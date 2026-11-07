@@ -224,6 +224,26 @@ class HerdrMainViewModel(
             )
         }
 
+        val ztDir = File(context.filesDir, "zerotier_node")
+        if (current.zeroTierCustomPlanetPath.isBlank()) {
+            val persistedPlanet = listOf(
+                File(ztDir, "planet.custom"),
+                File(ztDir, "roots")
+            ).firstOrNull { it.isFile && it.length() > 0L }
+            if (persistedPlanet != null) {
+                current = current.copy(zeroTierCustomPlanetPath = persistedPlanet.absolutePath)
+            }
+        }
+        if (current.zeroTierIdentitySecret.isBlank()) {
+            val persistedSecretFile = File(ztDir, "identity.secret")
+            if (persistedSecretFile.isFile && persistedSecretFile.canRead()) {
+                val loadedSecret = runCatching { persistedSecretFile.readText().trim() }.getOrNull().orEmpty()
+                if (loadedSecret.isNotBlank()) {
+                    current = current.copy(zeroTierIdentitySecret = loadedSecret)
+                }
+            }
+        }
+
         val extraHost = intent?.getStringExtra("host")?.trim()
         val extraUser = intent?.getStringExtra("username")?.trim()
         val extraFp = intent?.getStringExtra("fingerprint")?.trim()

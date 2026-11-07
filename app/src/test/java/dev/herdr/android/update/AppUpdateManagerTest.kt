@@ -53,4 +53,13 @@ class AppUpdateManagerTest {
             info.apkDownloadUrl
         )
     }
+
+    @Test
+    fun buildsCandidateDownloadUrlsWithMirrorFallback() {
+        val raw = "https://github.com/DracaeneSunbringer/HerdrAndroid/releases/download/v0.1.1/HerdrAndroid-v0.1.1.apk"
+        val candidates = AppUpdateManager.buildCandidateDownloadUrls(raw)
+        assertEquals(4, candidates.size)
+        assertTrue(candidates.first().startsWith("https://gh-proxy.com/"))
+        assertEquals(raw, candidates.last())
+    }
 }

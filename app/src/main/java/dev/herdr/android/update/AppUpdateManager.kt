@@ -140,13 +140,28 @@ object AppUpdateManager {
         return false
     }
 
+    internal fun buildCandidateDownloadUrls(rawUrl: String): List<String> {
+        val clean = rawUrl.trim()
+        if (clean.isBlank()) return emptyList()
+        if (!clean.startsWith("https://github.com/", ignoreCase = true)) {
+            return listOf(clean)
+        }
+        return listOf(
+            "https://gh-proxy.com/$clean",
+            "https://ghfast.top/$clean",
+            "https://ghproxy.net/$clean",
+            clean
+        )
+    }
+
     suspend fun downloadReleaseApk(
         context: Context,
         release: ReleaseUpdateInfo,
         onProgress: (Int) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
         try {
-            require(release.apkDownloadUrl.isNotBlank()) { "该 Release 未附带可下载的 APK 安装包" }
+            val candidateUrls = buildCandidateDownloadUrls(release.apkDownloadUrl)
+            require(candidateUrls.isNotEmpty()) { "该 Release 未附带可下载的 APK 安装包" }
             val updatesDir = File(context.cacheDir, "updates")
             if (!updatesDir.isDirectory && !updatesDir.mkdirs()) {
                 throw IOException("无法创建更新缓存目录")
@@ -157,83 +172,109 @@ object AppUpdateManager {
             val targetFile = File(updatesDir, safeFileName)
             val tempFile = File(updatesDir, "$safeFileName.part")
 
-            var currentUrl = release.apkDownloadUrl
-            var redirects = 0
-            var conn: HttpURLConnection? = null
-            try {
-                while (true) {
-                    conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = 15_000
-                        readTimeout = 30_000
-                        instanceFollowRedirects = false
-                        setRequestProperty("User-Agent", "HerdrAndroid/${BuildConfig.VERSION_NAME}")
+            var lastError: Throwable? = null
+            for (candidateUrl in candidateUrls) {
+                try {
+                    if (tempFile.exists()) {
+                        tempFile.delete()
                     }
-                    val status = conn.responseCode
-                    if (status in listOf(301, 302, 303, 307, 308)) {
-                        val location = conn.getHeaderField("Location")
-                            ?: throw IOException("下载重定向缺少 Location 头")
-                        conn.disconnect()
-                        currentUrl = URL(URL(currentUrl), location).toString()
-                        if (++redirects > 6) throw IOException("下载重定向次数过多")
-                        continue
+                    downloadFromSingleUrl(
+                        initialUrl = candidateUrl,
+                        expectedSizeBytes = release.apkSizeBytes,
+                        tempFile = tempFile,
+                        onProgress = onProgress
+                    )
+                    if (targetFile.exists()) {
+                        targetFile.delete()
                     }
-                    if (status !in 200..299) {
-                        throw IOException("APK 下载失败 (HTTP $status)")
+                    if (!tempFile.renameTo(targetFile)) {
+                        tempFile.copyTo(targetFile, overwrite = true)
+                        tempFile.delete()
                     }
-                    break
+                    onProgress(100)
+                    return@withContext Result.success(targetFile)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    lastError = e
                 }
-
-                val activeConn = conn ?: throw IOException("下载连接未建立")
-                val totalBytes = activeConn.contentLengthLong.takeIf { it > 0L } ?: release.apkSizeBytes
-                var downloadedBytes = 0L
-                var lastReportedPercent = -1
-
-                activeConn.inputStream.use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        val buffer = ByteArray(16 * 1024)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            output.write(buffer, 0, read)
-                            downloadedBytes += read
-                            if (totalBytes > 0L) {
-                                val pct = ((downloadedBytes * 100L) / totalBytes).toInt().coerceIn(0, 100)
-                                if (pct != lastReportedPercent) {
-                                    lastReportedPercent = pct
-                                    onProgress(pct)
-                                }
-                            }
-                        }
-                        output.fd.sync()
-                    }
-                }
-
-                if (tempFile.length() < 4L) {
-                    throw IOException("下载的 APK 文件不完整")
-                }
-                val header = ByteArray(4)
-                tempFile.inputStream().use { it.read(header) }
-                if (header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
-                    throw IOException("下载的文件不是有效的 APK (ZIP) 包")
-                }
-
-                if (targetFile.exists()) {
-                    targetFile.delete()
-                }
-                if (!tempFile.renameTo(targetFile)) {
-                    tempFile.copyTo(targetFile, overwrite = true)
-                    tempFile.delete()
-                }
-                onProgress(100)
-                Result.success(targetFile)
-            } finally {
-                conn?.disconnect()
             }
+            throw (lastError ?: IOException("所有下载通道均不可用"))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             Result.failure(e)
+        }
+    }
+
+    private fun downloadFromSingleUrl(
+        initialUrl: String,
+        expectedSizeBytes: Long,
+        tempFile: File,
+        onProgress: (Int) -> Unit
+    ) {
+        var currentUrl = initialUrl
+        var redirects = 0
+        var conn: HttpURLConnection? = null
+        try {
+            while (true) {
+                conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 8_000
+                    readTimeout = 20_000
+                    instanceFollowRedirects = false
+                    setRequestProperty("User-Agent", "HerdrAndroid/${BuildConfig.VERSION_NAME}")
+                }
+                val status = conn.responseCode
+                if (status in listOf(301, 302, 303, 307, 308)) {
+                    val location = conn.getHeaderField("Location")
+                        ?: throw IOException("下载重定向缺少 Location 头")
+                    conn.disconnect()
+                    currentUrl = URL(URL(currentUrl), location).toString()
+                    if (++redirects > 6) throw IOException("下载重定向次数过多")
+                    continue
+                }
+                if (status !in 200..299) {
+                    throw IOException("APK 下载失败 (HTTP $status)")
+                }
+                break
+            }
+
+            val activeConn = conn ?: throw IOException("下载连接未建立")
+            val totalBytes = activeConn.contentLengthLong.takeIf { it > 0L } ?: expectedSizeBytes
+            var downloadedBytes = 0L
+            var lastReportedPercent = -1
+
+            activeConn.inputStream.use { input ->
+                FileOutputStream(tempFile).use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        downloadedBytes += read
+                        if (totalBytes > 0L) {
+                            val pct = ((downloadedBytes * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                            if (pct != lastReportedPercent) {
+                                lastReportedPercent = pct
+                                onProgress(pct)
+                            }
+                        }
+                    }
+                    output.fd.sync()
+                }
+            }
+
+            if (tempFile.length() < 4L) {
+                throw IOException("下载的 APK 文件不完整")
+            }
+            val header = ByteArray(4)
+            tempFile.inputStream().use { it.read(header) }
+            if (header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
+                throw IOException("下载的文件不是有效的 APK (ZIP) 包")
+            }
+        } finally {
+            conn?.disconnect()
         }
     }
 
