@@ -18,6 +18,8 @@ import dev.herdr.android.protocol.AttachMode
 import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.ui.theme.HerdrColors
+import dev.herdr.android.ui.theme.HerdrThemePreset
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
@@ -32,13 +34,14 @@ import kotlinx.coroutines.launch
 import java.io.File
 
 enum class WorkspaceTab(val title: String, val badgeCode: String) {
-    CONNECTION("连接与诊断", "CONN"),
-    AGENTS("Agents 拓扑", "TREE"),
-    TERMINAL("终端接管", "TERM"),
-    SETTINGS("默认参数设置", "CONF")
+    CONNECTION("连接", "CONN"),
+    AGENTS("拓扑", "TREE"),
+    TERMINAL("终端", "TERM"),
+    SETTINGS("设置", "CONF")
 }
 
 data class HerdrAppSettings(
+    val themePreset: HerdrThemePreset = HerdrThemePreset.LINEAR_OBSIDIAN,
     val defaultLanHost: String = "192.168.1.100",
     val defaultZeroTierHost: String = "10.147.17.100",
     val defaultDesktopFallbackCols: Int = 138,
@@ -167,7 +170,10 @@ class HerdrMainViewModel(
             if (!sp.contains("default_zt_host") && savedHostClean != null && explicitUseZt == true) {
                 sp.edit().putString("default_zt_host", migratedZtHost).apply()
             }
+            val savedTheme = HerdrThemePreset.fromId(sp.getString("theme_preset", null))
+            HerdrColors.applyPreset(savedTheme)
             _appSettings.value = HerdrAppSettings(
+                themePreset = savedTheme,
                 defaultLanHost = migratedLanHost,
                 defaultZeroTierHost = migratedZtHost,
                 defaultDesktopFallbackCols = sp.getInt("default_desktop_fallback_cols", 138),
@@ -334,8 +340,10 @@ class HerdrMainViewModel(
 
     fun updateAppSettings(transform: (HerdrAppSettings) -> HerdrAppSettings) {
         val updated = transform(_appSettings.value)
+        HerdrColors.applyPreset(updated.themePreset)
         _appSettings.value = updated
         prefs?.edit()?.apply {
+            putString("theme_preset", updated.themePreset.id)
             putString("default_lan_host", updated.defaultLanHost)
             putString("default_zt_host", updated.defaultZeroTierHost)
             putInt("default_desktop_fallback_cols", updated.defaultDesktopFallbackCols)

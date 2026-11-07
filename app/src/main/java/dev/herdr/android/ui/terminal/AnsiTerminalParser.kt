@@ -16,7 +16,7 @@ import dev.herdr.android.ui.theme.HerdrColors
  */
 object AnsiTerminalParser {
 
-    private val ansi16Palette = arrayOf(
+    private val ansi16DarkPalette = arrayOf(
         Color(0xFF1E2430), // 0 Black
         Color(0xFFF87171), // 1 Red
         Color(0xFF34D399), // 2 Green
@@ -34,6 +34,28 @@ object AnsiTerminalParser {
         Color(0xFF67E8F9), // 14 Bright Cyan
         Color(0xFFF8FAFC)  // 15 Bright White
     )
+
+    private val ansi16LightPalette = arrayOf(
+        Color(0xFF1F2937), // 0 Black
+        Color(0xFFDC2626), // 1 Red
+        Color(0xFF059669), // 2 Green
+        Color(0xFFB45309), // 3 Yellow/Amber
+        Color(0xFF2563EB), // 4 Blue
+        Color(0xFF7C3AED), // 5 Magenta
+        Color(0xFF0891B2), // 6 Cyan
+        Color(0xFF374151), // 7 White -> Dark Slate on Light bg
+        Color(0xFF6B7280), // 8 Bright Black
+        Color(0xFFE11D48), // 9 Bright Red
+        Color(0xFF047857), // 10 Bright Green
+        Color(0xFFD97706), // 11 Bright Yellow
+        Color(0xFF1D4ED8), // 12 Bright Blue
+        Color(0xFF6D28D9), // 13 Bright Magenta
+        Color(0xFF0E7490), // 14 Bright Cyan
+        Color(0xFF111827)  // 15 Bright White -> Deep Ink on Light bg
+    )
+
+    private val activeAnsiPalette: Array<Color>
+        get() = if (HerdrColors.IsLight) ansi16LightPalette else ansi16DarkPalette
 
     private val oscRegex = Regex("\u001B\\][^\u0007\u001B]*(?:\u0007|\u001B\\\\)")
     private val csiRegex = Regex("\u001B\\[([0-9;?]*)([A-Za-z])")
@@ -121,7 +143,7 @@ object AnsiTerminalParser {
                 userPromptLineRegex.matches(line) && !trimmed.startsWith("> ") -> {
                     val match = userPromptLineRegex.find(line)!!
                     appendStyledSegment(match.groupValues[1], HerdrColors.Accent, Color.Unspecified, true)
-                    appendStyledSegment(match.groupValues[2], Color(0xFF7DD3FC), Color.Unspecified, true)
+                    appendStyledSegment(match.groupValues[2], HerdrColors.Foreground, Color.Unspecified, true)
                 }
 
                 thoughtLineRegex.matches(trimmed) -> {
@@ -259,12 +281,12 @@ object AnsiTerminalParser {
                         }
                         1 -> isBold = true
                         22 -> isBold = false
-                        in 30..37 -> currentFg = ansi16Palette[code - 30]
+                        in 30..37 -> currentFg = activeAnsiPalette[code - 30]
                         39 -> currentFg = HerdrColors.Foreground
-                        in 40..47 -> currentBg = ansi16Palette[code - 40].copy(alpha = 0.35f)
+                        in 40..47 -> currentBg = activeAnsiPalette[code - 40].copy(alpha = 0.25f)
                         49 -> currentBg = Color.Unspecified
-                        in 90..97 -> currentFg = ansi16Palette[code - 90 + 8]
-                        in 100..107 -> currentBg = ansi16Palette[code - 100 + 8].copy(alpha = 0.35f)
+                        in 90..97 -> currentFg = activeAnsiPalette[code - 90 + 8]
+                        in 100..107 -> currentBg = activeAnsiPalette[code - 100 + 8].copy(alpha = 0.25f)
                         38, 48 -> {
                             val isForeground = (code == 38)
                             val mode = codes.getOrNull(idx + 1)
@@ -316,7 +338,7 @@ object AnsiTerminalParser {
 
     private fun xterm256ToColor(index: Int): Color {
         val clamped = index.coerceIn(0, 255)
-        if (clamped < 16) return ansi16Palette[clamped]
+        if (clamped < 16) return activeAnsiPalette[clamped]
         if (clamped in 16..231) {
             val offset = clamped - 16
             val r = (offset / 36) % 6
