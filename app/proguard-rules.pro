@@ -1,0 +1,5 @@
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-dontwarn org.bouncycastle.**
+-dontwarn net.i2p.crypto.**
+-dontwarn com.hierynomus.**
+-dontwarn org.slf4j.**

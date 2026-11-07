@@ -1,0 +1,14 @@
+.gradle/
+build/
+**/build/
+.cxx/
+**/.cxx/
+local.properties
+*.iml
+.idea/
+*.apk
+*.aab
+*.keystore
+*.jks
+third_party/
+zerotier-android/src/main/assets/default_planet
