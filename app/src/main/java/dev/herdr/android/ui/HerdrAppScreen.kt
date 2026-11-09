@@ -100,6 +100,22 @@ import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
 import kotlinx.coroutines.delay
+import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import dev.herdr.android.ui.components.HerdrButton
+import dev.herdr.android.ui.components.HerdrButtonKind
+import dev.herdr.android.ui.components.HerdrIconButton
+import dev.herdr.android.ui.components.HerdrShapes
+import dev.herdr.android.ui.components.HerdrToggle
+import dev.herdr.android.ui.components.OneLine
+import dev.herdr.android.ui.components.StatusDot
+import dev.herdr.android.ui.fleet.FleetInboxPane
+import dev.herdr.android.ui.theme.HerdrType
+import dev.herdr.android.ui.workbench.AgentWorkbenchPane
 import kotlinx.coroutines.launch
 
 @Composable
@@ -111,7 +127,6 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val allTerminals by viewModel.terminals.collectAsState()
     val agentNodes by viewModel.agentTreeNodes.collectAsState()
     val totalLiveCount by viewModel.totalLiveCount.collectAsState()
-    val statusCounts by viewModel.statusCounts.collectAsState()
     val statusFilter by viewModel.statusFilter.collectAsState()
     val activeSession by viewModel.activeSession.collectAsState()
     val activeSummary by viewModel.activeTerminalSummary.collectAsState()
@@ -126,8 +141,6 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
     val context = LocalContext.current
 
-    var showQuickThemeDrawer by remember { mutableStateOf(false) }
-
     val notificationPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { _ -> }
@@ -140,529 +153,217 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
 
     LaunchedEffect(toastBanner) {
         if (toastBanner != null) {
-            delay(2400)
+            delay((2200L + (toastBanner?.length ?: 0) * 45L).coerceAtMost(6000L))
             viewModel.clearBanner()
         }
     }
 
     val effectiveHostLabel = (connectionState as? ConnectionState.Connected)?.profile?.host ?: profile.host
+    val connectWithPermission: () -> Unit = {
+        if (Build.VERSION.SDK_INT >= 33 && appSettings.keepAliveInBackground) {
+            runCatching {
+                notificationPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        viewModel.connectNow()
+    }
 
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(HerdrColors.Canvas)
             .imePadding()
     ) {
-        // Minimal top telemetry & status pill bar (hidden inside full-screen Agent Workbench)
-        AnimatedVisibility(visible = selectedTab != WorkspaceTab.TERMINAL) {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                TopTelemetryBar(
-                    selectedTab = selectedTab,
-                    connectionState = connectionState,
-                    terminalCount = totalLiveCount,
-                    hostLabel = effectiveHostLabel,
-                    currentTheme = appSettings.themePreset,
-                    themeDrawerExpanded = showQuickThemeDrawer,
-                    onNavigateBackToFleet = { viewModel.selectTab(WorkspaceTab.AGENTS) },
-                    onOpenConnectionSheet = {
-                        if (selectedTab == WorkspaceTab.CONNECTION) {
-                            viewModel.selectTab(WorkspaceTab.AGENTS)
-                        } else {
-                            viewModel.selectTab(WorkspaceTab.CONNECTION)
-                        }
-                    },
-                    onOpenSettings = {
-                        if (selectedTab == WorkspaceTab.SETTINGS) {
-                            viewModel.selectTab(WorkspaceTab.AGENTS)
-                        } else {
-                            viewModel.selectTab(WorkspaceTab.SETTINGS)
-                        }
-                    },
-                    onToggleThemeDrawer = { showQuickThemeDrawer = !showQuickThemeDrawer }
-                )
-
-                AnimatedVisibility(visible = showQuickThemeDrawer) {
-                    QuickThemeStrip(
-                        currentPreset = appSettings.themePreset,
-                        onSelectPreset = { preset ->
-                            viewModel.updateAppSettings { it.copy(themePreset = preset) }
-                        }
-                    )
-                }
-
-                if (appUpdateState.status == UpdateStatus.AVAILABLE ||
+        Column(modifier = Modifier.fillMaxSize()) {
+            val showUpdate = selectedTab != WorkspaceTab.TERMINAL && (
+                appUpdateState.status == UpdateStatus.AVAILABLE ||
                     appUpdateState.status == UpdateStatus.DOWNLOADING ||
                     appUpdateState.status == UpdateStatus.READY_TO_INSTALL
-                ) {
-                    val rel = appUpdateState.latestRelease
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(HerdrColors.DoneSubtle)
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(HerdrColors.Done)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = when (appUpdateState.status) {
-                                    UpdateStatus.DOWNLOADING -> "正在下载更新 ${rel?.tagName.orEmpty()} (${appUpdateState.downloadProgressPercent}%)..."
-                                    UpdateStatus.READY_TO_INSTALL -> "新版本 ${rel?.tagName.orEmpty()} 已就绪 · 保留全部配置"
-                                    else -> "发现新版本 ${rel?.tagName.orEmpty()} · ${rel?.releaseTitle.orEmpty()}"
-                                },
-                                color = HerdrColors.Foreground,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        if (appUpdateState.status != UpdateStatus.DOWNLOADING) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .background(HerdrColors.Done)
-                                    .clickable { viewModel.downloadAndInstallUpdate(context) }
-                                    .padding(horizontal = 12.dp, vertical = 4.5.dp)
-                            ) {
-                                Text(
-                                    text = if (appUpdateState.status == UpdateStatus.READY_TO_INSTALL) "安装更新" else "立即更新",
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    softWrap = false,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        AnimatedVisibility(visible = toastBanner != null) {
-            toastBanner?.let { msg ->
+                )
+            AnimatedVisibility(visible = showUpdate) {
+                val rel = appUpdateState.latestRelease
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(HerdrColors.AccentSubtle)
-                        .clickable { viewModel.clearBanner() }
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                        .padding(start = 16.dp, end = 16.dp, top = 8.dp)
+                        .clip(HerdrShapes.Control)
+                        .background(HerdrColors.Surface)
+                        .padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .clip(CircleShape)
-                            .background(HerdrColors.Accent)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = msg,
+                    StatusDot(HerdrColors.Done, 7.dp)
+                    Spacer(modifier = Modifier.width(10.dp))
+                    OneLine(
+                        text = when (appUpdateState.status) {
+                            UpdateStatus.DOWNLOADING -> "正在下载 ${rel?.tagName.orEmpty()} · ${appUpdateState.downloadProgressPercent}%"
+                            UpdateStatus.READY_TO_INSTALL -> "${rel?.tagName.orEmpty()} 已下载，可安装"
+                            else -> "新版本 ${rel?.tagName.orEmpty()} 可用"
+                        },
+                        style = HerdrType.Label,
                         color = HerdrColors.Foreground,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "×",
-                        color = HerdrColors.Accent,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
-            }
-        }
-
-        // Main Two-Layer Workspace Content (Fleet Triage Inbox <-> Agent Dispatch Workbench, with Overlay Connection/Settings)
-        Box(modifier = Modifier.weight(1f)) {
-            when (selectedTab) {
-                WorkspaceTab.CONNECTION -> ConnectionAndDiagnosticsPane(
-                    profile = profile,
-                    appSettings = appSettings,
-                    connectionState = connectionState,
-                    zeroTierState = zeroTierState,
-                    agentCount = totalLiveCount,
-                    onUpdateProfile = viewModel::updateProfile,
-                    onUpdateAppSettings = viewModel::updateAppSettings,
-                    onApplyLanPreset = viewModel::applyLanPreset,
-                    onApplyPreset = viewModel::applyPreset,
-                    onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
-                    onShowBanner = viewModel::showBanner,
-                    onConnect = {
-                        if (Build.VERSION.SDK_INT >= 33 && appSettings.keepAliveInBackground) {
-                            runCatching {
-                                notificationPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                            }
-                        }
-                        viewModel.connectNow()
-                    },
-                    onRefreshTerminals = viewModel::refreshTerminals,
-                    onDisconnect = viewModel::disconnectNow,
-                    onJumpToAgents = { viewModel.selectTab(WorkspaceTab.AGENTS) }
-                )
-
-                WorkspaceTab.AGENTS -> AgentsTopologyPane(
-                    nodes = agentNodes,
-                    allTerminals = allTerminals,
-                    totalLiveCount = totalLiveCount,
-                    statusCounts = statusCounts,
-                    connectionState = connectionState,
-                    activeTerminalAddress = activeSession?.address,
-                    currentFilter = statusFilter,
-                    acknowledgedDoneTurns = acknowledgedDoneTurns,
-                    dispatchedReceipts = dispatchedReceipts,
-                    onSelectFilter = viewModel::setStatusFilter,
-                    onRefresh = viewModel::refreshTerminals,
-                    onCardClick = { viewModel.attachTerminal(it, AttachMode.TAKEOVER) },
-                    onWriteNextInstruction = viewModel::openTerminalAndFocusInput,
-                    onQuickDispatch = viewModel::quickDispatchToTerminal,
-                    onAcknowledgeDone = viewModel::markTerminalDoneAcknowledged,
-                    onConnectNow = {
-                        if (Build.VERSION.SDK_INT >= 33 && appSettings.keepAliveInBackground) {
-                            runCatching {
-                                notificationPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                            }
-                        }
-                        viewModel.connectNow()
-                    },
-                    onEnterDemoMode = {
-                        viewModel.applyPreset(true)
-                        viewModel.connectNow()
-                    },
-                    onGoToConnect = { viewModel.selectTab(WorkspaceTab.CONNECTION) }
-                )
-
-                WorkspaceTab.TERMINAL -> LiveTerminalAttachPane(
-                    session = activeSession,
-                    summary = activeSummary,
-                    allLiveTerminals = allTerminals.filter { it.state == "live" },
-                    acknowledgedDoneTurns = acknowledgedDoneTurns,
-                    draftText = activeSession?.address?.let { draftsByAddress[it] }.orEmpty(),
-                    dispatchedReceipt = activeSession?.address?.let { dispatchedReceipts[it] },
-                    requestInputFocusSignal = requestInputFocusSignal,
-                    appSettings = appSettings,
-                    savedDesktopDims = savedDesktopDims,
-                    mobilePtyTargetCols = mobilePtyTargetCols,
-                    onNavigateBack = { viewModel.navigateBack() },
-                    onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
-                    onSwitchTerminal = { target ->
-                        viewModel.attachTerminal(target, AttachMode.TAKEOVER)
-                    },
-                    onUpdateDraft = { text ->
-                        activeSession?.address?.let { addr ->
-                            viewModel.updateDraftForTerminal(addr, text)
-                        }
-                    },
-                    onToggleMode = viewModel::toggleAttachMode,
-                    onTakeoverPtyWidth = viewModel::takeoverPtyWidth,
-                    onReleasePtyWidth = viewModel::releasePtyWidth,
-                    onSendLine = viewModel::sendTerminalLine,
-                    onSendSpecialKey = viewModel::sendSpecialKey,
-                    onInterrupt = viewModel::interruptActiveTerminal,
-                    onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
-                )
-
-                WorkspaceTab.SETTINGS -> DefaultSettingsPane(
-                    profile = profile,
-                    appSettings = appSettings,
-                    mobilePtyTargetCols = mobilePtyTargetCols,
-                    zeroTierState = zeroTierState,
-                    appUpdateState = appUpdateState,
-                    onUpdateProfile = viewModel::updateProfile,
-                    onUpdateAppSettings = viewModel::updateAppSettings,
-                    onSetDefaultMobilePtyCols = viewModel::setDefaultMobilePtyCols,
-                    onImportZtIdentity = viewModel::importZeroTierIdentity,
-                    onExportZtIdentity = viewModel::exportZeroTierIdentity,
-                    onImportCustomPlanet = viewModel::importCustomPlanet,
-                    onResetBuiltInPlanet = viewModel::resetBuiltInPlanet,
-                    onCheckForUpdates = { viewModel.checkForUpdates(silentIfUpToDate = false) },
-                    onDownloadAndInstallUpdate = { viewModel.downloadAndInstallUpdate(context) },
-                    onShowBanner = viewModel::showBanner
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun TopTelemetryBar(
-    selectedTab: WorkspaceTab,
-    connectionState: ConnectionState,
-    terminalCount: Int,
-    hostLabel: String,
-    currentTheme: HerdrThemePreset,
-    themeDrawerExpanded: Boolean,
-    onNavigateBackToFleet: () -> Unit,
-    onOpenConnectionSheet: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onToggleThemeDrawer: () -> Unit
-) {
-    val isSecondarySheet = selectedTab == WorkspaceTab.CONNECTION || selectedTab == WorkspaceTab.SETTINGS
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(HerdrColors.Chrome)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (isSecondarySheet) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(HerdrColors.AccentSubtle)
-                        .clickable { onNavigateBackToFleet() }
-                        .padding(horizontal = 10.dp, vertical = 7.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "← 牧群",
-                        color = HerdrColors.Accent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 12.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-            } else {
-                Box(
-                    modifier = Modifier
-                        .size(34.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(HerdrColors.AccentSubtle)
-                        .clickable { onOpenConnectionSheet() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "H",
-                        color = HerdrColors.Accent,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp
-                    )
+                    if (appUpdateState.status != UpdateStatus.DOWNLOADING) {
+                        HerdrButton(
+                            text = if (appUpdateState.status == UpdateStatus.READY_TO_INSTALL) "安装" else "更新",
+                            onClick = { viewModel.downloadAndInstallUpdate(context) },
+                            kind = HerdrButtonKind.Tonal,
+                            compact = true
+                        )
+                    }
                 }
             }
 
-            Spacer(modifier = Modifier.width(10.dp))
+            Box(modifier = Modifier.weight(1f)) {
+                when (selectedTab) {
+                    WorkspaceTab.AGENTS -> FleetInboxPane(
+                        nodes = agentNodes,
+                        allTerminals = allTerminals,
+                        totalLiveCount = totalLiveCount,
+                        connectionState = connectionState,
+                        hostLabel = effectiveHostLabel,
+                        activeTerminalAddress = activeSession?.address,
+                        currentFilter = statusFilter,
+                        acknowledgedDoneTurns = acknowledgedDoneTurns,
+                        dispatchedReceipts = dispatchedReceipts,
+                        onSelectFilter = viewModel::setStatusFilter,
+                        onRefresh = viewModel::refreshTerminals,
+                        onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
+                        onOpenConnection = { viewModel.selectTab(WorkspaceTab.CONNECTION) },
+                        onCardClick = { viewModel.attachTerminal(it, AttachMode.TAKEOVER) },
+                        onWriteNextInstruction = viewModel::openTerminalAndFocusInput,
+                        onQuickDispatch = viewModel::quickDispatchToTerminal,
+                        onAcknowledgeDone = viewModel::markTerminalDoneAcknowledged,
+                        onConnectNow = connectWithPermission,
+                        onEnterDemoMode = {
+                            viewModel.applyPreset(true)
+                            viewModel.connectNow()
+                        }
+                    )
 
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable { onOpenConnectionSheet() }
-                    .padding(vertical = 2.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = when (selectedTab) {
-                            WorkspaceTab.CONNECTION -> "链路与网络诊断"
-                            WorkspaceTab.SETTINGS -> "全局偏好设置"
-                            else -> "Herdr 牧群台"
+                    WorkspaceTab.TERMINAL -> AgentWorkbenchPane(
+                        session = activeSession,
+                        summary = activeSummary,
+                        allLiveTerminals = allTerminals.filter { it.state == "live" },
+                        acknowledgedDoneTurns = acknowledgedDoneTurns,
+                        draftText = activeSession?.address?.let { draftsByAddress[it] }.orEmpty(),
+                        dispatchedReceipt = activeSession?.address?.let { dispatchedReceipts[it] },
+                        requestInputFocusSignal = requestInputFocusSignal,
+                        appSettings = appSettings,
+                        savedDesktopDims = savedDesktopDims,
+                        mobilePtyTargetCols = mobilePtyTargetCols,
+                        onNavigateBack = { viewModel.navigateBack() },
+                        onSwitchTerminal = { target -> viewModel.attachTerminal(target, AttachMode.TAKEOVER) },
+                        onUpdateDraft = { text ->
+                            activeSession?.address?.let { addr -> viewModel.updateDraftForTerminal(addr, text) }
                         },
-                        color = HerdrColors.Foreground,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.5.sp,
-                        letterSpacing = (-0.3).sp,
-                        softWrap = false,
-                        maxLines = 1
+                        onTakeoverPtyWidth = viewModel::takeoverPtyWidth,
+                        onReleasePtyWidth = viewModel::releasePtyWidth,
+                        onSendLine = viewModel::sendTerminalLine,
+                        onSendSpecialKey = viewModel::sendSpecialKey,
+                        onInterrupt = viewModel::interruptActiveTerminal,
+                        onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                     )
-                    Spacer(modifier = Modifier.width(7.dp))
-                    val (dotColor, pillText) = when (connectionState) {
-                        is ConnectionState.Connected -> HerdrColors.Done to "已连接"
-                        is ConnectionState.Connecting -> HerdrColors.Working to "重连中"
-                        is ConnectionState.Failed -> HerdrColors.Blocked to "链路受阻"
-                        ConnectionState.Disconnected -> HerdrColors.Idle to "待连接"
-                    }
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(dotColor.copy(alpha = 0.14f))
-                            .padding(horizontal = 8.dp, vertical = 2.5.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(5.5.dp)
-                                .clip(CircleShape)
-                                .background(dotColor)
+
+                    WorkspaceTab.CONNECTION -> Column(modifier = Modifier.fillMaxSize()) {
+                        SubPageTopBar(title = "连接", onBack = { viewModel.selectTab(WorkspaceTab.AGENTS) })
+                        ConnectionAndDiagnosticsPane(
+                            profile = profile,
+                            appSettings = appSettings,
+                            connectionState = connectionState,
+                            zeroTierState = zeroTierState,
+                            agentCount = totalLiveCount,
+                            onUpdateProfile = viewModel::updateProfile,
+                            onUpdateAppSettings = viewModel::updateAppSettings,
+                            onApplyLanPreset = viewModel::applyLanPreset,
+                            onApplyPreset = viewModel::applyPreset,
+                            onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
+                            onShowBanner = viewModel::showBanner,
+                            onConnect = connectWithPermission,
+                            onRefreshTerminals = viewModel::refreshTerminals,
+                            onDisconnect = viewModel::disconnectNow,
+                            onJumpToAgents = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                         )
-                        Spacer(modifier = Modifier.width(4.5.dp))
-                        Text(
-                            text = "$pillText ▾",
-                            color = dotColor,
-                            fontSize = 10.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            softWrap = false,
-                            maxLines = 1
+                    }
+
+                    WorkspaceTab.SETTINGS -> Column(modifier = Modifier.fillMaxSize()) {
+                        SubPageTopBar(title = "设置", onBack = { viewModel.navigateBack() })
+                        DefaultSettingsPane(
+                            profile = profile,
+                            appSettings = appSettings,
+                            mobilePtyTargetCols = mobilePtyTargetCols,
+                            zeroTierState = zeroTierState,
+                            appUpdateState = appUpdateState,
+                            onUpdateProfile = viewModel::updateProfile,
+                            onUpdateAppSettings = viewModel::updateAppSettings,
+                            onSetDefaultMobilePtyCols = viewModel::setDefaultMobilePtyCols,
+                            onImportZtIdentity = viewModel::importZeroTierIdentity,
+                            onExportZtIdentity = viewModel::exportZeroTierIdentity,
+                            onImportCustomPlanet = viewModel::importCustomPlanet,
+                            onResetBuiltInPlanet = viewModel::resetBuiltInPlanet,
+                            onCheckForUpdates = { viewModel.checkForUpdates(silentIfUpToDate = false) },
+                            onDownloadAndInstallUpdate = { viewModel.downloadAndInstallUpdate(context) },
+                            onShowBanner = viewModel::showBanner
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(1.5.dp))
-                Text(
-                    text = when (connectionState) {
-                        is ConnectionState.Connected ->
-                            "$hostLabel · $terminalCount 个在管终端 · 点击切换网络"
-                        is ConnectionState.Connecting ->
-                            "正在执行：${connectionState.activeStage.title} ($hostLabel)"
-                        is ConnectionState.Failed ->
-                            "受阻于：${connectionState.failedStage.title} · 点击诊断"
-                        ConnectionState.Disconnected ->
-                            "$hostLabel · 点击连接或开启离线演示"
-                    },
-                    color = HerdrColors.Muted,
-                    fontSize = 11.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
             }
+        }
 
-            Spacer(modifier = Modifier.width(6.dp))
-
-            // 1-Tap Quick Theme Pill
+        // Snackbar-style toast: floats above content, never pushes layout.
+        AnimatedVisibility(
+            visible = toastBanner != null,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(
+                    start = 16.dp,
+                    end = 16.dp,
+                    bottom = if (selectedTab == WorkspaceTab.TERMINAL) 132.dp else 24.dp
+                )
+        ) {
+            val msg = toastBanner.orEmpty()
             Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(if (themeDrawerExpanded) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                    .clickable { onToggleThemeDrawer() }
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                    .fillMaxWidth()
+                    .clip(HerdrShapes.Control)
+                    .background(HerdrColors.Foreground)
+                    .clickable { viewModel.clearBanner() }
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(7.5.dp)
-                        .clip(CircleShape)
-                        .background(HerdrColors.Accent)
-                )
-                Spacer(modifier = Modifier.width(5.dp))
                 Text(
-                    text = currentTheme.title,
-                    color = if (themeDrawerExpanded) HerdrColors.Accent else HerdrColors.Foreground,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    softWrap = false,
-                    maxLines = 1
-                )
-            }
-
-            Spacer(modifier = Modifier.width(6.dp))
-
-            // 1-Tap Settings Pill
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(if (selectedTab == WorkspaceTab.SETTINGS) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                    .clickable { onOpenSettings() }
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "⚙ 设置",
-                    color = if (selectedTab == WorkspaceTab.SETTINGS) HerdrColors.Accent else HerdrColors.Foreground,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    softWrap = false,
-                    maxLines = 1
+                    text = msg,
+                    style = HerdrType.Label,
+                    color = HerdrColors.Canvas,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
             }
         }
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(0.5.dp)
-                .background(HerdrColors.Border)
-        )
     }
 }
 
 @Composable
-private fun QuickThemeStrip(
-    currentPreset: HerdrThemePreset,
-    onSelectPreset: (HerdrThemePreset) -> Unit
-) {
-    Column(
+private fun SubPageTopBar(title: String, onBack: () -> Unit) {
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(HerdrColors.Chrome)
+            .padding(start = 4.dp, end = 16.dp, top = 6.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            HerdrThemePreset.entries.forEach { preset ->
-                val pal = preset.palette()
-                val selected = preset == currentPreset
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (selected) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                        .border(
-                            width = if (selected) 1.2.dp else 0.5.dp,
-                            color = if (selected) HerdrColors.Accent else HerdrColors.Border,
-                            shape = RoundedCornerShape(10.dp)
-                        )
-                        .clickable { onSelectPreset(preset) }
-                        .padding(horizontal = 10.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(16.dp)
-                            .clip(CircleShape)
-                            .background(pal.canvas)
-                            .border(1.dp, pal.border, CircleShape),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(pal.accent)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(7.dp))
-                    Text(
-                        text = preset.title,
-                        color = if (selected) HerdrColors.Accent else HerdrColors.Foreground,
-                        fontSize = 11.5.sp,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-            }
-        }
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(0.5.dp)
-                .background(HerdrColors.Border)
+        HerdrIconButton(
+            icon = Icons.AutoMirrored.Filled.ArrowBack,
+            contentDescription = "返回",
+            onClick = onBack,
+            tint = HerdrColors.Foreground
         )
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(title, style = HerdrType.Title.copy(fontSize = 20.sp), color = HerdrColors.Foreground)
     }
 }
+
 
 @Composable
 private fun ConnectionAndDiagnosticsPane(
@@ -720,7 +421,7 @@ private fun ConnectionAndDiagnosticsPane(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(16.dp))
                 .background(HerdrColors.Surface)
-                .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(16.dp))
+                .then(if (HerdrColors.IsLight) Modifier.border(1.dp, HerdrColors.Border, RoundedCornerShape(16.dp)) else Modifier)
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
@@ -731,14 +432,14 @@ private fun ConnectionAndDiagnosticsPane(
             ) {
                 Column {
                     Text(
-                        text = "远端工作台连接",
+                        text = "工作站",
                         color = HerdrColors.Foreground,
                         fontWeight = FontWeight.Bold,
                         fontSize = 15.5.sp
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "切换连接模式并建立 SSH 加密会话",
+                        text = "选择网络，建立 SSH 会话",
                         color = HerdrColors.Muted,
                         fontSize = 11.5.sp
                     )
@@ -1031,7 +732,7 @@ private fun ConnectionAndDiagnosticsPane(
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "进入终端拓扑 ($agentCount) →",
+                                text = "回到牧群 · $agentCount",
                                 color = HerdrColors.OnAccent,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.5.sp,
@@ -1246,7 +947,7 @@ private fun ConnectionAndDiagnosticsPane(
                         )
                     }
                     TacticalActionPill(
-                        text = if (appSettings.keepAliveInBackground) "保活中" else "开启",
+                        text = if (appSettings.keepAliveInBackground) "关闭" else "开启",
                         accent = appSettings.keepAliveInBackground,
                         onClick = {
                             onUpdateAppSettings { it.copy(keepAliveInBackground = !it.keepAliveInBackground) }
@@ -1279,7 +980,7 @@ private fun ThemeSelectorCard(
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(HerdrColors.Surface)
-            .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(16.dp))
+            .then(if (HerdrColors.IsLight) Modifier.border(1.dp, HerdrColors.Border, RoundedCornerShape(16.dp)) else Modifier)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -1296,13 +997,13 @@ private fun ThemeSelectorCard(
                     fontSize = 14.5.sp
                 )
                 Text(
-                    text = "4 款深色 + 2 款浅色护眼主题 · 实时同步终端配色",
+                    text = "界面与终端同步换色",
                     color = HerdrColors.Muted,
                     fontSize = 11.sp
                 )
             }
             Text(
-                text = if (currentPreset.isLight) "☼ 浅色" else "◐ 深色",
+                text = if (currentPreset.isLight) "浅色" else "深色",
                 color = HerdrColors.Accent,
                 fontSize = 11.5.sp,
                 fontWeight = FontWeight.SemiBold
@@ -1577,9 +1278,8 @@ private fun DefaultSettingsPane(
                         fontSize = 11.sp
                     )
                 }
-                TacticalActionPill(
-                    text = if (appSettings.autoHideTerminalTopBar) "已开启" else "常驻展开",
-                    accent = appSettings.autoHideTerminalTopBar,
+                HerdrToggle(
+                    checked = appSettings.autoHideTerminalTopBar,
                     onClick = {
                         onUpdateAppSettings { it.copy(autoHideTerminalTopBar = !it.autoHideTerminalTopBar) }
                     }
@@ -1604,9 +1304,8 @@ private fun DefaultSettingsPane(
                         fontSize = 11.sp
                     )
                 }
-                TacticalActionPill(
-                    text = if (appSettings.autoHideObserveKeyStrip) "已开启" else "始终显示",
-                    accent = appSettings.autoHideObserveKeyStrip,
+                HerdrToggle(
+                    checked = appSettings.autoHideObserveKeyStrip,
                     onClick = {
                         onUpdateAppSettings { it.copy(autoHideObserveKeyStrip = !it.autoHideObserveKeyStrip) }
                     }
@@ -1673,9 +1372,8 @@ private fun DefaultSettingsPane(
                             }
                         )
                     }
-                    TacticalActionPill(
-                        text = if (appSettings.keepAliveInBackground) "已开启" else "已关闭",
-                        accent = appSettings.keepAliveInBackground,
+                    HerdrToggle(
+                        checked = appSettings.keepAliveInBackground,
                         onClick = {
                             onUpdateAppSettings { it.copy(keepAliveInBackground = !it.keepAliveInBackground) }
                         }
@@ -2140,51 +1838,36 @@ private fun SettingsSectionCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .clip(HerdrShapes.Card)
             .background(HerdrColors.Surface)
-            .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(16.dp))
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .then(if (HerdrColors.IsLight) Modifier.border(1.dp, HerdrColors.Border, HerdrShapes.Card) else Modifier)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { onToggleExpand() },
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .clickable { onToggleExpand() }
+                .padding(start = 16.dp, end = 10.dp, top = 14.dp, bottom = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = title,
-                    color = HerdrColors.Foreground,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 14.5.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                OneLine(title, HerdrType.Heading, HerdrColors.Foreground)
                 Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = subtitle,
-                    color = HerdrColors.Muted,
-                    fontSize = 11.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                OneLine(subtitle, HerdrType.Caption, HerdrColors.Muted)
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = if (expanded) "收起 ▴" else "展开 ▾",
-                color = HerdrColors.Accent,
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Medium
+            Icon(
+                imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                contentDescription = if (expanded) "收起" else "展开",
+                tint = HerdrColors.Dim,
+                modifier = Modifier.size(20.dp)
             )
         }
         AnimatedVisibility(visible = expanded) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .padding(start = 16.dp, end = 16.dp, bottom = 16.dp, top = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 content()
             }
@@ -2202,41 +1885,24 @@ private fun PresetTargetCard(
 ) {
     Column(
         modifier = modifier
-            .clip(RoundedCornerShape(9.dp))
+            .clip(RoundedCornerShape(10.dp))
             .background(if (selected) HerdrColors.Surface else Color.Transparent)
-            .then(
-                if (selected) {
-                    Modifier.border(0.8.dp, HerdrColors.Accent.copy(alpha = 0.65f), RoundedCornerShape(9.dp))
-                } else {
-                    Modifier
-                }
-            )
             .clickable { onClick() }
-            .padding(horizontal = 10.dp, vertical = 9.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier
-                    .size(6.dp)
-                    .clip(CircleShape)
-                    .background(if (selected) HerdrColors.Accent else HerdrColors.Dim)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = title,
-                color = if (selected) HerdrColors.Foreground else HerdrColors.Muted,
-                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                fontSize = 12.5.sp,
-                softWrap = false,
-                maxLines = 1
-            )
-        }
+        Text(
+            text = title,
+            style = HerdrType.Label,
+            color = if (selected) HerdrColors.Foreground else HerdrColors.Muted,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+            softWrap = false,
+            maxLines = 1
+        )
         Text(
             text = subtitle,
-            color = if (selected) HerdrColors.Accent else HerdrColors.Dim,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.sp,
+            style = HerdrType.Caption,
+            color = if (selected) HerdrColors.Muted else HerdrColors.Dim,
             softWrap = false,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -2260,13 +1926,13 @@ private fun TacticalInputField(
 
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(5.dp)
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         if (!label.isNullOrBlank()) {
             Text(
                 text = label,
+                style = HerdrType.Caption,
                 color = if (focused) HerdrColors.Accent else HerdrColors.Muted,
-                fontSize = 11.5.sp,
                 fontWeight = FontWeight.Medium,
                 softWrap = false,
                 maxLines = 1,
@@ -2276,22 +1942,21 @@ private fun TacticalInputField(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(HerdrColors.Canvas.copy(alpha = 0.65f))
-                .border(
-                    width = if (focused) 1.2.dp else 0.7.dp,
-                    color = if (focused) HerdrColors.Accent else HerdrColors.InputBorder,
-                    shape = RoundedCornerShape(10.dp)
+                .heightIn(min = 44.dp)
+                .clip(HerdrShapes.Control)
+                .background(HerdrColors.Raised)
+                .then(
+                    if (focused) Modifier.border(1.dp, HerdrColors.Accent, HerdrShapes.Control) else Modifier
                 )
-                .padding(horizontal = 12.dp, vertical = 10.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             contentAlignment = Alignment.CenterStart
         ) {
             if (value.isEmpty()) {
                 Text(
                     text = placeholder,
+                    style = HerdrType.Label,
                     color = HerdrColors.Dim,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Normal,
                     maxLines = maxLines,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -2302,12 +1967,7 @@ private fun TacticalInputField(
                 singleLine = singleLine,
                 minLines = minLines,
                 maxLines = maxLines,
-                textStyle = TextStyle(
-                    color = HerdrColors.Foreground,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.5.sp,
-                    lineHeight = 17.sp
-                ),
+                textStyle = HerdrType.Mono.copy(color = HerdrColors.Foreground, fontSize = 13.5.sp, lineHeight = 19.sp),
                 cursorBrush = SolidColor(HerdrColors.Accent),
                 keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
                 modifier = Modifier
@@ -2326,22 +1986,24 @@ private fun TacticalActionPill(
 ) {
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
+            .heightIn(min = 34.dp)
+            .clip(RoundedCornerShape(10.dp))
             .background(if (accent) HerdrColors.AccentSubtle else HerdrColors.Raised)
             .clickable { onClick() }
-            .padding(horizontal = 11.dp, vertical = 6.dp),
+            .padding(horizontal = 12.dp, vertical = 7.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = text,
+            style = HerdrType.Label,
             color = if (accent) HerdrColors.Accent else HerdrColors.Foreground,
-            fontSize = 11.5.sp,
-            fontWeight = if (accent) FontWeight.Bold else FontWeight.Medium,
+            fontWeight = if (accent) FontWeight.SemiBold else FontWeight.Medium,
             softWrap = false,
             maxLines = 1
         )
     }
 }
+
 
 @Composable
 private fun DiagnosticsPipelineCard(
@@ -2510,7 +2172,7 @@ private fun DiagnosticsPipelineCard(
             }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = if (showStages) "收起 ▴" else "展开 ▾",
+                text = if (showStages) "收起" else "展开",
                 color = HerdrColors.Accent,
                 fontSize = 11.5.sp,
                 fontWeight = FontWeight.Medium,
@@ -2650,2347 +2312,6 @@ private fun DiagnosticsPipelineCard(
                             maxLines = 1
                         )
                     }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun AgentsTopologyPane(
-    nodes: List<AgentTreeNode>,
-    allTerminals: List<TerminalSummary>,
-    totalLiveCount: Int,
-    statusCounts: Map<AgentStateWord, Int>,
-    connectionState: ConnectionState,
-    activeTerminalAddress: String?,
-    currentFilter: AgentStateWord?,
-    acknowledgedDoneTurns: Map<String, Int>,
-    dispatchedReceipts: Map<String, DispatchedReceipt>,
-    onSelectFilter: (AgentStateWord?) -> Unit,
-    onRefresh: () -> Unit,
-    onCardClick: (TerminalSummary) -> Unit,
-    onWriteNextInstruction: (TerminalSummary) -> Unit,
-    onQuickDispatch: (TerminalSummary, String, Boolean) -> Unit,
-    onAcknowledgeDone: (TerminalSummary) -> Unit,
-    onConnectNow: () -> Unit,
-    onEnterDemoMode: () -> Unit,
-    onGoToConnect: () -> Unit
-) {
-    val liveTerminals = remember(allTerminals) { allTerminals.filter { it.state == "live" } }
-    val childrenByParent = remember(liveTerminals) {
-        val byAddress = liveTerminals.associateBy { it.address }
-        val byShortId = liveTerminals.associateBy { it.address.substringAfterLast('/') }
-        val result = mutableMapOf<String, MutableList<TerminalSummary>>()
-        for (term in liveTerminals) {
-            val rawParent = term.parent?.trim().orEmpty()
-            if (rawParent.isEmpty()) continue
-            val resolvedParent = byAddress[rawParent] ?: byShortId[rawParent.substringAfterLast('/')]
-            if (resolvedParent != null && resolvedParent.address != term.address) {
-                result.getOrPut(resolvedParent.address) { mutableListOf() }.add(term)
-            }
-        }
-        result
-    }
-
-    val allUrgentCount = remember(liveTerminals) {
-        liveTerminals.count { it.agentStatus == AgentStateWord.BLOCKED || it.agentStatus == AgentStateWord.ERROR }
-    }
-    val allReadyDoneCount = remember(liveTerminals, acknowledgedDoneTurns) {
-        liveTerminals.count {
-            it.agentStatus == AgentStateWord.DONE && acknowledgedDoneTurns[it.address] != it.turn
-        }
-    }
-    val allWorkingCount = remember(liveTerminals) {
-        liveTerminals.count { it.agentStatus == AgentStateWord.WORKING }
-    }
-    val allQuietCount = remember(liveTerminals, acknowledgedDoneTurns) {
-        liveTerminals.count {
-            it.agentStatus == AgentStateWord.IDLE ||
-                it.agentStatus == AgentStateWord.NONE ||
-                (it.agentStatus == AgentStateWord.DONE && acknowledgedDoneTurns[it.address] == it.turn)
-        }
-    }
-
-    val urgentNodes = remember(nodes) {
-        nodes.filter {
-            it.summary.agentStatus == AgentStateWord.BLOCKED || it.summary.agentStatus == AgentStateWord.ERROR
-        }
-    }
-    val readyDoneNodes = remember(nodes, acknowledgedDoneTurns) {
-        nodes.filter {
-            it.summary.agentStatus == AgentStateWord.DONE &&
-                acknowledgedDoneTurns[it.summary.address] != it.summary.turn
-        }
-    }
-    val workingNodes = remember(nodes) {
-        nodes.filter { it.summary.agentStatus == AgentStateWord.WORKING }
-    }
-    val quietArchiveNodes = remember(nodes, acknowledgedDoneTurns) {
-        nodes.filter {
-            it.summary.agentStatus == AgentStateWord.IDLE ||
-                it.summary.agentStatus == AgentStateWord.NONE ||
-                (it.summary.agentStatus == AgentStateWord.DONE &&
-                    acknowledgedDoneTurns[it.summary.address] == it.summary.turn)
-        }
-    }
-
-    var expandQuietArchive by remember(currentFilter) {
-        mutableStateOf(currentFilter == AgentStateWord.IDLE || currentFilter == AgentStateWord.DONE)
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 14.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        // Inline Connection Status & Recovery Banner when not yet connected
-        if (connectionState !is ConnectionState.Connected) {
-            val isConnecting = connectionState is ConnectionState.Connecting
-            val isFailed = connectionState is ConnectionState.Failed
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(
-                        when {
-                            isConnecting -> HerdrColors.WorkingSubtle
-                            isFailed -> HerdrColors.BlockedSubtle
-                            else -> HerdrColors.Surface
-                        }
-                    )
-                    .border(
-                        width = 0.8.dp,
-                        color = when {
-                            isConnecting -> HerdrColors.Working
-                            isFailed -> HerdrColors.Blocked
-                            else -> HerdrColors.Border
-                        },
-                        shape = RoundedCornerShape(14.dp)
-                    )
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = when (connectionState) {
-                                is ConnectionState.Connecting ->
-                                    "正在建立加密连接 · 第 ${connectionState.activeStage.stepNumber} 步 ${connectionState.activeStage.title}"
-                                is ConnectionState.Failed ->
-                                    "链路受阻 · ${connectionState.failedStage.title}"
-                                else ->
-                                    "等待连接远端牧群主机"
-                            },
-                            color = when {
-                                isConnecting -> HerdrColors.Working
-                                isFailed -> HerdrColors.Blocked
-                                else -> HerdrColors.Foreground
-                            },
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.5.sp
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = when (connectionState) {
-                                is ConnectionState.Connecting ->
-                                    "若局域网不可达且已配置 ZeroTier，将自动回退虚拟局域网..."
-                                is ConnectionState.Failed ->
-                                    connectionState.message
-                                else ->
-                                    "一键连接远端 SSH，或直接体验内置离线多 Agent 演示"
-                            },
-                            color = HerdrColors.Muted,
-                            fontSize = 11.5.sp,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(HerdrColors.Accent)
-                            .clickable { onConnectNow() }
-                            .padding(horizontal = 13.dp, vertical = 7.dp)
-                    ) {
-                        Text(
-                            text = if (isConnecting) "重新握手" else "立即连接",
-                            color = HerdrColors.OnAccent,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(HerdrColors.Raised)
-                            .clickable { onEnterDemoMode() }
-                            .padding(horizontal = 12.dp, vertical = 7.dp)
-                    ) {
-                        Text(
-                            text = "离线演示",
-                            color = HerdrColors.Foreground,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 12.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(HerdrColors.Raised)
-                            .clickable { onGoToConnect() }
-                            .padding(horizontal = 12.dp, vertical = 7.dp)
-                    ) {
-                        Text(
-                            text = "链路诊断与切换 →",
-                            color = HerdrColors.Accent,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 12.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-        }
-
-        // Triage Filter Strip + Refresh
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val filters: List<Triple<AgentStateWord?, String, Color>> = listOf(
-                    Triple(null, "分诊收件箱 $totalLiveCount", HerdrColors.Accent),
-                    Triple(
-                        AgentStateWord.BLOCKED,
-                        if (allUrgentCount > 0) "🔴 等你拍板 $allUrgentCount" else "等你拍板",
-                        HerdrColors.Blocked
-                    ),
-                    Triple(
-                        AgentStateWord.DONE,
-                        if (allReadyDoneCount > 0) "🟢 待派活 $allReadyDoneCount" else "已完成 ${statusCounts[AgentStateWord.DONE] ?: 0}",
-                        HerdrColors.Done
-                    ),
-                    Triple(
-                        AgentStateWord.WORKING,
-                        if (allWorkingCount > 0) "⚡ 运行中 $allWorkingCount" else "运行中",
-                        HerdrColors.Working
-                    ),
-                    Triple(
-                        AgentStateWord.IDLE,
-                        if (allQuietCount > 0) "🌙 归档 $allQuietCount" else "归档",
-                        HerdrColors.Muted
-                    )
-                )
-                filters.forEach { (word, label, highlightColor) ->
-                    val active = currentFilter == word
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(
-                                if (active) highlightColor.copy(alpha = 0.16f) else HerdrColors.Surface
-                            )
-                            .border(
-                                width = if (active) 1.dp else 0.6.dp,
-                                color = if (active) highlightColor else HerdrColors.Border,
-                                shape = RoundedCornerShape(999.dp)
-                            )
-                            .clickable { onSelectFilter(word) }
-                            .padding(horizontal = 11.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = label,
-                            color = if (active) highlightColor else HerdrColors.Muted,
-                            fontSize = 11.5.sp,
-                            fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-
-            TacticalActionPill(
-                text = "↻ 刷新",
-                accent = false,
-                onClick = onRefresh
-            )
-        }
-
-        if (nodes.isEmpty()) {
-            val isConnected = connectionState is ConnectionState.Connected
-            val isFilteredEmpty = isConnected && totalLiveCount > 0 && currentFilter != null
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = when {
-                            !isConnected -> "牧群收件箱待命中"
-                            isFilteredEmpty -> "该分诊分组下暂无终端"
-                            else -> "远端暂无活跃 Agent 终端"
-                        },
-                        color = HerdrColors.Foreground,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.5.sp
-                    )
-                    Text(
-                        text = when {
-                            !isConnected -> "点击上方「立即连接」建立远端会话，或点「离线演示」体验分诊与批示流"
-                            isFilteredEmpty -> "共有 $totalLiveCount 个在管终端，当前筛选条件下无匹配项"
-                            else -> "远端 Herdr Core 运行正常，当前尚未启动托管终端"
-                        },
-                        color = HerdrColors.Muted,
-                        fontSize = 12.sp
-                    )
-                    if (isFilteredEmpty) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(HerdrColors.Accent)
-                                .clickable { onSelectFilter(null) }
-                                .padding(horizontal = 18.dp, vertical = 10.dp)
-                        ) {
-                            Text(
-                                text = "返回全部牧群 ($totalLiveCount)",
-                                color = HerdrColors.OnAccent,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.5.sp
-                            )
-                        }
-                    }
-                }
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                // Tier 1: Urgent Blocked / Error (Needs immediate user decision)
-                if (urgentNodes.isNotEmpty()) {
-                    item(key = "header_urgent") {
-                        TriageSectionHeader(
-                            badgeText = "🔴 等你拍板 · 阻塞待批示",
-                            count = urgentNodes.size,
-                            accentColor = HerdrColors.Blocked,
-                            subtitle = "支持在卡片内一键批准/确认，或进入批示台查看上下文"
-                        )
-                    }
-                    items(urgentNodes, key = { "urgent_${it.summary.address}" }) { node ->
-                        UrgentTriageCard(
-                            node = node,
-                            childHelpers = childrenByParent[node.summary.address].orEmpty(),
-                            isCurrentlyAttached = node.summary.address == activeTerminalAddress,
-                            recentReceipt = dispatchedReceipts[node.summary.address],
-                            onOpenWorkbench = { onCardClick(node.summary) },
-                            onQuickDispatch = { payload, isSpecialKey ->
-                                onQuickDispatch(node.summary, payload, isSpecialKey)
-                            },
-                            onSelectChild = onCardClick
-                        )
-                    }
-                }
-
-                // Tier 2: Unacknowledged DONE (Just finished a turn, waiting for next instruction)
-                if (readyDoneNodes.isNotEmpty()) {
-                    item(key = "header_ready_done") {
-                        TriageSectionHeader(
-                            badgeText = "🟢 刚完成 · 待验收派活",
-                            count = readyDoneNodes.size,
-                            accentColor = HerdrColors.Done,
-                            subtitle = "本轮任务已收工，可立即派发下一轮指令或标记已阅归档"
-                        )
-                    }
-                    items(readyDoneNodes, key = { "done_${it.summary.address}" }) { node ->
-                        ReadyDoneTriageCard(
-                            node = node,
-                            childHelpers = childrenByParent[node.summary.address].orEmpty(),
-                            isCurrentlyAttached = node.summary.address == activeTerminalAddress,
-                            recentReceipt = dispatchedReceipts[node.summary.address],
-                            onOpenWorkbench = { onCardClick(node.summary) },
-                            onWriteNextInstruction = { onWriteNextInstruction(node.summary) },
-                            onQuickDispatch = { payload, isSpecialKey ->
-                                onQuickDispatch(node.summary, payload, isSpecialKey)
-                            },
-                            onAcknowledgeDone = { onAcknowledgeDone(node.summary) },
-                            onSelectChild = onCardClick
-                        )
-                    }
-                }
-
-                // Tier 3: Autonomous WORKING (Compact telemetry rows)
-                if (workingNodes.isNotEmpty()) {
-                    item(key = "header_working") {
-                        TriageSectionHeader(
-                            badgeText = "⚡ 正在自主推进",
-                            count = workingNodes.size,
-                            accentColor = HerdrColors.Working,
-                            subtitle = "无需人工干预，点击任意节点可随时巡检或插话"
-                        )
-                    }
-                    items(workingNodes, key = { "working_${it.summary.address}" }) { node ->
-                        CompactWorkingTriageRow(
-                            node = node,
-                            childHelpers = childrenByParent[node.summary.address].orEmpty(),
-                            isCurrentlyAttached = node.summary.address == activeTerminalAddress,
-                            recentReceipt = dispatchedReceipts[node.summary.address],
-                            onOpenWorkbench = { onCardClick(node.summary) },
-                            onSelectChild = onCardClick
-                        )
-                    }
-                }
-
-                // Tier 4: Quiet Archive (IDLE shells + Acknowledged DONE, collapsed by default)
-                if (quietArchiveNodes.isNotEmpty()) {
-                    item(key = "header_quiet_archive") {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(HerdrColors.Surface)
-                                .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(12.dp))
-                                .clickable { expandQuietArchive = !expandQuietArchive }
-                                .padding(horizontal = 14.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(7.dp)
-                                        .clip(CircleShape)
-                                        .background(HerdrColors.Idle)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "已归档与空闲终端 (${quietArchiveNodes.size})",
-                                    color = HerdrColors.Muted,
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 12.5.sp
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "含已阅 DONE 与空闲 Shell",
-                                    color = HerdrColors.Dim,
-                                    fontSize = 11.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            Text(
-                                text = if (expandQuietArchive) "收起 ▴" else "展开 ▾",
-                                color = HerdrColors.Accent,
-                                fontSize = 11.5.sp,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-                    }
-
-                    if (expandQuietArchive) {
-                        items(quietArchiveNodes, key = { "quiet_${it.summary.address}" }) { node ->
-                            CompactQuietTriageRow(
-                                node = node,
-                                isCurrentlyAttached = node.summary.address == activeTerminalAddress,
-                                onOpenWorkbench = { onCardClick(node.summary) },
-                                onWriteNextInstruction = { onWriteNextInstruction(node.summary) }
-                            )
-                        }
-                    }
-                }
-
-                item(key = "bottom_spacer") {
-                    Spacer(modifier = Modifier.height(18.dp))
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TriageSectionHeader(
-    badgeText: String,
-    count: Int,
-    accentColor: Color,
-    subtitle: String
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 2.dp, bottom = 1.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.weight(1f)
-        ) {
-            Text(
-                text = badgeText,
-                color = accentColor,
-                fontWeight = FontWeight.Bold,
-                fontSize = 12.5.sp,
-                softWrap = false,
-                maxLines = 1
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(accentColor.copy(alpha = 0.16f))
-                    .padding(horizontal = 7.dp, vertical = 1.5.dp)
-            ) {
-                Text(
-                    text = "$count",
-                    color = accentColor,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 10.5.sp
-                )
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = subtitle,
-                color = HerdrColors.Dim,
-                fontSize = 11.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-    }
-}
-
-@Composable
-private fun UrgentTriageCard(
-    node: AgentTreeNode,
-    childHelpers: List<TerminalSummary>,
-    isCurrentlyAttached: Boolean,
-    recentReceipt: DispatchedReceipt?,
-    onOpenWorkbench: () -> Unit,
-    onQuickDispatch: (String, Boolean) -> Unit,
-    onSelectChild: (TerminalSummary) -> Unit
-) {
-    val item = node.summary
-    val headline = remember(item) {
-        StructuredTerminalReader.extractLatestHeadline(null, item)
-    }
-    val quickActions = remember(item) {
-        StructuredTerminalReader.extractQuickActions(null, item).take(3)
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(IntrinsicSize.Min)
-            .clip(RoundedCornerShape(15.dp))
-            .background(HerdrColors.Surface)
-            .border(
-                width = 1.3.dp,
-                color = HerdrColors.Blocked,
-                shape = RoundedCornerShape(15.dp)
-            )
-            .clickable { onOpenWorkbench() }
-    ) {
-        Box(
-            modifier = Modifier
-                .width(4.5.dp)
-                .fillMaxHeight()
-                .background(HerdrColors.Blocked)
-        )
-
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.BlockedSubtle)
-                            .padding(horizontal = 7.dp, vertical = 2.5.dp)
-                    ) {
-                        Text(
-                            text = item.address,
-                            color = HerdrColors.Blocked,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = item.name?.takeIf { it.isNotBlank() } ?: item.workspaceSubtitle,
-                        color = HerdrColors.Foreground,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(6.dp))
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = (item.agentApp ?: "agent").uppercase(),
-                        color = HerdrColors.Muted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.Raised)
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
-                    Text(
-                        text = if (item.agentStatus == AgentStateWord.ERROR) "ERROR" else "待拍板",
-                        color = HerdrColors.Blocked,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 10.5.sp,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.BlockedSubtle)
-                            .padding(horizontal = 7.dp, vertical = 2.dp)
-                    )
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(HerdrColors.BlockedSubtle.copy(alpha = 0.65f))
-                    .border(0.7.dp, HerdrColors.Blocked.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 11.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                Text(
-                    text = headline,
-                    color = HerdrColors.Foreground,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    lineHeight = 18.5.sp,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = "${item.workspaceSubtitle} · Turn ${item.turn}",
-                    color = HerdrColors.Muted,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.5.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            if (childHelpers.isNotEmpty()) {
-                SwarmChildHelperStrip(
-                    childHelpers = childHelpers,
-                    onSelectChild = onSelectChild
-                )
-            }
-
-            if (recentReceipt != null) {
-                DispatchedReceiptInlineBanner(receipt = recentReceipt)
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(7.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                quickActions.forEach { action ->
-                    val bg = when {
-                        action.isPrimary -> HerdrColors.Done
-                        action.isDanger -> HerdrColors.BlockedSubtle
-                        else -> HerdrColors.Raised
-                    }
-                    val fg = when {
-                        action.isPrimary -> Color.White
-                        action.isDanger -> HerdrColors.Blocked
-                        else -> HerdrColors.Foreground
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(bg)
-                            .clickable { onQuickDispatch(action.payload, action.isSpecialKey) }
-                            .padding(horizontal = 11.dp, vertical = 7.dp)
-                    ) {
-                        Text(
-                            text = action.label,
-                            color = fg,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 11.5.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(9.dp))
-                        .background(HerdrColors.AccentSubtle)
-                        .clickable { onOpenWorkbench() }
-                        .padding(horizontal = 11.dp, vertical = 7.dp)
-                ) {
-                    Text(
-                        text = if (isCurrentlyAttached) "批示台 (当前) →" else "进入批示台 →",
-                        color = HerdrColors.Accent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 11.5.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ReadyDoneTriageCard(
-    node: AgentTreeNode,
-    childHelpers: List<TerminalSummary>,
-    isCurrentlyAttached: Boolean,
-    recentReceipt: DispatchedReceipt?,
-    onOpenWorkbench: () -> Unit,
-    onWriteNextInstruction: () -> Unit,
-    onQuickDispatch: (String, Boolean) -> Unit,
-    onAcknowledgeDone: () -> Unit,
-    onSelectChild: (TerminalSummary) -> Unit
-) {
-    val item = node.summary
-    val headline = remember(item) {
-        StructuredTerminalReader.extractLatestHeadline(null, item)
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(IntrinsicSize.Min)
-            .clip(RoundedCornerShape(14.dp))
-            .background(HerdrColors.Surface)
-            .border(
-                width = if (isCurrentlyAttached) 1.2.dp else 0.8.dp,
-                color = if (isCurrentlyAttached) HerdrColors.Accent else HerdrColors.Done.copy(alpha = 0.65f),
-                shape = RoundedCornerShape(14.dp)
-            )
-            .clickable { onOpenWorkbench() }
-    ) {
-        Box(
-            modifier = Modifier
-                .width(4.dp)
-                .fillMaxHeight()
-                .background(HerdrColors.Done)
-        )
-
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 14.dp, vertical = 11.dp),
-            verticalArrangement = Arrangement.spacedBy(7.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.DoneSubtle)
-                            .padding(horizontal = 7.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = item.address,
-                            color = HerdrColors.Done,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = item.name?.takeIf { it.isNotBlank() } ?: item.workspaceSubtitle,
-                        color = HerdrColors.Foreground,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.5.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    if (!item.parent.isNullOrBlank()) {
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "↳ ${item.parent}",
-                            color = HerdrColors.Muted,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.5.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.width(6.dp))
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "${(item.agentApp ?: "agent").uppercase()} · Turn ${item.turn}",
-                        color = HerdrColors.Muted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp
-                    )
-                    Text(
-                        text = "✓ 已完成",
-                        color = HerdrColors.Done,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 10.sp,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.DoneSubtle)
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
-                }
-            }
-
-            Text(
-                text = headline,
-                color = HerdrColors.Foreground,
-                fontSize = 12.5.sp,
-                lineHeight = 17.5.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
-
-            if (childHelpers.isNotEmpty()) {
-                SwarmChildHelperStrip(
-                    childHelpers = childHelpers,
-                    onSelectChild = onSelectChild
-                )
-            }
-
-            if (recentReceipt != null) {
-                DispatchedReceiptInlineBanner(receipt = recentReceipt)
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(7.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(HerdrColors.Accent)
-                        .clickable { onWriteNextInstruction() }
-                        .padding(horizontal = 11.dp, vertical = 6.5.dp)
-                ) {
-                    Text(
-                        text = "✎ 派下一轮指令",
-                        color = HerdrColors.OnAccent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 11.5.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(HerdrColors.Raised)
-                        .clickable { onQuickDispatch("继续", false) }
-                        .padding(horizontal = 10.dp, vertical = 6.5.dp)
-                ) {
-                    Text(
-                        text = "继续推进",
-                        color = HerdrColors.Foreground,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 11.5.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-
-                Spacer(modifier = Modifier.weight(1f))
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(HerdrColors.Raised)
-                        .clickable { onAcknowledgeDone() }
-                        .padding(horizontal = 10.dp, vertical = 6.5.dp)
-                ) {
-                    Text(
-                        text = "✓ 已阅归档",
-                        color = HerdrColors.Muted,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 11.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CompactWorkingTriageRow(
-    node: AgentTreeNode,
-    childHelpers: List<TerminalSummary>,
-    isCurrentlyAttached: Boolean,
-    recentReceipt: DispatchedReceipt?,
-    onOpenWorkbench: () -> Unit,
-    onSelectChild: (TerminalSummary) -> Unit
-) {
-    val item = node.summary
-    val headline = remember(item) {
-        StructuredTerminalReader.extractLatestHeadline(null, item)
-    }
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(IntrinsicSize.Min)
-            .clip(RoundedCornerShape(12.dp))
-            .background(HerdrColors.Surface)
-            .border(
-                width = if (isCurrentlyAttached) 1.1.dp else 0.6.dp,
-                color = if (isCurrentlyAttached) HerdrColors.Accent else HerdrColors.Border,
-                shape = RoundedCornerShape(12.dp)
-            )
-            .clickable { onOpenWorkbench() }
-    ) {
-        Box(
-            modifier = Modifier
-                .width(3.5.dp)
-                .fillMaxHeight()
-                .background(HerdrColors.Working)
-        )
-
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 12.dp, vertical = 9.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(5.dp))
-                        .background(HerdrColors.WorkingSubtle)
-                        .padding(horizontal = 6.dp, vertical = 1.5.dp)
-                ) {
-                    Text(
-                        text = item.address,
-                        color = HerdrColors.Working,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 11.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-                Spacer(modifier = Modifier.width(7.dp))
-                Text(
-                    text = item.name?.takeIf { it.isNotBlank() } ?: item.workspaceSubtitle,
-                    color = HerdrColors.Foreground,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 12.5.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "${(item.agentApp ?: "shell").uppercase()} · Turn ${item.turn}",
-                    color = HerdrColors.Dim,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    softWrap = false,
-                    maxLines = 1
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "⚡ 运行中",
-                    color = HerdrColors.Working,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 10.sp,
-                    softWrap = false,
-                    maxLines = 1
-                )
-            }
-
-            Text(
-                text = headline,
-                color = HerdrColors.Muted,
-                fontSize = 11.5.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-
-            if (childHelpers.isNotEmpty()) {
-                SwarmChildHelperStrip(
-                    childHelpers = childHelpers,
-                    onSelectChild = onSelectChild
-                )
-            }
-
-            if (recentReceipt != null) {
-                DispatchedReceiptInlineBanner(receipt = recentReceipt)
-            }
-        }
-    }
-}
-
-@Composable
-private fun CompactQuietTriageRow(
-    node: AgentTreeNode,
-    isCurrentlyAttached: Boolean,
-    onOpenWorkbench: () -> Unit,
-    onWriteNextInstruction: () -> Unit
-) {
-    val item = node.summary
-    val isDone = item.agentStatus == AgentStateWord.DONE
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .background(HerdrColors.Surface.copy(alpha = 0.78f))
-            .border(
-                width = if (isCurrentlyAttached) 1.dp else 0.5.dp,
-                color = if (isCurrentlyAttached) HerdrColors.Accent else HerdrColors.Border,
-                shape = RoundedCornerShape(10.dp)
-            )
-            .clickable { onOpenWorkbench() }
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = item.address,
-            color = if (isDone) HerdrColors.Done else HerdrColors.Muted,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 11.sp,
-            softWrap = false,
-            maxLines = 1
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = item.name?.takeIf { it.isNotBlank() } ?: item.workspaceSubtitle,
-            color = HerdrColors.Foreground,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            text = if (isDone) "已阅 DONE" else "IDLE",
-            color = HerdrColors.Dim,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.sp
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(6.dp))
-                .background(HerdrColors.Raised)
-                .clickable { onWriteNextInstruction() }
-                .padding(horizontal = 8.dp, vertical = 4.dp)
-        ) {
-            Text(
-                text = "派活 →",
-                color = HerdrColors.Accent,
-                fontSize = 10.5.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
-    }
-}
-
-@Composable
-private fun SwarmChildHelperStrip(
-    childHelpers: List<TerminalSummary>,
-    onSelectChild: (TerminalSummary) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = "↳ 协作子助手:",
-            color = HerdrColors.Dim,
-            fontSize = 10.5.sp,
-            fontWeight = FontWeight.Medium,
-            softWrap = false,
-            maxLines = 1
-        )
-        childHelpers.forEach { child ->
-            val dotColor = when (child.agentStatus) {
-                AgentStateWord.BLOCKED, AgentStateWord.ERROR -> HerdrColors.Blocked
-                AgentStateWord.DONE -> HerdrColors.Done
-                AgentStateWord.WORKING -> HerdrColors.Working
-                else -> HerdrColors.Idle
-            }
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(7.dp))
-                    .background(HerdrColors.Raised)
-                    .border(0.5.dp, dotColor.copy(alpha = 0.5f), RoundedCornerShape(7.dp))
-                    .clickable { onSelectChild(child) }
-                    .padding(horizontal = 8.dp, vertical = 3.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(5.5.dp)
-                        .clip(CircleShape)
-                        .background(dotColor)
-                )
-                Spacer(modifier = Modifier.width(5.dp))
-                Text(
-                    text = "${child.address.substringAfterLast('/')} ${child.name.orEmpty()}".trim(),
-                    color = HerdrColors.Foreground,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.5.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    softWrap = false,
-                    maxLines = 1
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun DispatchedReceiptInlineBanner(receipt: DispatchedReceipt) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(HerdrColors.AccentSubtle)
-            .padding(horizontal = 10.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = "✓ 已发送批示「${receipt.text}」· 正在同步远端状态...",
-            color = HerdrColors.Accent,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-    }
-}
-
-@Composable
-private fun LiveTerminalAttachPane(
-    session: TerminalSession?,
-    summary: TerminalSummary?,
-    allLiveTerminals: List<TerminalSummary>,
-    acknowledgedDoneTurns: Map<String, Int>,
-    draftText: String,
-    dispatchedReceipt: DispatchedReceipt?,
-    requestInputFocusSignal: Long,
-    appSettings: HerdrAppSettings,
-    savedDesktopDims: Map<String, Pair<Int, Int>>,
-    mobilePtyTargetCols: Int,
-    onNavigateBack: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onSwitchTerminal: (TerminalSummary) -> Unit,
-    onUpdateDraft: (String) -> Unit,
-    onToggleMode: () -> Unit,
-    onTakeoverPtyWidth: (Int) -> Unit,
-    onReleasePtyWidth: () -> Unit,
-    onSendLine: (String, Boolean) -> Unit,
-    onSendSpecialKey: (String) -> Unit,
-    onInterrupt: () -> Unit,
-    onPickTerminal: () -> Unit
-) {
-    if (session == null || summary == null) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(24.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text(
-                    text = "尚未选择 Agent 终端",
-                    color = HerdrColors.Foreground,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 15.5.sp
-                )
-                Text(
-                    text = "请返回牧群分诊收件箱选择需要批示或巡检的 Agent。",
-                    color = HerdrColors.Muted,
-                    fontSize = 12.5.sp
-                )
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(HerdrColors.Accent)
-                        .clickable { onPickTerminal() }
-                        .padding(horizontal = 18.dp, vertical = 10.dp)
-                ) {
-                    Text(
-                        text = "← 返回牧群收件箱",
-                        color = HerdrColors.OnAccent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp
-                    )
-                }
-            }
-        }
-        return
-    }
-
-    val clipboardManager = LocalClipboardManager.current
-    val rawScreen by session.screenSnapshot.collectAsState()
-    val dims by session.dimensions.collectAsState()
-
-    // Default to Structured Reflow Reader Mode (`阅读批示`); user can toggle to 1:1 Raw PTY (`>_ 原始`) anytime
-    var structuredReaderMode by remember { mutableStateOf(true) }
-    var fontZoomDeltaSp by remember(session.address) { mutableFloatStateOf(0f) }
-    var softWrapLines by remember(session.address) { mutableStateOf(false) }
-    var showSpecialKeyStrip by remember(session.address) { mutableStateOf(false) }
-    val inputFocusRequester = remember { FocusRequester() }
-    val coroutineScope = rememberCoroutineScope()
-
-    LaunchedEffect(requestInputFocusSignal) {
-        if (requestInputFocusSignal > 0L) {
-            delay(120)
-            runCatching { inputFocusRequester.requestFocus() }
-        }
-    }
-
-    val curCols = dims.first
-    val curRows = dims.second
-    val isMobilePtyLocked = curCols in 1..88
-    val desktopOrigDims = savedDesktopDims[summary.address]
-
-    val semanticBlocks = remember(rawScreen) {
-        StructuredTerminalReader.parseBlocks(rawScreen)
-    }
-    val quickActions = remember(rawScreen, summary) {
-        StructuredTerminalReader.extractQuickActions(rawScreen, summary)
-    }
-
-    val fastSwitchList = remember(allLiveTerminals, acknowledgedDoneTurns, summary.address) {
-        allLiveTerminals.sortedWith(
-            compareBy<TerminalSummary> { term ->
-                when {
-                    term.agentStatus == AgentStateWord.BLOCKED || term.agentStatus == AgentStateWord.ERROR -> 0
-                    term.address == summary.address -> 1
-                    term.agentStatus == AgentStateWord.DONE && acknowledgedDoneTurns[term.address] != term.turn -> 2
-                    term.agentStatus == AgentStateWord.WORKING -> 3
-                    else -> 4
-                }
-            }.thenBy { it.address }
-        )
-    }
-
-    val otherBlockedCount = remember(allLiveTerminals, summary.address) {
-        allLiveTerminals.count {
-            it.address != summary.address &&
-                (it.agentStatus == AgentStateWord.BLOCKED || it.agentStatus == AgentStateWord.ERROR)
-        }
-    }
-
-    val activeThemePreset = HerdrColors.currentPalette.preset
-    val styledScreen = remember(rawScreen, activeThemePreset, structuredReaderMode) {
-        if (structuredReaderMode) {
-            AnnotatedString("")
-        } else {
-            AnsiTerminalParser.parseToAnnotatedString(rawScreen, mobileReflow = false)
-        }
-    }
-
-    val readerScrollState = rememberScrollState()
-    val rawVScroll = rememberScrollState()
-    val rawHScroll = rememberScrollState()
-    var followBottom by remember(session.address) { mutableStateOf(true) }
-    var isProgrammaticScroll by remember(session.address) { mutableStateOf(false) }
-    var lastProgrammaticTarget by remember(session.address) { mutableIntStateOf(0) }
-
-    val activeVScroll = if (structuredReaderMode) readerScrollState else rawVScroll
-
-    LaunchedEffect(activeVScroll) {
-        snapshotFlow { Triple(activeVScroll.value, activeVScroll.maxValue, activeVScroll.isScrollInProgress) }
-            .collect { (value, maxValue, inProgress) ->
-                if (maxValue <= 0 || isProgrammaticScroll) return@collect
-                val distFromBottom = (maxValue - value).coerceAtLeast(0)
-                if (inProgress) {
-                    followBottom = distFromBottom <= 24
-                    if (followBottom) {
-                        lastProgrammaticTarget = value
-                    }
-                } else if (followBottom && value < lastProgrammaticTarget - 24 && distFromBottom > 24) {
-                    followBottom = false
-                }
-            }
-    }
-
-    LaunchedEffect(rawScreen, structuredReaderMode, activeVScroll.maxValue, dispatchedReceipt?.timestampMs) {
-        val currentMax = activeVScroll.maxValue
-        if (currentMax <= 0) return@LaunchedEffect
-        if (followBottom && !activeVScroll.isScrollInProgress) {
-            isProgrammaticScroll = true
-            try {
-                activeVScroll.scrollTo(currentMax)
-                lastProgrammaticTarget = activeVScroll.value
-            } finally {
-                isProgrammaticScroll = false
-            }
-        }
-    }
-
-    val isScrolledUp = !followBottom && activeVScroll.maxValue > 32 && (activeVScroll.maxValue - activeVScroll.value) > 32
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Top Workbench Header + Fast-Switch Agent Strip + View Mode Toggle
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(HerdrColors.Chrome)
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(7.dp)
-        ) {
-            // Row 1: Back to Fleet + Current Agent Title + View Mode Switcher ([阅读批示 | >_ 原始])
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(if (otherBlockedCount > 0) HerdrColors.BlockedSubtle else HerdrColors.Raised)
-                        .clickable { onNavigateBack() }
-                        .padding(horizontal = 9.dp, vertical = 5.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (otherBlockedCount > 0) "← 牧群 ($otherBlockedCount 待拍板)" else "← 牧群",
-                        color = if (otherBlockedCount > 0) HerdrColors.Blocked else HerdrColors.Accent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 11.5.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = summary.address,
-                            color = HerdrColors.Accent,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 12.5.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = summary.name?.takeIf { it.isNotBlank() } ?: summary.workspaceSubtitle,
-                            color = HerdrColors.Foreground,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.width(6.dp))
-
-                // Segmented View Mode Toggle: [ 阅读批示 | >_ 原始 ]
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(9.dp))
-                        .background(HerdrColors.Raised)
-                        .padding(2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(2.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(7.dp))
-                            .background(if (structuredReaderMode) HerdrColors.Accent else Color.Transparent)
-                            .clickable {
-                                structuredReaderMode = true
-                                followBottom = true
-                            }
-                            .padding(horizontal = 9.dp, vertical = 4.5.dp)
-                    ) {
-                        Text(
-                            text = "阅读批示",
-                            color = if (structuredReaderMode) HerdrColors.OnAccent else HerdrColors.Muted,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 11.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(7.dp))
-                            .background(if (!structuredReaderMode) HerdrColors.Accent else Color.Transparent)
-                            .clickable {
-                                structuredReaderMode = false
-                                followBottom = true
-                            }
-                            .padding(horizontal = 9.dp, vertical = 4.5.dp)
-                    ) {
-                        Text(
-                            text = ">_ 原始",
-                            color = if (!structuredReaderMode) HerdrColors.OnAccent else HerdrColors.Muted,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 11.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-
-            // Row 2: Horizontal Fast-Switch Agent Strip (1-tap jump between blocked/done/working terminals)
-            if (fastSwitchList.size > 1) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    fastSwitchList.forEach { term ->
-                        val isCurrent = term.address == summary.address
-                        val isUnackedDone = term.agentStatus == AgentStateWord.DONE &&
-                            acknowledgedDoneTurns[term.address] != term.turn
-                        val dotColor = when {
-                            term.agentStatus == AgentStateWord.BLOCKED || term.agentStatus == AgentStateWord.ERROR -> HerdrColors.Blocked
-                            isUnackedDone -> HerdrColors.Done
-                            term.agentStatus == AgentStateWord.WORKING -> HerdrColors.Working
-                            else -> HerdrColors.Idle
-                        }
-                        Row(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(if (isCurrent) HerdrColors.AccentSubtle else HerdrColors.Surface)
-                                .border(
-                                    width = if (isCurrent) 1.1.dp else 0.6.dp,
-                                    color = if (isCurrent) HerdrColors.Accent else dotColor.copy(alpha = 0.45f),
-                                    shape = RoundedCornerShape(999.dp)
-                                )
-                                .clickable {
-                                    if (!isCurrent) {
-                                        onSwitchTerminal(term)
-                                    }
-                                }
-                                .padding(horizontal = 9.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(6.dp)
-                                    .clip(CircleShape)
-                                    .background(dotColor)
-                            )
-                            Spacer(modifier = Modifier.width(5.dp))
-                            Text(
-                                text = buildString {
-                                    append(term.address.substringAfterLast('/'))
-                                    val label = term.name?.takeIf { it.isNotBlank() }
-                                    if (label != null) {
-                                        append(" ")
-                                        append(label)
-                                    }
-                                },
-                                color = if (isCurrent) HerdrColors.Accent else HerdrColors.Foreground,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
-                                fontSize = 10.5.sp,
-                                softWrap = false,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Row 3: Low-level PTY / Font / Wrap Controls (ONLY shown when user switches to `>_ 原始` raw PTY mode)
-            AnimatedVisibility(visible = !structuredReaderMode) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(5.dp)
-                ) {
-                    Text(
-                        text = "${curCols}×${curRows}",
-                        color = HerdrColors.Muted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 10.sp
-                    )
-                    listOf(56, 68, 80).forEach { presetCols ->
-                        val isSelected = curCols == presetCols
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(if (isSelected) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                                .clickable {
-                                    fontZoomDeltaSp = 0f
-                                    coroutineScope.launch { rawHScroll.scrollTo(0) }
-                                    onTakeoverPtyWidth(presetCols)
-                                }
-                                .padding(horizontal = 7.dp, vertical = 3.dp)
-                        ) {
-                            Text(
-                                text = "PTY ${presetCols}列",
-                                color = if (isSelected) HerdrColors.Accent else HerdrColors.Muted,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-                    if (isMobilePtyLocked) {
-                        val origColsLabel = desktopOrigDims?.first ?: appSettings.defaultDesktopFallbackCols
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(HerdrColors.WorkingSubtle)
-                                .clickable {
-                                    fontZoomDeltaSp = 0f
-                                    onReleasePtyWidth()
-                                }
-                                .padding(horizontal = 7.dp, vertical = 3.dp)
-                        ) {
-                            Text(
-                                text = "释放(${origColsLabel}列)",
-                                color = HerdrColors.Working,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.Raised)
-                            .clickable { fontZoomDeltaSp = (fontZoomDeltaSp - 0.75f).coerceAtLeast(-3.5f) }
-                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = "A-",
-                            color = HerdrColors.Foreground,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.Raised)
-                            .clickable { fontZoomDeltaSp = (fontZoomDeltaSp + 0.75f).coerceAtMost(5.0f) }
-                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = "A+",
-                            color = HerdrColors.Foreground,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 10.sp
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(if (softWrapLines) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                            .clickable { softWrapLines = !softWrapLines }
-                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = if (softWrapLines) "折行" else "1:1等宽",
-                            color = if (softWrapLines) HerdrColors.Accent else HerdrColors.Muted,
-                            fontSize = 10.sp
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(HerdrColors.Raised)
-                            .clickable { onOpenSettings() }
-                            .padding(horizontal = 7.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = "⚙",
-                            color = HerdrColors.Muted,
-                            fontSize = 10.sp
-                        )
-                    }
-                }
-            }
-        }
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(0.5.dp)
-                .background(HerdrColors.Border)
-        )
-
-        // Main Reading / Inspection Viewport
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .background(HerdrColors.Canvas)
-        ) {
-            if (structuredReaderMode) {
-                // Mode A: Structured Mobile-Native Reflow Reader (`结构化重排阅读器`)
-                SelectionContainer {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(readerScrollState)
-                            .padding(horizontal = 14.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        // Agent Context Capsule at top of stream
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(HerdrColors.Surface)
-                                .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(12.dp))
-                                .padding(horizontal = 12.dp, vertical = 9.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "${(summary.agentApp ?: "shell").uppercase()} · Turn ${summary.turn} · ${summary.workspaceSubtitle}",
-                                    color = HerdrColors.Foreground,
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 12.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                if (!summary.cwd.isNullOrBlank()) {
-                                    Text(
-                                        text = summary.cwd.orEmpty(),
-                                        color = HerdrColors.Dim,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 10.5.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            val statusColor = when (summary.agentStatus) {
-                                AgentStateWord.BLOCKED, AgentStateWord.ERROR -> HerdrColors.Blocked
-                                AgentStateWord.DONE -> HerdrColors.Done
-                                AgentStateWord.WORKING -> HerdrColors.Working
-                                else -> HerdrColors.Idle
-                            }
-                            Text(
-                                text = summary.agentStatus.wireName.uppercase(),
-                                color = statusColor,
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 10.5.sp,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(statusColor.copy(alpha = 0.15f))
-                                    .padding(horizontal = 7.dp, vertical = 2.5.dp)
-                            )
-                        }
-
-                        if (semanticBlocks.isEmpty()) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(HerdrColors.Surface)
-                                    .padding(16.dp)
-                            ) {
-                                Text(
-                                    text = summary.agentMessage?.takeIf { it.isNotBlank() }
-                                        ?: "正在同步终端画面，或切换到「>_ 原始」查看原始终端画布...",
-                                    color = HerdrColors.Muted,
-                                    fontSize = 13.5.sp,
-                                    lineHeight = 20.sp
-                                )
-                            }
-                        } else {
-                            semanticBlocks.forEachIndexed { idx, block ->
-                                when (block) {
-                                    is TerminalSemanticBlock.UserPromptBlock -> {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.End
-                                        ) {
-                                            Column(
-                                                modifier = Modifier
-                                                    .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp))
-                                                    .background(HerdrColors.AccentSubtle)
-                                                    .border(
-                                                        0.8.dp,
-                                                        HerdrColors.Accent.copy(alpha = 0.45f),
-                                                        RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp)
-                                                    )
-                                                    .padding(horizontal = 13.dp, vertical = 9.dp),
-                                                verticalArrangement = Arrangement.spacedBy(3.dp)
-                                            ) {
-                                                Text(
-                                                    text = "❯ 指令输入",
-                                                    color = HerdrColors.Accent,
-                                                    fontFamily = FontFamily.Monospace,
-                                                    fontWeight = FontWeight.Bold,
-                                                    fontSize = 10.5.sp
-                                                )
-                                                Text(
-                                                    text = block.text,
-                                                    color = HerdrColors.Foreground,
-                                                    fontSize = 14.5.sp,
-                                                    fontWeight = FontWeight.Medium,
-                                                    lineHeight = 20.5.sp
-                                                )
-                                            }
-                                        }
-                                    }
-
-                                    is TerminalSemanticBlock.ToolGroupBlock -> {
-                                        var expanded by remember(session.address, idx) { mutableStateOf(false) }
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(10.dp))
-                                                .background(HerdrColors.Surface)
-                                                .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(10.dp))
-                                                .clickable { expanded = !expanded }
-                                                .padding(horizontal = 12.dp, vertical = 8.dp),
-                                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text(
-                                                    text = "⚙ ${block.summaryLabel}",
-                                                    color = if (block.hasError) HerdrColors.Blocked else HerdrColors.Muted,
-                                                    fontSize = 12.sp,
-                                                    fontWeight = FontWeight.Medium,
-                                                    maxLines = 1,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    modifier = Modifier.weight(1f)
-                                                )
-                                                Spacer(modifier = Modifier.width(8.dp))
-                                                Text(
-                                                    text = if (expanded) "收起 ▴" else "展开 ▾",
-                                                    color = HerdrColors.Accent,
-                                                    fontSize = 11.sp,
-                                                    fontWeight = FontWeight.SemiBold
-                                                )
-                                            }
-                                            AnimatedVisibility(visible = expanded) {
-                                                Column(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .clip(RoundedCornerShape(8.dp))
-                                                        .background(HerdrColors.Canvas)
-                                                        .padding(10.dp),
-                                                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                                                ) {
-                                                    block.steps.forEach { line ->
-                                                        Text(
-                                                            text = line,
-                                                            color = HerdrColors.Muted,
-                                                            fontFamily = FontFamily.Monospace,
-                                                            fontSize = 11.5.sp,
-                                                            lineHeight = 16.sp
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    is TerminalSemanticBlock.AgentProseBlock -> {
-                                        Text(
-                                            text = if (block.isBullet) "• ${block.text}" else block.text,
-                                            color = HerdrColors.Foreground,
-                                            fontFamily = FontFamily.SansSerif,
-                                            fontSize = if (block.isHeading) 15.5.sp else 14.8.sp,
-                                            fontWeight = if (block.isHeading) FontWeight.Bold else FontWeight.Normal,
-                                            lineHeight = 22.sp,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(
-                                                    start = if (block.isBullet) 8.dp else 2.dp,
-                                                    end = 2.dp
-                                                )
-                                        )
-                                    }
-
-                                    is TerminalSemanticBlock.CodeOrTableBlock -> {
-                                        val codeText = block.content
-                                        val lineCount = remember(codeText) { codeText.lines().size }
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(11.dp))
-                                                .background(HerdrColors.Surface)
-                                                .border(0.7.dp, HerdrColors.Border, RoundedCornerShape(11.dp))
-                                        ) {
-                                            Row(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .background(HerdrColors.Raised)
-                                                    .padding(horizontal = 11.dp, vertical = 5.dp),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text(
-                                                    text = "CODE / OUTPUT ($lineCount 行)",
-                                                    color = HerdrColors.Muted,
-                                                    fontFamily = FontFamily.Monospace,
-                                                    fontSize = 10.5.sp,
-                                                    fontWeight = FontWeight.SemiBold
-                                                )
-                                                Text(
-                                                    text = "复制",
-                                                    color = HerdrColors.Accent,
-                                                    fontSize = 11.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    modifier = Modifier.clickable {
-                                                        clipboardManager.setText(AnnotatedString(codeText))
-                                                    }
-                                                )
-                                            }
-                                            Box(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .horizontalScroll(rememberScrollState())
-                                                    .padding(horizontal = 12.dp, vertical = 9.dp)
-                                            ) {
-                                                Text(
-                                                    text = codeText,
-                                                    color = HerdrColors.Foreground,
-                                                    fontFamily = FontFamily.Monospace,
-                                                    fontSize = 12.sp,
-                                                    lineHeight = 17.sp,
-                                                    softWrap = false
-                                                )
-                                            }
-                                        }
-                                    }
-
-                                    is TerminalSemanticBlock.UrgentAlertBlock -> {
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clip(RoundedCornerShape(12.dp))
-                                                .background(HerdrColors.BlockedSubtle)
-                                                .border(1.2.dp, HerdrColors.Blocked, RoundedCornerShape(12.dp))
-                                                .padding(horizontal = 13.dp, vertical = 10.dp),
-                                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                                        ) {
-                                            Text(
-                                                text = "⚠️ ${block.title}",
-                                                color = HerdrColors.Blocked,
-                                                fontWeight = FontWeight.Bold,
-                                                fontSize = 12.sp
-                                            )
-                                            if (block.detail.isNotBlank() && block.detail != block.title) {
-                                                Text(
-                                                    text = block.detail,
-                                                    color = HerdrColors.Foreground,
-                                                    fontSize = 13.5.sp,
-                                                    fontWeight = FontWeight.Medium,
-                                                    lineHeight = 19.sp
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Deterministic Dispatched Receipt Bubble at bottom of conversation stream
-                        if (dispatchedReceipt != null) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.End
-                            ) {
-                                Column(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp))
-                                        .background(HerdrColors.DoneSubtle)
-                                        .border(
-                                            0.9.dp,
-                                            HerdrColors.Done,
-                                            RoundedCornerShape(14.dp, 14.dp, 4.dp, 14.dp)
-                                        )
-                                        .padding(horizontal = 13.dp, vertical = 9.dp),
-                                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                                ) {
-                                    Text(
-                                        text = "✓ 已下达指令 · 正在同步远端画面",
-                                        color = HerdrColors.Done,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 11.sp
-                                    )
-                                    Text(
-                                        text = dispatchedReceipt.text,
-                                        color = HerdrColors.Foreground,
-                                        fontSize = 13.5.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-                }
-            } else {
-                // Mode B: Native 1:1 ANSI PTY Canvas (`>_ 原始终端`)
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = HerdrColors.Canvas
-                ) {
-                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                        val innerWidthDp = (maxWidth - 20.dp).value.coerceAtLeast(240f)
-                        val baseFontSizeSp = if (curCols in 1..92) {
-                            (innerWidthDp / (curCols * 0.675f)).coerceIn(7.2f, 15.0f)
-                        } else {
-                            10.5f
-                        }
-                        val effectiveFontSizeSp = (baseFontSizeSp + fontZoomDeltaSp).coerceIn(6.8f, 18.0f)
-
-                        val scrollModifier = if (softWrapLines) {
-                            Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rawVScroll)
-                                .padding(horizontal = 10.dp, vertical = 8.dp)
-                        } else {
-                            Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rawVScroll)
-                                .horizontalScroll(rawHScroll, enabled = rawHScroll.maxValue > 4)
-                                .padding(horizontal = 10.dp, vertical = 8.dp)
-                        }
-                        Box(modifier = scrollModifier) {
-                            SelectionContainer {
-                                Text(
-                                    text = styledScreen,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = effectiveFontSizeSp.sp,
-                                    lineHeight = (effectiveFontSizeSp * 1.32f).sp,
-                                    softWrap = softWrapLines
-                                )
-                            }
-                        }
-                    }
-                }
-
-                if (!softWrapLines && rawHScroll.maxValue > 28 && (rawHScroll.maxValue - rawHScroll.value) > 20) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 8.dp, end = 10.dp)
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(HerdrColors.Surface.copy(alpha = 0.88f))
-                            .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(999.dp))
-                            .clickable {
-                                coroutineScope.launch {
-                                    rawHScroll.animateScrollTo((rawHScroll.value + 320).coerceAtMost(rawHScroll.maxValue))
-                                }
-                            }
-                            .padding(horizontal = 9.dp, vertical = 3.5.dp)
-                    ) {
-                        Text(
-                            text = "横滑或切回「阅读批示」→",
-                            color = HerdrColors.Muted,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Medium,
-                            softWrap = false,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-
-            if (isScrolledUp) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(14.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(HerdrColors.Accent)
-                        .clickable {
-                            followBottom = true
-                            coroutineScope.launch {
-                                isProgrammaticScroll = true
-                                try {
-                                    activeVScroll.animateScrollTo(activeVScroll.maxValue)
-                                    lastProgrammaticTarget = activeVScroll.value
-                                } finally {
-                                    isProgrammaticScroll = false
-                                }
-                            }
-                        }
-                        .padding(horizontal = 14.dp, vertical = 7.dp)
-                ) {
-                    Text(
-                        text = "↓ 最新输出",
-                        color = HerdrColors.OnAccent,
-                        fontSize = 11.5.sp,
-                        fontWeight = FontWeight.Bold,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-            }
-        }
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(0.5.dp)
-                .background(HerdrColors.Border)
-        )
-
-        // Bottom Always-Ready Dispatch Bar (Contextual Quick Actions + Special Keys + Always-Active Input)
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(HerdrColors.Chrome)
-                .padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            // Row 1: Contextual Quick-Reply Pills + Toggle Raw Key Strip
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .weight(1f)
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    quickActions.forEach { action ->
-                        val bg = when {
-                            action.isPrimary -> HerdrColors.DoneSubtle
-                            action.isDanger -> HerdrColors.BlockedSubtle
-                            else -> HerdrColors.Raised
-                        }
-                        val fg = when {
-                            action.isPrimary -> HerdrColors.Done
-                            action.isDanger -> HerdrColors.Blocked
-                            else -> HerdrColors.Foreground
-                        }
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(bg)
-                                .border(
-                                    width = 0.6.dp,
-                                    color = if (action.isPrimary || action.isDanger) fg.copy(alpha = 0.5f) else HerdrColors.Border,
-                                    shape = RoundedCornerShape(999.dp)
-                                )
-                                .clickable {
-                                    followBottom = true
-                                    if (action.isSpecialKey) {
-                                        if (action.payload == "ctrl+c") {
-                                            onInterrupt()
-                                        } else {
-                                            onSendSpecialKey(action.payload)
-                                        }
-                                    } else {
-                                        onSendLine(action.payload, false)
-                                    }
-                                }
-                                .padding(horizontal = 11.dp, vertical = 5.5.dp)
-                        ) {
-                            Text(
-                                text = action.label,
-                                color = fg,
-                                fontWeight = if (action.isPrimary || action.isDanger) FontWeight.Bold else FontWeight.Medium,
-                                fontSize = 11.5.sp,
-                                softWrap = false,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(if (showSpecialKeyStrip) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                        .clickable { showSpecialKeyStrip = !showSpecialKeyStrip }
-                        .padding(horizontal = 9.dp, vertical = 5.5.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (showSpecialKeyStrip) "按键 ▾" else "按键 ▴",
-                        color = if (showSpecialKeyStrip) HerdrColors.Accent else HerdrColors.Muted,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Medium,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
-            }
-
-            // Row 2: Optional Raw Special Key Strip (ESC / TAB / Arrows / CTRL+O / CTRL+C)
-            AnimatedVisibility(visible = showSpecialKeyStrip) {
-                val specialKeys = listOf(
-                    "esc" to "ESC",
-                    "tab" to "TAB",
-                    "up" to "↑",
-                    "down" to "↓",
-                    "ctrl+o" to "CTRL+O",
-                    "ctrl+t" to "CTRL+T",
-                    "ctrl+c" to "CTRL+C",
-                    "enter" to "ENTER"
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    specialKeys.forEach { (wireKey, label) ->
-                        val isInterruptKey = wireKey == "ctrl+c"
-                        val isExpandKey = wireKey == "ctrl+o" || wireKey == "ctrl+t"
-                        val keyWeight = when {
-                            label.length == 1 -> 0.72f
-                            label.length >= 6 -> 1.28f
-                            label.length == 5 -> 1.18f
-                            else -> 0.95f
-                        }
-                        Box(
-                            modifier = Modifier
-                                .weight(keyWeight)
-                                .clip(RoundedCornerShape(7.dp))
-                                .background(
-                                    when {
-                                        isInterruptKey -> HerdrColors.BlockedSubtle
-                                        isExpandKey -> HerdrColors.AccentSubtle
-                                        else -> HerdrColors.Raised
-                                    }
-                                )
-                                .clickable {
-                                    followBottom = true
-                                    if (isInterruptKey) {
-                                        onInterrupt()
-                                    } else {
-                                        onSendSpecialKey(wireKey)
-                                    }
-                                }
-                                .padding(vertical = 6.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = label,
-                                color = when {
-                                    isInterruptKey -> HerdrColors.Blocked
-                                    isExpandKey -> HerdrColors.Accent
-                                    else -> HerdrColors.Foreground
-                                },
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 10.sp,
-                                softWrap = false,
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Row 3: Always-Ready Input Field (Preserves draft per terminal & auto-promotes to TAKEOVER on send)
-            var inputFocused by remember { mutableStateOf(false) }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(42.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(HerdrColors.Surface)
-                        .border(
-                            width = if (inputFocused) 1.2.dp else 0.7.dp,
-                            color = if (inputFocused) HerdrColors.Accent else HerdrColors.InputBorder,
-                            shape = RoundedCornerShape(10.dp)
-                        )
-                        .padding(horizontal = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "❯",
-                        color = HerdrColors.Accent,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.5.sp
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Box(
-                        modifier = Modifier.weight(1f),
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        if (draftText.isEmpty()) {
-                            Text(
-                                text = "直接向 ${summary.address.substringAfterLast('/')} (${summary.name ?: summary.workspaceSubtitle}) 下达指令...",
-                                color = HerdrColors.Dim,
-                                fontSize = 12.5.sp,
-                                softWrap = false,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        BasicTextField(
-                            value = draftText,
-                            onValueChange = onUpdateDraft,
-                            singleLine = true,
-                            textStyle = TextStyle(
-                                color = HerdrColors.Foreground,
-                                fontSize = 13.5.sp
-                            ),
-                            cursorBrush = SolidColor(HerdrColors.Accent),
-                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                            keyboardActions = KeyboardActions(
-                                onSend = {
-                                    followBottom = true
-                                    if (draftText.isNotBlank()) {
-                                        val toSend = draftText
-                                        onUpdateDraft("")
-                                        onSendLine(toSend, false)
-                                    } else {
-                                        onSendSpecialKey("enter")
-                                    }
-                                }
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(inputFocusRequester)
-                                .onFocusChanged { inputFocused = it.isFocused }
-                        )
-                    }
-                }
-
-                val hasInputText = draftText.isNotBlank()
-                Box(
-                    modifier = Modifier
-                        .height(42.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (hasInputText) HerdrColors.Accent else HerdrColors.AccentSubtle)
-                        .clickable {
-                            followBottom = true
-                            if (hasInputText) {
-                                val toSend = draftText
-                                onUpdateDraft("")
-                                onSendLine(toSend, false)
-                            } else {
-                                onSendSpecialKey("enter")
-                            }
-                        }
-                        .padding(horizontal = 15.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (hasInputText) "发送" else "⏎ 回车",
-                        color = if (hasInputText) HerdrColors.OnAccent else HerdrColors.Accent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 12.5.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
                 }
             }
         }
