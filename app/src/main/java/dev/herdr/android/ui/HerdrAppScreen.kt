@@ -1,5 +1,11 @@
 package dev.herdr.android.ui
 
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
+import android.content.Context
+import android.os.Build
+import android.os.PersistableBundle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,9 +39,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -56,6 +64,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -65,6 +74,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import dev.herdr.android.connection.ConnectionProfile
 import dev.herdr.android.connection.ConnectionStage
 import dev.herdr.android.connection.ConnectionState
@@ -96,6 +107,8 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val profile by viewModel.profile.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
     val agentNodes by viewModel.agentTreeNodes.collectAsState()
+    val totalLiveCount by viewModel.totalLiveCount.collectAsState()
+    val statusCounts by viewModel.statusCounts.collectAsState()
     val statusFilter by viewModel.statusFilter.collectAsState()
     val activeSession by viewModel.activeSession.collectAsState()
     val activeSummary by viewModel.activeTerminalSummary.collectAsState()
@@ -125,6 +138,8 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
         }
     }
 
+    val effectiveHostLabel = (connectionState as? ConnectionState.Connected)?.profile?.host ?: profile.host
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -136,8 +151,8 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
             Column(modifier = Modifier.fillMaxWidth()) {
                 TopTelemetryBar(
                     connectionState = connectionState,
-                    terminalCount = agentNodes.size,
-                    hostLabel = profile.host,
+                    terminalCount = totalLiveCount,
+                    hostLabel = effectiveHostLabel,
                     currentTheme = appSettings.themePreset,
                     themeDrawerExpanded = showQuickThemeDrawer,
                     onToggleThemeDrawer = { showQuickThemeDrawer = !showQuickThemeDrawer }
@@ -259,34 +274,37 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                     appSettings = appSettings,
                     connectionState = connectionState,
                     zeroTierState = zeroTierState,
-                    agentCount = agentNodes.size,
+                    agentCount = totalLiveCount,
                     onUpdateProfile = viewModel::updateProfile,
                     onUpdateAppSettings = viewModel::updateAppSettings,
-                    onSelectTheme = { preset ->
-                        viewModel.updateAppSettings { it.copy(themePreset = preset) }
-                    },
                     onApplyLanPreset = viewModel::applyLanPreset,
                     onApplyPreset = viewModel::applyPreset,
                     onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
                     onShowBanner = viewModel::showBanner,
                     onConnect = {
-                        if (android.os.Build.VERSION.SDK_INT >= 33 && appSettings.keepAliveInBackground) {
+                        if (Build.VERSION.SDK_INT >= 33 && appSettings.keepAliveInBackground) {
                             runCatching {
                                 notificationPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
                             }
                         }
                         viewModel.connectNow()
                     },
+                    onRefreshTerminals = viewModel::refreshTerminals,
                     onDisconnect = viewModel::disconnectNow,
                     onJumpToAgents = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                 )
 
                 WorkspaceTab.AGENTS -> AgentsTopologyPane(
                     nodes = agentNodes,
+                    totalLiveCount = totalLiveCount,
+                    statusCounts = statusCounts,
+                    connectionState = connectionState,
+                    activeTerminalAddress = activeSession?.address,
                     currentFilter = statusFilter,
                     onSelectFilter = viewModel::setStatusFilter,
                     onRefresh = viewModel::refreshTerminals,
-                    onObserve = { viewModel.attachTerminal(it, appSettings.defaultAttachMode) },
+                    onCardClick = { viewModel.attachTerminal(it, appSettings.defaultAttachMode) },
+                    onObserve = { viewModel.attachTerminal(it, AttachMode.OBSERVE) },
                     onTakeover = { viewModel.attachTerminal(it, AttachMode.TAKEOVER) },
                     onGoToConnect = { viewModel.selectTab(WorkspaceTab.CONNECTION) }
                 )
@@ -332,7 +350,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
         AnimatedVisibility(visible = selectedTab != WorkspaceTab.TERMINAL) {
             BottomWorkspaceDock(
                 selectedTab = selectedTab,
-                agentCount = agentNodes.size,
+                agentCount = totalLiveCount,
                 activeTerminalAddress = activeSession?.address,
                 onSelectTab = viewModel::selectTab
             )
@@ -551,21 +569,13 @@ private fun BottomWorkspaceDock(
     activeTerminalAddress: String?,
     onSelectTab: (WorkspaceTab) -> Unit
 ) {
-    val visibleTabs = remember(activeTerminalAddress) {
-        if (activeTerminalAddress != null) {
-            listOf(
-                WorkspaceTab.CONNECTION,
-                WorkspaceTab.AGENTS,
-                WorkspaceTab.TERMINAL,
-                WorkspaceTab.SETTINGS
-            )
-        } else {
-            listOf(
-                WorkspaceTab.CONNECTION,
-                WorkspaceTab.AGENTS,
-                WorkspaceTab.SETTINGS
-            )
-        }
+    val visibleTabs = remember {
+        listOf(
+            WorkspaceTab.CONNECTION,
+            WorkspaceTab.AGENTS,
+            WorkspaceTab.TERMINAL,
+            WorkspaceTab.SETTINGS
+        )
     }
 
     Column(
@@ -589,11 +599,17 @@ private fun BottomWorkspaceDock(
             visibleTabs.forEach { tab ->
                 val selected = tab == selectedTab
                 val shortTermId = activeTerminalAddress?.substringAfterLast('/')
+                val isUnattachedTerminalTab = tab == WorkspaceTab.TERMINAL && activeTerminalAddress == null
                 val (iconGlyph, label, badge) = when (tab) {
                     WorkspaceTab.CONNECTION -> Triple("◈", "连接", null)
                     WorkspaceTab.AGENTS -> Triple("❖", "拓扑", if (agentCount > 0) "$agentCount" else null)
                     WorkspaceTab.TERMINAL -> Triple("❯_", "终端", shortTermId)
                     WorkspaceTab.SETTINGS -> Triple("⚙", "设置", null)
+                }
+                val itemColor = when {
+                    selected -> HerdrColors.Accent
+                    isUnattachedTerminalTab -> HerdrColors.Dim
+                    else -> HerdrColors.Muted
                 }
                 Row(
                     modifier = Modifier
@@ -607,7 +623,7 @@ private fun BottomWorkspaceDock(
                 ) {
                     Text(
                         text = iconGlyph,
-                        color = if (selected) HerdrColors.Accent else HerdrColors.Muted,
+                        color = itemColor,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         fontSize = 12.5.sp,
@@ -617,7 +633,7 @@ private fun BottomWorkspaceDock(
                     Spacer(modifier = Modifier.width(5.dp))
                     Text(
                         text = label,
-                        color = if (selected) HerdrColors.Accent else HerdrColors.Muted,
+                        color = itemColor,
                         fontSize = 12.5.sp,
                         fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                         softWrap = false,
@@ -635,7 +651,7 @@ private fun BottomWorkspaceDock(
                                 text = badge,
                                 color = if (selected) HerdrColors.OnAccent else HerdrColors.Muted,
                                 fontFamily = FontFamily.Monospace,
-                                fontSize = 9.5.sp,
+                                fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
                                 softWrap = false,
                                 maxLines = 1
@@ -657,20 +673,31 @@ private fun ConnectionAndDiagnosticsPane(
     agentCount: Int,
     onUpdateProfile: ((ConnectionProfile) -> ConnectionProfile) -> Unit,
     onUpdateAppSettings: ((HerdrAppSettings) -> HerdrAppSettings) -> Unit,
-    onSelectTheme: (HerdrThemePreset) -> Unit,
     onApplyLanPreset: () -> Unit,
     onApplyPreset: (Boolean) -> Unit,
     onOpenSettings: () -> Unit,
     onShowBanner: (String) -> Unit,
     onConnect: () -> Unit,
+    onRefreshTerminals: () -> Unit,
     onDisconnect: () -> Unit,
     onJumpToAgents: () -> Unit
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     var showQuickTargetOverride by remember { mutableStateOf(false) }
     var batteryWhitelisted by remember {
         mutableStateOf(HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context))
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryWhitelisted = HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val lanDefaultHost = appSettings.defaultLanHost.ifBlank { "192.168.1.100" }
@@ -678,6 +705,7 @@ private fun ConnectionAndDiagnosticsPane(
     val isPreview = profile.host.startsWith("demo://")
     val isZeroTier = (!isPreview && (profile.useBuiltInZeroTier || profile.host == ztDefaultHost))
     val isLan = (!isPreview && !isZeroTier)
+    val isConnectedOrConnecting = connectionState is ConnectionState.Connected || connectionState is ConnectionState.Connecting
 
     Column(
         modifier = Modifier
@@ -736,21 +764,39 @@ private fun ConnectionAndDiagnosticsPane(
                     subtitle = lanDefaultHost,
                     selected = isLan,
                     modifier = Modifier.weight(1f),
-                    onClick = onApplyLanPreset
+                    onClick = {
+                        val changed = !isLan
+                        onApplyLanPreset()
+                        if (changed && isConnectedOrConnecting) {
+                            onConnect()
+                        }
+                    }
                 )
                 PresetTargetCard(
                     title = "ZeroTier",
                     subtitle = ztDefaultHost,
                     selected = isZeroTier,
                     modifier = Modifier.weight(1f),
-                    onClick = { onApplyPreset(false) }
+                    onClick = {
+                        val changed = !isZeroTier
+                        onApplyPreset(false)
+                        if (changed && isConnectedOrConnecting) {
+                            onConnect()
+                        }
+                    }
                 )
                 PresetTargetCard(
                     title = "离线演示",
                     subtitle = "本地拓扑预览",
                     selected = isPreview,
                     modifier = Modifier.weight(1f),
-                    onClick = { onApplyPreset(true) }
+                    onClick = {
+                        val changed = !isPreview
+                        onApplyPreset(true)
+                        if (changed && isConnectedOrConnecting) {
+                            onConnect()
+                        }
+                    }
                 )
             }
 
@@ -966,71 +1012,175 @@ private fun ConnectionAndDiagnosticsPane(
                 }
             }
 
-            // Primary Action Buttons Row
+            // Primary Action Buttons Row (4-State Machine: Disconnected / Connecting / Failed / Connected)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val isConnected = connectionState is ConnectionState.Connected
-                Box(
-                    modifier = Modifier
-                        .weight(1.25f)
-                        .height(46.dp)
-                        .clip(RoundedCornerShape(11.dp))
-                        .background(HerdrColors.Accent)
-                        .clickable { onConnect() }
-                        .padding(horizontal = 12.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = if (isConnected) "重新同步连接" else "建立加密连接",
-                        color = HerdrColors.OnAccent,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.5.sp,
-                        softWrap = false,
-                        maxLines = 1
-                    )
-                }
+                when (connectionState) {
+                    is ConnectionState.Connected -> {
+                        Box(
+                            modifier = Modifier
+                                .weight(1.35f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.Accent)
+                                .clickable { onJumpToAgents() }
+                                .padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "进入终端拓扑 ($agentCount) →",
+                                color = HerdrColors.OnAccent,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.5.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
 
-                if (isConnected) {
-                    Box(
-                        modifier = Modifier
-                            .weight(1.15f)
-                            .height(46.dp)
-                            .clip(RoundedCornerShape(11.dp))
-                            .background(HerdrColors.AccentSubtle)
-                            .clickable { onJumpToAgents() }
-                            .padding(horizontal = 10.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "终端拓扑 ($agentCount) →",
-                            color = HerdrColors.Accent,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
+                        Box(
+                            modifier = Modifier
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.Raised)
+                                .clickable { onRefreshTerminals() }
+                                .padding(horizontal = 14.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "↻ 同步",
+                                color = HerdrColors.Foreground,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.BlockedSubtle)
+                                .clickable { onDisconnect() }
+                                .padding(horizontal = 14.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "断开",
+                                color = HerdrColors.Blocked,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
                     }
 
-                    Box(
-                        modifier = Modifier
-                            .height(46.dp)
-                            .clip(RoundedCornerShape(11.dp))
-                            .background(HerdrColors.BlockedSubtle)
-                            .clickable { onDisconnect() }
-                            .padding(horizontal = 14.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "断开",
-                            color = HerdrColors.Blocked,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            softWrap = false,
-                            maxLines = 1
-                        )
+                    is ConnectionState.Connecting -> {
+                        Box(
+                            modifier = Modifier
+                                .weight(1.35f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.WorkingSubtle)
+                                .padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "正在握手 (${connectionState.activeStage.stepNumber}/4) · ${connectionState.activeStage.title}",
+                                color = HerdrColors.Working,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.5.sp,
+                                softWrap = false,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.BlockedSubtle)
+                                .clickable { onDisconnect() }
+                                .padding(horizontal = 16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "取消",
+                                color = HerdrColors.Blocked,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    is ConnectionState.Failed -> {
+                        Box(
+                            modifier = Modifier
+                                .weight(1.35f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.Accent)
+                                .clickable { onConnect() }
+                                .padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "重试加密连接",
+                                color = HerdrColors.OnAccent,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.5.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.Raised)
+                                .clickable { onDisconnect() }
+                                .padding(horizontal = 16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "重置",
+                                color = HerdrColors.Muted,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
+                    }
+
+                    ConnectionState.Disconnected -> {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(HerdrColors.Accent)
+                                .clickable { onConnect() }
+                                .padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "建立加密连接",
+                                color = HerdrColors.OnAccent,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.5.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }
@@ -1106,13 +1256,7 @@ private fun ConnectionAndDiagnosticsPane(
             }
         }
 
-        // Theme Showcase Card (Dark & Light Presets)
-        ThemeSelectorCard(
-            currentPreset = appSettings.themePreset,
-            onSelectPreset = onSelectTheme
-        )
-
-        // Progressive-Disclosure Handshake Diagnostics Card
+        // Progressive-Disclosure Handshake Diagnostics Card (visible directly on first screen)
         DiagnosticsPipelineCard(
             connectionState = connectionState,
             onTrustFingerprint = { fp ->
@@ -1316,6 +1460,22 @@ private fun DefaultSettingsPane(
     var expandZtSection by remember { mutableStateOf(true) }
     var expandSshSection by remember { mutableStateOf(profile.privateKeyPem.isBlank()) }
     var expandUpdateSection by remember { mutableStateOf(true) }
+    var showZtIdentityPlaintext by remember { mutableStateOf(false) }
+    var showSshKeyPlaintext by remember { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var batteryWhitelisted by remember {
+        mutableStateOf(HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context))
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryWhitelisted = HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Column(
         modifier = Modifier
@@ -1504,7 +1664,7 @@ private fun DefaultSettingsPane(
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (!HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context)) {
+                    if (!batteryWhitelisted) {
                         TacticalActionPill(
                             text = "省电白名单",
                             accent = false,
@@ -1621,6 +1781,13 @@ private fun DefaultSettingsPane(
                     modifier = Modifier.weight(1f)
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    if (identityDraft.isNotBlank()) {
+                        TacticalActionPill(
+                            text = if (showZtIdentityPlaintext) "隐藏明文" else "显示明文",
+                            accent = showZtIdentityPlaintext,
+                            onClick = { showZtIdentityPlaintext = !showZtIdentityPlaintext }
+                        )
+                    }
                     TacticalActionPill(
                         text = "选文件",
                         accent = false,
@@ -1632,7 +1799,7 @@ private fun DefaultSettingsPane(
                         onClick = {
                             onExportZtIdentity { exported ->
                                 identityDraft = exported
-                                clipboardManager.setText(AnnotatedString(exported))
+                                copySensitiveTextToClipboard(context, "ZeroTier Identity Secret", exported)
                             }
                         }
                     )
@@ -1644,16 +1811,47 @@ private fun DefaultSettingsPane(
                 }
             }
 
-            TacticalInputField(
-                label = null,
-                value = identityDraft,
-                onValueChange = { identityDraft = it },
-                placeholder = "留空自动生成持久化身份；或粘贴已有 identity.secret",
-                singleLine = false,
-                minLines = 2,
-                maxLines = 4,
-                modifier = Modifier.fillMaxWidth()
-            )
+            if (showZtIdentityPlaintext || identityDraft.isBlank()) {
+                TacticalInputField(
+                    label = null,
+                    value = identityDraft,
+                    onValueChange = { identityDraft = it },
+                    placeholder = "留空自动生成持久化身份；或粘贴已有 identity.secret",
+                    singleLine = false,
+                    minLines = 2,
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(HerdrColors.Canvas.copy(alpha = 0.65f))
+                        .border(0.7.dp, HerdrColors.InputBorder, RoundedCornerShape(10.dp))
+                        .clickable { showZtIdentityPlaintext = true }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "✓ 已配置持久化节点身份密钥 (${identityDraft.length} 字符 · 已隐藏明文)",
+                        color = HerdrColors.Done,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.5.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "查看/编辑",
+                        color = HerdrColors.Accent,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
 
         // Section: SSH Credentials & Default Host Addresses
@@ -1790,25 +1988,66 @@ private fun DefaultSettingsPane(
                     color = HerdrColors.Muted,
                     fontSize = 11.5.sp,
                     softWrap = false,
-                    maxLines = 1
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f)
                 )
-                TacticalActionPill(
-                    text = "从文件导入",
-                    accent = true,
-                    onClick = { keyPickerLauncher.launch(arrayOf("*/*")) }
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (profile.privateKeyPem.isNotBlank()) {
+                        TacticalActionPill(
+                            text = if (showSshKeyPlaintext) "隐藏明文" else "显示明文",
+                            accent = showSshKeyPlaintext,
+                            onClick = { showSshKeyPlaintext = !showSshKeyPlaintext }
+                        )
+                    }
+                    TacticalActionPill(
+                        text = "从文件导入",
+                        accent = true,
+                        onClick = { keyPickerLauncher.launch(arrayOf("*/*")) }
+                    )
+                }
             }
 
-            TacticalInputField(
-                label = null,
-                value = profile.privateKeyPem,
-                onValueChange = { pem -> onUpdateProfile { it.copy(privateKeyPem = pem) } },
-                placeholder = "粘贴 -----BEGIN OPENSSH PRIVATE KEY----- 或从文件导入",
-                singleLine = false,
-                minLines = 3,
-                maxLines = 5,
-                modifier = Modifier.fillMaxWidth()
-            )
+            if (showSshKeyPlaintext || profile.privateKeyPem.isBlank()) {
+                TacticalInputField(
+                    label = null,
+                    value = profile.privateKeyPem,
+                    onValueChange = { pem -> onUpdateProfile { it.copy(privateKeyPem = pem) } },
+                    placeholder = "粘贴 -----BEGIN OPENSSH PRIVATE KEY----- 或从文件导入",
+                    singleLine = false,
+                    minLines = 3,
+                    maxLines = 5,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(HerdrColors.Canvas.copy(alpha = 0.65f))
+                        .border(0.7.dp, HerdrColors.InputBorder, RoundedCornerShape(10.dp))
+                        .clickable { showSshKeyPlaintext = true }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "✓ 已配置 Ed25519 私钥 (${profile.privateKeyPem.lines().size} 行 / ${profile.privateKeyPem.length} 字符 · 已隐藏明文)",
+                        color = HerdrColors.Done,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.5.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "查看/编辑",
+                        color = HerdrColors.Accent,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
 
         // Section: App Version & GitHub Release Online Update
@@ -2117,8 +2356,109 @@ private fun DiagnosticsPipelineCard(
     }
 
     val isActiveOrFailed = connectionState is ConnectionState.Connecting || connectionState is ConnectionState.Failed
-    var manuallyExpanded by remember { mutableStateOf(false) }
-    val showStages = isActiveOrFailed || manuallyExpanded
+    var showStages by remember(connectionState::class) { mutableStateOf(isActiveOrFailed) }
+    var pendingTrustFingerprint by remember { mutableStateOf<String?>(null) }
+    val isHostKeyChanged = (connectionState as? ConnectionState.Failed)?.errorKind == "host_key_changed"
+
+    pendingTrustFingerprint?.let { fp ->
+        val formattedFp = remember(fp) {
+            fp.removePrefix("SHA256:").chunked(8).joinToString(" ")
+        }
+        AlertDialog(
+            onDismissRequest = { pendingTrustFingerprint = null },
+            containerColor = HerdrColors.Surface,
+            titleContentColor = HerdrColors.Foreground,
+            textContentColor = HerdrColors.Foreground,
+            title = {
+                Text(
+                    text = if (isHostKeyChanged) {
+                        "⚠️ 警告：远端主机指纹发生变更"
+                    } else {
+                        "确认信任 SSH 主机指纹"
+                    },
+                    color = if (isHostKeyChanged) HerdrColors.Blocked else HerdrColors.Foreground,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.5.sp
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (isHostKeyChanged) {
+                            "远端主机返回的公钥指纹与您之前固定信任的指纹不一致！这可能是由于远端重装了系统/OpenSSH，或者当前网络存在中间人攻击 (MITM)。请务必在远端机器核对以下 SHA256 指纹："
+                        } else {
+                            "首次建立固定指纹信任前，请核对远端 OpenSSH 服务端的公钥 SHA256 指纹："
+                        },
+                        color = if (isHostKeyChanged) HerdrColors.Blocked else HerdrColors.Muted,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(HerdrColors.Canvas)
+                            .border(0.8.dp, HerdrColors.Border, RoundedCornerShape(10.dp))
+                            .padding(12.dp)
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "SHA256:",
+                                color = HerdrColors.Accent,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp
+                            )
+                            Text(
+                                text = formattedFp,
+                                color = HerdrColors.Foreground,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.5.sp,
+                                lineHeight = 18.sp
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(if (isHostKeyChanged) HerdrColors.Blocked else HerdrColors.Accent)
+                        .clickable {
+                            val targetFp = fp
+                            pendingTrustFingerprint = null
+                            onTrustFingerprint(targetFp)
+                        }
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = if (isHostKeyChanged) "确认覆盖并重连" else "确认信任并重连",
+                        color = if (isHostKeyChanged) Color.White else HerdrColors.OnAccent,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.5.sp
+                    )
+                }
+            },
+            dismissButton = {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(HerdrColors.Raised)
+                        .clickable { pendingTrustFingerprint = null }
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = "取消",
+                        color = HerdrColors.Foreground,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 12.5.sp
+                    )
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -2136,7 +2476,7 @@ private fun DiagnosticsPipelineCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { manuallyExpanded = !manuallyExpanded },
+                .clickable { showStages = !showStages },
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -2292,14 +2632,18 @@ private fun DiagnosticsPipelineCard(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(9.dp))
-                            .background(HerdrColors.Accent)
-                            .clickable { onTrustFingerprint(detectedSha256) }
+                            .background(if (isHostKeyChanged) HerdrColors.Blocked else HerdrColors.Accent)
+                            .clickable { pendingTrustFingerprint = detectedSha256 }
                             .padding(vertical = 10.dp, horizontal = 12.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "信任并填入服务端指纹重连",
-                            color = HerdrColors.OnAccent,
+                            text = if (isHostKeyChanged) {
+                                "⚠️ 核对并覆盖服务端指纹..."
+                            } else {
+                                "核对并信任服务端指纹..."
+                            },
+                            color = if (isHostKeyChanged) Color.White else HerdrColors.OnAccent,
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.5.sp,
                             softWrap = false,
@@ -2315,13 +2659,22 @@ private fun DiagnosticsPipelineCard(
 @Composable
 private fun AgentsTopologyPane(
     nodes: List<AgentTreeNode>,
+    totalLiveCount: Int,
+    statusCounts: Map<AgentStateWord, Int>,
+    connectionState: ConnectionState,
+    activeTerminalAddress: String?,
     currentFilter: AgentStateWord?,
     onSelectFilter: (AgentStateWord?) -> Unit,
     onRefresh: () -> Unit,
+    onCardClick: (TerminalSummary) -> Unit,
     onObserve: (TerminalSummary) -> Unit,
     onTakeover: (TerminalSummary) -> Unit,
     onGoToConnect: () -> Unit
 ) {
+    val visibleAddressSet = remember(nodes) {
+        nodes.mapTo(mutableSetOf()) { it.summary.address }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -2341,12 +2694,16 @@ private fun AgentsTopologyPane(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                val blockedCount = statusCounts[AgentStateWord.BLOCKED] ?: 0
+                val workingCount = statusCounts[AgentStateWord.WORKING] ?: 0
+                val doneCount = statusCounts[AgentStateWord.DONE] ?: 0
+                val idleCount = statusCounts[AgentStateWord.IDLE] ?: 0
                 val filters: List<Pair<AgentStateWord?, String>> = listOf(
-                    null to "全部 ${nodes.size}",
-                    AgentStateWord.BLOCKED to "待处理",
-                    AgentStateWord.WORKING to "运行中",
-                    AgentStateWord.DONE to "已完成",
-                    AgentStateWord.IDLE to "空闲"
+                    null to "全部 $totalLiveCount",
+                    AgentStateWord.BLOCKED to if (blockedCount > 0) "待处理 $blockedCount" else "待处理",
+                    AgentStateWord.WORKING to if (workingCount > 0) "运行中 $workingCount" else "运行中",
+                    AgentStateWord.DONE to if (doneCount > 0) "已完成 $doneCount" else "已完成",
+                    AgentStateWord.IDLE to if (idleCount > 0) "空闲 $idleCount" else "空闲"
                 )
                 filters.forEach { (word, label) ->
                     val active = currentFilter == word
@@ -2382,6 +2739,8 @@ private fun AgentsTopologyPane(
         }
 
         if (nodes.isEmpty()) {
+            val isConnected = connectionState is ConnectionState.Connected
+            val isFilteredEmpty = isConnected && totalLiveCount > 0 && currentFilter != null
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -2393,13 +2752,21 @@ private fun AgentsTopologyPane(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "暂无活跃终端节点",
+                        text = when {
+                            !isConnected -> "尚未建立远端连接"
+                            isFilteredEmpty -> "当前筛选条件下无终端"
+                            else -> "远端暂无活跃终端"
+                        },
                         color = HerdrColors.Foreground,
                         fontWeight = FontWeight.Bold,
                         fontSize = 15.5.sp
                     )
                     Text(
-                        text = "请先在「连接」页建立远端会话，或切换筛选条件",
+                        text = when {
+                            !isConnected -> "请先在「连接」页建立远端 SSH 会话或开启离线演示"
+                            isFilteredEmpty -> "共有 $totalLiveCount 个活跃终端，但没有处于该状态的节点"
+                            else -> "远端 Herdr Core 运行正常，当前尚未开启托管终端"
+                        },
                         color = HerdrColors.Muted,
                         fontSize = 12.sp
                     )
@@ -2408,11 +2775,21 @@ private fun AgentsTopologyPane(
                         modifier = Modifier
                             .clip(RoundedCornerShape(10.dp))
                             .background(HerdrColors.Accent)
-                            .clickable { onGoToConnect() }
+                            .clickable {
+                                when {
+                                    !isConnected -> onGoToConnect()
+                                    isFilteredEmpty -> onSelectFilter(null)
+                                    else -> onRefresh()
+                                }
+                            }
                             .padding(horizontal = 18.dp, vertical = 10.dp)
                     ) {
                         Text(
-                            text = "前往连接工作台 →",
+                            text = when {
+                                !isConnected -> "前往连接工作台 →"
+                                isFilteredEmpty -> "显示全部终端 ($totalLiveCount)"
+                                else -> "↻ 刷新终端列表"
+                            },
                             color = HerdrColors.OnAccent,
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.5.sp
@@ -2426,8 +2803,13 @@ private fun AgentsTopologyPane(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(nodes, key = { it.summary.address }) { node ->
+                    val parentAddr = node.summary.parent
+                    val isParentFilteredOut = !parentAddr.isNullOrBlank() && parentAddr !in visibleAddressSet
                     AgentTreeNodeCard(
                         node = node,
+                        isCurrentlyAttached = node.summary.address == activeTerminalAddress,
+                        isParentFilteredOut = isParentFilteredOut,
+                        onCardClick = { onCardClick(node.summary) },
                         onObserve = { onObserve(node.summary) },
                         onTakeover = { onTakeover(node.summary) }
                     )
@@ -2443,6 +2825,9 @@ private fun AgentsTopologyPane(
 @Composable
 private fun AgentTreeNodeCard(
     node: AgentTreeNode,
+    isCurrentlyAttached: Boolean,
+    isParentFilteredOut: Boolean,
+    onCardClick: () -> Unit,
     onObserve: () -> Unit,
     onTakeover: () -> Unit
 ) {
@@ -2454,6 +2839,7 @@ private fun AgentTreeNodeCard(
         AgentStateWord.DONE -> HerdrColors.Done
         AgentStateWord.IDLE, AgentStateWord.NONE -> HerdrColors.Idle
     }
+    val isUrgent = item.agentStatus == AgentStateWord.BLOCKED || item.agentStatus == AgentStateWord.ERROR
 
     Row(
         modifier = Modifier
@@ -2480,15 +2866,15 @@ private fun AgentTreeNodeCard(
                 .clip(RoundedCornerShape(14.dp))
                 .background(HerdrColors.Surface)
                 .border(
-                    width = if (item.agentStatus == AgentStateWord.BLOCKED) 1.2.dp else 0.6.dp,
-                    color = if (item.agentStatus == AgentStateWord.BLOCKED) {
-                        HerdrColors.Blocked
-                    } else {
-                        HerdrColors.Border
+                    width = if (isUrgent || isCurrentlyAttached) 1.2.dp else 0.6.dp,
+                    color = when {
+                        isUrgent -> HerdrColors.Blocked
+                        isCurrentlyAttached -> HerdrColors.Accent
+                        else -> HerdrColors.Border
                     },
                     shape = RoundedCornerShape(14.dp)
                 )
-                .clickable { onObserve() }
+                .clickable { onCardClick() }
         ) {
             // Left vertical status indicator rail
             Box(
@@ -2541,6 +2927,17 @@ private fun AgentTreeNodeCard(
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
+                        if (isParentFilteredOut && !item.parent.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "↳ ${item.parent}",
+                                color = HerdrColors.Muted,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.5.sp,
+                                softWrap = false,
+                                maxLines = 1
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.width(8.dp))
@@ -2549,6 +2946,20 @@ private fun AgentTreeNodeCard(
                         horizontalArrangement = Arrangement.spacedBy(5.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        if (isCurrentlyAttached) {
+                            Text(
+                                text = "● 挂载中",
+                                color = HerdrColors.Accent,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(HerdrColors.AccentSubtle)
+                                    .padding(horizontal = 6.dp, vertical = 2.5.dp)
+                            )
+                        }
                         Text(
                             text = (item.agentApp ?: "shell").uppercase(),
                             color = HerdrColors.Muted,
@@ -2718,7 +3129,7 @@ private fun LiveTerminalAttachPane(
     val mode by session.mode.collectAsState()
     val rawScreen by session.screenSnapshot.collectAsState()
     val dims by session.dimensions.collectAsState()
-    var inputBuffer by remember { mutableStateOf("") }
+    var inputBuffer by remember(session.address) { mutableStateOf("") }
     var fontZoomDeltaSp by remember(session.address) { mutableFloatStateOf(0f) }
     var softWrapLines by remember(session.address) { mutableStateOf(false) }
     var pendingFocusAfterUnlock by remember { mutableStateOf(false) }
@@ -2880,22 +3291,42 @@ private fun LiveTerminalAttachPane(
                     horizontalArrangement = Arrangement.spacedBy(5.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(if (mode == AttachMode.TAKEOVER) HerdrColors.DoneSubtle else HerdrColors.Raised)
+                            .clickable {
+                                topBarInteractionTick++
+                                onToggleMode()
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.5.dp)
+                    ) {
+                        Text(
+                            text = if (mode == AttachMode.TAKEOVER) "● 接管" else "只读",
+                            color = if (mode == AttachMode.TAKEOVER) HerdrColors.Done else HerdrColors.Muted,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 10.5.sp,
+                            softWrap = false,
+                            maxLines = 1
+                        )
+                    }
+
                     if (!isMobilePtyLocked) {
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(HerdrColors.Accent)
+                                .clip(RoundedCornerShape(7.dp))
+                                .background(HerdrColors.AccentSubtle)
                                 .clickable {
                                     fontZoomDeltaSp = 0f
                                     topBarInteractionTick++
                                     coroutineScope.launch { hScroll.scrollTo(0) }
                                     onTakeoverPtyWidth(mobilePtyTargetCols)
                                 }
-                                .padding(horizontal = 9.dp, vertical = 4.5.dp)
+                                .padding(horizontal = 8.dp, vertical = 4.5.dp)
                         ) {
                             Text(
                                 text = "PTY ${mobilePtyTargetCols}列",
-                                color = HerdrColors.OnAccent,
+                                color = HerdrColors.Accent,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 10.5.sp,
                                 softWrap = false,
@@ -2906,14 +3337,14 @@ private fun LiveTerminalAttachPane(
                         val origColsLabel = desktopOrigDims?.first ?: appSettings.defaultDesktopFallbackCols
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
+                                .clip(RoundedCornerShape(7.dp))
                                 .background(HerdrColors.WorkingSubtle)
                                 .clickable {
                                     fontZoomDeltaSp = 0f
                                     topBarInteractionTick++
                                     onReleasePtyWidth()
                                 }
-                                .padding(horizontal = 9.dp, vertical = 4.5.dp)
+                                .padding(horizontal = 8.dp, vertical = 4.5.dp)
                         ) {
                             Text(
                                 text = "释放(${origColsLabel}列)",
@@ -2928,7 +3359,7 @@ private fun LiveTerminalAttachPane(
 
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(7.dp))
                             .background(HerdrColors.Raised)
                             .clickable {
                                 topBarExpanded = !topBarExpanded
@@ -3124,6 +3555,32 @@ private fun LiveTerminalAttachPane(
                             )
                         }
                     }
+                }
+            }
+
+            if (!softWrapLines && hScroll.maxValue > 28 && (hScroll.maxValue - hScroll.value) > 20) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 8.dp, end = 10.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(HerdrColors.Surface.copy(alpha = 0.88f))
+                        .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(999.dp))
+                        .clickable {
+                            coroutineScope.launch {
+                                hScroll.animateScrollTo((hScroll.value + 320).coerceAtMost(hScroll.maxValue))
+                            }
+                        }
+                        .padding(horizontal = 9.dp, vertical = 3.5.dp)
+                ) {
+                    Text(
+                        text = "横滑或点「折行」→",
+                        color = HerdrColors.Muted,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        softWrap = false,
+                        maxLines = 1
+                    )
                 }
             }
 
@@ -3358,6 +3815,8 @@ private fun LiveTerminalAttachPane(
                                         if (inputBuffer.isNotBlank()) {
                                             onSendLine(inputBuffer, false)
                                             inputBuffer = ""
+                                        } else {
+                                            onSendSpecialKey("enter")
                                         }
                                     }
                                 ),
@@ -3387,24 +3846,28 @@ private fun LiveTerminalAttachPane(
                         )
                     }
 
-                    val canSend = inputBuffer.isNotBlank()
+                    val hasInputText = inputBuffer.isNotBlank()
                     Box(
                         modifier = Modifier
                             .height(42.dp)
                             .clip(RoundedCornerShape(10.dp))
-                            .background(if (canSend) HerdrColors.Accent else HerdrColors.Raised)
-                            .clickable(enabled = canSend) {
-                                onSendLine(inputBuffer, false)
-                                inputBuffer = ""
+                            .background(if (hasInputText) HerdrColors.Accent else HerdrColors.AccentSubtle)
+                            .clickable {
+                                if (hasInputText) {
+                                    onSendLine(inputBuffer, false)
+                                    inputBuffer = ""
+                                } else {
+                                    onSendSpecialKey("enter")
+                                }
                             }
-                            .padding(horizontal = 15.dp),
+                            .padding(horizontal = 14.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "发送",
-                            color = if (canSend) HerdrColors.OnAccent else HerdrColors.Dim,
+                            text = if (hasInputText) "发送" else "⏎ 回车",
+                            color = if (hasInputText) HerdrColors.OnAccent else HerdrColors.Accent,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 12.5.sp,
+                            fontSize = 12.sp,
                             softWrap = false,
                             maxLines = 1
                         )
@@ -3413,4 +3876,21 @@ private fun LiveTerminalAttachPane(
             }
         }
     }
+}
+
+private fun copySensitiveTextToClipboard(context: Context, label: String, secret: String) {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    val clip = ClipData.newPlainText(label, secret)
+    if (Build.VERSION.SDK_INT >= 24) {
+        val extras = PersistableBundle().apply {
+            val extraKey = if (Build.VERSION.SDK_INT >= 33) {
+                ClipDescription.EXTRA_IS_SENSITIVE
+            } else {
+                "android.content.extra.IS_SENSITIVE"
+            }
+            putBoolean(extraKey, true)
+        }
+        clip.description.extras = extras
+    }
+    cm.setPrimaryClip(clip)
 }

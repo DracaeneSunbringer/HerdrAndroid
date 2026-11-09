@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -102,6 +103,24 @@ class HerdrMainViewModel(
     private val _statusFilter = MutableStateFlow<AgentStateWord?>(null)
     val statusFilter: StateFlow<AgentStateWord?> = _statusFilter.asStateFlow()
 
+    val totalLiveCount: StateFlow<Int> = controller.terminals.map { list ->
+        list.count { it.state == "live" }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, 0)
+
+    val statusCounts: StateFlow<Map<AgentStateWord, Int>> = controller.terminals.map { list ->
+        val live = list.filter { it.state == "live" }
+        mapOf(
+            AgentStateWord.BLOCKED to live.count {
+                it.agentStatus == AgentStateWord.BLOCKED || it.agentStatus == AgentStateWord.ERROR
+            },
+            AgentStateWord.WORKING to live.count { it.agentStatus == AgentStateWord.WORKING },
+            AgentStateWord.DONE to live.count { it.agentStatus == AgentStateWord.DONE },
+            AgentStateWord.IDLE to live.count {
+                it.agentStatus == AgentStateWord.IDLE || it.agentStatus == AgentStateWord.NONE
+            }
+        )
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
     val agentTreeNodes: StateFlow<List<AgentTreeNode>> = combine(
         controller.terminals,
         _statusFilter
@@ -138,6 +157,9 @@ class HerdrMainViewModel(
     private var ztStateJob: Job? = null
     private var updateJob: Job? = null
     private var lastDesiredAttachMode: AttachMode = AttachMode.OBSERVE
+    private var modeBeforePtyResize: AttachMode? = null
+    private var lastInterruptTapMs: Long = 0L
+    private var lastInterruptTargetAddress: String = ""
 
     fun bindZeroTierTransport(transport: ZeroTierOverlayTransport) {
         ZeroTierOverlayRegistry.transport = transport
@@ -156,6 +178,16 @@ class HerdrMainViewModel(
     fun initializeFromContext(context: Context, intent: Intent?) {
         appContext = context.applicationContext
         HerdrKeepAliveCoordinator.onDisconnectRequested = { disconnectNow() }
+        HerdrKeepAliveCoordinator.onNetworkAvailable = {
+            if (HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
+                _appSettings.value.keepAliveInBackground &&
+                connectionState.value !is ConnectionState.Connected
+            ) {
+                autoReconnectJob?.cancel()
+                autoReconnectJob = null
+                triggerBackgroundAutoReconnect()
+            }
+        }
         val sp = context.getSharedPreferences("herdr_connection_prefs", Context.MODE_PRIVATE)
         prefs = sp
         var current = _profile.value
@@ -355,9 +387,23 @@ class HerdrMainViewModel(
     }
 
     fun updateAppSettings(transform: (HerdrAppSettings) -> HerdrAppSettings) {
-        val updated = transform(_appSettings.value)
+        val previous = _appSettings.value
+        val updated = transform(previous)
         HerdrColors.applyPreset(updated.themePreset)
         _appSettings.value = updated
+        if (updated.defaultLanHost != previous.defaultLanHost &&
+            !_profile.value.useBuiltInZeroTier &&
+            !_profile.value.host.startsWith("demo://") &&
+            _profile.value.host == previous.defaultLanHost
+        ) {
+            updateProfile { it.copy(host = updated.defaultLanHost) }
+        }
+        if (updated.defaultZeroTierHost != previous.defaultZeroTierHost &&
+            _profile.value.useBuiltInZeroTier &&
+            _profile.value.host == previous.defaultZeroTierHost
+        ) {
+            updateProfile { it.copy(host = updated.defaultZeroTierHost) }
+        }
         prefs?.edit()?.apply {
             putString("theme_preset", updated.themePreset.id)
             putString("default_lan_host", updated.defaultLanHost)
@@ -369,7 +415,9 @@ class HerdrMainViewModel(
             putBoolean("keep_alive_in_background", updated.keepAliveInBackground)
             apply()
         }
-        syncKeepAliveNotification()
+        if (updated.keepAliveInBackground != previous.keepAliveInBackground) {
+            syncKeepAliveNotification()
+        }
     }
 
     fun setDefaultMobilePtyCols(cols: Int) {
@@ -644,13 +692,13 @@ class HerdrMainViewModel(
         val keepAliveEnabled = _appSettings.value.keepAliveInBackground
         val state = controller.connectionState.value
         val activeTerm = _activeTerminalSummary.value
-        val termCount = controller.terminals.value.size
-        val host = _profile.value.host
+        val termCount = controller.terminals.value.count { it.state == "live" }
+        val host = (state as? ConnectionState.Connected)?.profile?.host ?: _profile.value.host
 
         val shouldRunService = keepAliveEnabled && (
-            HerdrKeepAliveCoordinator.userWantsConnectionAlive ||
-                state is ConnectionState.Connected ||
-                state is ConnectionState.Connecting
+            state is ConnectionState.Connected ||
+                state is ConnectionState.Connecting ||
+                HerdrKeepAliveCoordinator.isReconnectingInBackground
             )
 
         if (!shouldRunService) {
@@ -727,9 +775,11 @@ class HerdrMainViewModel(
         autoReconnectJob = HerdrKeepAliveCoordinator.processScope.launch {
             HerdrKeepAliveCoordinator.isReconnectingInBackground = true
             syncKeepAliveNotification()
-            val delaysMs = listOf(1200L, 2500L, 4000L, 6000L)
+            val delaysMs = listOf(1500L, 3000L, 6000L, 12000L, 25000L, 45000L)
+            val maxAttempts = 12
             var attemptIndex = 0
             while (isActive &&
+                attemptIndex < maxAttempts &&
                 HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
                 _appSettings.value.keepAliveInBackground &&
                 controller.connectionState.value !is ConnectionState.Connected
@@ -905,6 +955,7 @@ class HerdrMainViewModel(
             val (curCols, curRows) = session.dimensions.value
             if (curCols > 88) {
                 rememberDesktopDimensions(session.address, curCols, curRows)
+                modeBeforePtyResize = session.mode.value
             }
             if (session.mode.value == AttachMode.OBSERVE) {
                 runCatching { session.setMode(AttachMode.TAKEOVER) }
@@ -913,8 +964,8 @@ class HerdrMainViewModel(
             session.requestResize(clampedCols, safeRows)
                 .onSuccess {
                     val orig = _savedDesktopDims.value[session.address]
-                    val origHint = if (orig != null) "（点「释放 PTY」可还原 ${orig.first}×${orig.second}）" else ""
-                    _toastBanner.value = "已接管 ${session.address} PTY 宽度为 ${clampedCols}×${safeRows}$origHint"
+                    val origHint = if (orig != null) "（点「释放」还原 ${orig.first}×${orig.second}）" else ""
+                    _toastBanner.value = "已同步 ${session.address} 列宽为 ${clampedCols}×${safeRows}$origHint"
                 }
                 .onFailure { err ->
                     _toastBanner.value = "PTY 宽度同步失败：${err.message}"
@@ -928,11 +979,15 @@ class HerdrMainViewModel(
             val (_, curRows) = session.dimensions.value
             val fallbackCols = _appSettings.value.defaultDesktopFallbackCols.coerceIn(100, 240)
             val (origCols, origRows) = _savedDesktopDims.value[session.address] ?: (fallbackCols to curRows.coerceAtLeast(44))
+            val restoreMode = modeBeforePtyResize ?: lastDesiredAttachMode
             if (session.mode.value == AttachMode.OBSERVE) {
                 runCatching { session.setMode(AttachMode.TAKEOVER) }
             }
             val resizeRes = session.requestResize(origCols, origRows)
-            runCatching { session.setMode(AttachMode.OBSERVE) }
+            if (restoreMode == AttachMode.OBSERVE) {
+                runCatching { session.setMode(AttachMode.OBSERVE) }
+            }
+            modeBeforePtyResize = null
             resizeRes.onSuccess {
                 _toastBanner.value = "已释放 ${session.address} PTY 并还原桌面尺寸 ${origCols}×${origRows}"
             }.onFailure { err ->
@@ -952,9 +1007,9 @@ class HerdrMainViewModel(
             lastDesiredAttachMode = next
             current.setMode(next)
             _toastBanner.value = if (next == AttachMode.OBSERVE) {
-                "已切换为 Observe 只读观看模式"
+                "已切换为只读观看模式"
             } else {
-                "已切换为 Takeover 接管模式（可输入与发送按键）"
+                "已切换为接管模式（可输入与发送按键）"
             }
         }
     }
@@ -976,10 +1031,11 @@ class HerdrMainViewModel(
 
     fun sendSpecialKey(keyName: String) {
         val session = _activeSession.value ?: return
+        if (session.mode.value == AttachMode.OBSERVE) {
+            _toastBanner.value = "当前为只读观看模式，请先点底部「接管输入」后再发送按键"
+            return
+        }
         viewModelScope.launch {
-            if (session.mode.value == AttachMode.OBSERVE) {
-                runCatching { session.setMode(AttachMode.TAKEOVER) }
-            }
             session.sendSpecialKey(keyName).onFailure { err ->
                 _toastBanner.value = err.message ?: "按键发送被拒绝"
             }
@@ -988,10 +1044,19 @@ class HerdrMainViewModel(
 
     fun interruptActiveTerminal() {
         val session = _activeSession.value ?: return
+        if (session.mode.value == AttachMode.OBSERVE) {
+            _toastBanner.value = "当前为只读观看模式，请先切换为「接管输入」后再执行中断"
+            return
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (lastInterruptTargetAddress != session.address || now - lastInterruptTapMs > 2500L) {
+            lastInterruptTargetAddress = session.address
+            lastInterruptTapMs = now
+            _toastBanner.value = "再按一次 CTRL+C 确认向 ${session.address} 发送中断信号"
+            return
+        }
+        lastInterruptTapMs = 0L
         viewModelScope.launch {
-            if (session.mode.value == AttachMode.OBSERVE) {
-                runCatching { session.setMode(AttachMode.TAKEOVER) }
-            }
             session.interrupt()
                 .onSuccess { _toastBanner.value = "已向 ${session.address} 发送中断指令" }
                 .onFailure { _toastBanner.value = "中断失败：${it.message}" }
@@ -1004,6 +1069,14 @@ class HerdrMainViewModel(
         AgentStateWord.WORKING -> 2
         AgentStateWord.IDLE -> 1
         AgentStateWord.NONE -> 0
+    }
+
+    private fun matchesStatusFilter(status: AgentStateWord, filter: AgentStateWord): Boolean {
+        return when (filter) {
+            AgentStateWord.BLOCKED -> status == AgentStateWord.BLOCKED || status == AgentStateWord.ERROR
+            AgentStateWord.IDLE -> status == AgentStateWord.IDLE || status == AgentStateWord.NONE
+            else -> status == filter
+        }
     }
 
     private fun buildAgentTree(
@@ -1050,6 +1123,14 @@ class HerdrMainViewModel(
 
         val flattened = rootGroups.flatten()
         if (filter == null) return flattened
-        return flattened.filter { it.summary.agentStatus == filter }
+        val matched = flattened.filter { matchesStatusFilter(it.summary.agentStatus, filter) }
+        val matchedAddresses = matched.map { it.summary.address }.toSet()
+        return matched.map { node ->
+            if (node.depth > 0 && node.summary.parent !in matchedAddresses) {
+                node.copy(depth = 0, treeConnectors = emptyList())
+            } else {
+                node
+            }
+        }
     }
 }

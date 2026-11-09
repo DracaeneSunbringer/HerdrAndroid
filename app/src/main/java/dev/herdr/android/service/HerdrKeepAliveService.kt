@@ -8,12 +8,15 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -29,6 +32,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class KeepAliveNotificationStatus(
     val active: Boolean = false,
@@ -58,17 +62,39 @@ object HerdrKeepAliveCoordinator {
     @Volatile
     var onDisconnectRequested: (() -> Unit)? = null
 
+    /**
+     * Invoked (on a binder/background thread) when the system reports that a default network became
+     * available again after a loss or switched to a different network. Not fired for the initial
+     * network delivered on registration.
+     */
+    @Volatile
+    var onNetworkAvailable: (() -> Unit)? = null
+
+    /**
+     * True from the moment `startForegroundService` is issued until the service is destroyed.
+     * Guarantees `startForegroundService` is called at most once per service lifetime, so status
+     * text updates never trigger a background FGS start (ForegroundServiceStartNotAllowedException
+     * on Android 12+). Subsequent updates flow through [status] and are posted by the service.
+     */
+    private val serviceStartRequested = AtomicBoolean(false)
+
     fun updateStatus( context: Context, active: Boolean, title: String, subtitle: String) {
         val next = KeepAliveNotificationStatus(active = active, title = title, subtitle = subtitle)
-        val prev = _status.value
         _status.value = next
         if (active) {
-            if (!prev.active || prev.title != next.title || prev.subtitle != next.subtitle) {
-                HerdrKeepAliveService.startOrUpdate(context.applicationContext)
+            if (serviceStartRequested.compareAndSet(false, true)) {
+                val started = HerdrKeepAliveService.startOrUpdate(context.applicationContext)
+                if (!started) {
+                    serviceStartRequested.set(false)
+                }
             }
-        } else if (prev.active) {
+        } else if (serviceStartRequested.get()) {
             HerdrKeepAliveService.stop(context.applicationContext)
         }
+    }
+
+    internal fun markServiceStopped() {
+        serviceStartRequested.set(false)
     }
 
     fun isIgnoringBatteryOptimizations(context: Context): Boolean {
@@ -92,61 +118,144 @@ class HerdrKeepAliveService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var statusCollectorJob: Job? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var inForeground = false
 
     override fun onCreate() {
         super.onCreate()
         ensureNotificationChannel()
-        acquireLocks()
         statusCollectorJob = HerdrKeepAliveCoordinator.processScope.launch(Dispatchers.Main.immediate) {
             HerdrKeepAliveCoordinator.status.collect { current ->
                 if (current.active) {
-                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                    nm?.notify(NOTIFICATION_ID, buildNotification(current))
+                    if (inForeground) {
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                        nm?.notify(NOTIFICATION_ID, buildNotification(current))
+                    }
+                } else if (inForeground) {
+                    // Session no longer needs keep-alive: drop foreground state and locks immediately.
+                    shutdown()
                 }
             }
         }
+        registerNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP_SERVICE) {
-            stopForegroundCompat()
-            stopSelf()
-            return START_NOT_STICKY
-        }
-        if (intent?.action == ACTION_DISCONNECT_FROM_NOTIFICATION) {
-            HerdrKeepAliveCoordinator.onDisconnectRequested?.invoke()
-            stopForegroundCompat()
-            stopSelf()
+        // Every start via startForegroundService must be answered with startForeground(), even if we
+        // are about to stop; otherwise the system raises ForegroundServiceDidNotStartInTimeException.
+        val currentStatus = HerdrKeepAliveCoordinator.status.value
+        if (!enterForeground(currentStatus)) {
+            shutdown()
             return START_NOT_STICKY
         }
 
-        ensureNotificationChannel()
+        when {
+            intent?.action == ACTION_STOP_SERVICE -> {
+                shutdown()
+                return START_NOT_STICKY
+            }
+            intent?.action == ACTION_DISCONNECT_FROM_NOTIFICATION -> {
+                HerdrKeepAliveCoordinator.onDisconnectRequested?.invoke()
+                shutdown()
+                return START_NOT_STICKY
+            }
+            // intent == null means a system restart without any live connection state; a stale
+            // inactive status means the session already ended. Neither should keep a notification
+            // or hold wake/wifi locks.
+            intent == null || !currentStatus.active -> {
+                shutdown()
+                return START_NOT_STICKY
+            }
+        }
+
         acquireLocks()
-        val currentStatus = HerdrKeepAliveCoordinator.status.value
-        val notification = buildNotification(currentStatus)
-        runCatching {
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        statusCollectorJob?.cancel()
+        statusCollectorJob = null
+        unregisterNetworkCallback()
+        releaseLocks()
+        inForeground = false
+        HerdrKeepAliveCoordinator.markServiceStopped()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun enterForeground(status: KeepAliveNotificationStatus): Boolean {
+        ensureNotificationChannel()
+        return try {
             ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
-                notification,
+                buildNotification(status),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 } else {
                     0
                 }
             )
+            inForeground = true
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "startForeground failed; stopping keep-alive service", t)
+            false
         }
-        return START_STICKY
     }
 
-    override fun onDestroy() {
-        statusCollectorJob?.cancel()
-        statusCollectorJob = null
-        releaseLocks()
-        super.onDestroy()
+    private fun shutdown() {
+        stopForegroundCompat()
+        stopSelf()
+        HerdrKeepAliveCoordinator.markServiceStopped()
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            @Volatile
+            private var currentNetwork: Network? = null
+
+            @Volatile
+            private var initialDelivered = false
+
+            @Volatile
+            private var lostSinceLastAvailable = false
+
+            override fun onAvailable(network: Network) {
+                val previous = currentNetwork
+                currentNetwork = network
+                val shouldNotify = initialDelivered && (lostSinceLastAvailable || previous != network)
+                initialDelivered = true
+                lostSinceLastAvailable = false
+                if (shouldNotify) {
+                    runCatching { HerdrKeepAliveCoordinator.onNetworkAvailable?.invoke() }
+                        .onFailure { Log.w(TAG, "onNetworkAvailable handler failed", it) }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                if (network == currentNetwork) {
+                    currentNetwork = null
+                    lostSinceLastAvailable = true
+                }
+                // Mark the initial delivery as done even if the first event is a loss.
+                initialDelivered = true
+            }
+        }
+        runCatching {
+            cm.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        }.onFailure { Log.w(TAG, "registerDefaultNetworkCallback failed", it) }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        runCatching { cm.unregisterNetworkCallback(callback) }
+    }
 
     private fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -255,29 +364,40 @@ class HerdrKeepAliveService : Service() {
         runCatching {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         }
+        inForeground = false
         releaseLocks()
     }
 
     companion object {
+        private const val TAG = "HerdrKeepAlive"
         private const val CHANNEL_ID = "herdr_keep_alive_channel"
         private const val NOTIFICATION_ID = 4201
         private const val ACTION_STOP_SERVICE = "dev.herdr.android.action.STOP_KEEP_ALIVE"
         private const val ACTION_DISCONNECT_FROM_NOTIFICATION = "dev.herdr.android.action.DISCONNECT_KEEP_ALIVE"
 
-        fun startOrUpdate(context: Context) {
-            runCatching {
+        /**
+         * Issues `startForegroundService`. Returns false if the platform rejected the start
+         * (e.g. background-start restriction on Android 12+), so the caller can retry later.
+         * Callers should go through [HerdrKeepAliveCoordinator.updateStatus], which guarantees this
+         * runs at most once per service lifetime.
+         */
+        fun startOrUpdate(context: Context): Boolean {
+            return try {
                 val intent = Intent(context, HerdrKeepAliveService::class.java)
                 ContextCompat.startForegroundService(context, intent)
+                true
+            } catch (t: Throwable) {
+                Log.w(TAG, "startForegroundService rejected", t)
+                false
             }
         }
 
         fun stop(context: Context) {
             runCatching {
-                val intent = Intent(context, HerdrKeepAliveService::class.java).apply {
-                    action = ACTION_STOP_SERVICE
-                }
+                val intent = Intent(context, HerdrKeepAliveService::class.java)
                 context.stopService(intent)
             }
+            HerdrKeepAliveCoordinator.markServiceStopped()
         }
     }
 }

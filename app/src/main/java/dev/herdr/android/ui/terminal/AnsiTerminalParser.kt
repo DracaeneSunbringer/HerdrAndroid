@@ -1,10 +1,13 @@
 package dev.herdr.android.ui.terminal
 
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import dev.herdr.android.ui.theme.HerdrColors
 
 /**
@@ -58,7 +61,7 @@ object AnsiTerminalParser {
         get() = if (HerdrColors.IsLight) ansi16LightPalette else ansi16DarkPalette
 
     private val oscRegex = Regex("\u001B\\][^\u0007\u001B]*(?:\u0007|\u001B\\\\)")
-    private val csiRegex = Regex("\u001B\\[([0-9;?]*)([A-Za-z])")
+    private val csiRegex = Regex("\u001B\\[([0-9;:?]*)([A-Za-z])")
     private val fullLineRuleRegex = Regex("^[\\s─━═\\-_]{6,}$")
     private val boxTableBorderRegex = Regex("^[\\s─━═┌┬┐├┼┤└┴┘╭╮╯╰|+\\-:]{4,}$")
     private val labeledRuleRegex = Regex("^([\\s─━═\\-_]{3,})([^─━═\\-_]+?)([\\s─━═\\-_]{3,})$")
@@ -73,6 +76,12 @@ object AnsiTerminalParser {
     )
     private val diffAddLineRegex = Regex("^\\s*\\d+\\s+\\+\\s+.*$")
     private val diffDelLineRegex = Regex("^\\s*\\d+\\s+-\\s+.*$")
+    private val lonePromptLineRegex = Regex("^\\s*[›❯]\\s*$")
+    private val errorLineRegex = Regex("^\\s*(?:Error|ERROR|error|Fatal|FATAL|fatal|panic)(?:\\[[^\\]]*])?\\s*[:：].*$")
+    private val warningLineRegex = Regex("^\\s*(?:Warning|WARNING|warning|WARN|Warn)(?:\\[[^\\]]*])?\\s*[:：].*$")
+
+    /** Minimum contrast ratio enforced for remote 256-color / truecolor foregrounds on light themes. */
+    private const val MIN_LIGHT_FG_CONTRAST = 3.0
 
     fun parseToAnnotatedString(
         rawText: String,
@@ -144,6 +153,18 @@ object AnsiTerminalParser {
                     val match = userPromptLineRegex.find(line)!!
                     appendStyledSegment(match.groupValues[1], HerdrColors.Accent, Color.Unspecified, true)
                     appendStyledSegment(match.groupValues[2], HerdrColors.Foreground, Color.Unspecified, true)
+                }
+
+                lonePromptLineRegex.matches(line) -> {
+                    appendStyledSegment(line, HerdrColors.Accent, Color.Unspecified, true)
+                }
+
+                errorLineRegex.matches(line) -> {
+                    appendStyledSegment(line, HerdrColors.Blocked, Color.Unspecified, false)
+                }
+
+                warningLineRegex.matches(line) -> {
+                    appendStyledSegment(line, HerdrColors.Working, Color.Unspecified, false)
                 }
 
                 thoughtLineRegex.matches(trimmed) -> {
@@ -253,54 +274,98 @@ object AnsiTerminalParser {
         }
     }
 
+    /**
+     * Mutable SGR attribute state for the ANSI path.
+     * `fg`/`bg` hold the *logical* colors; inverse/dim are resolved at emit time.
+     */
+    private class SgrState {
+        var fg: Color = Color.Unspecified // Unspecified => theme foreground
+        var bg: Color = Color.Unspecified
+        var bold = false
+        var faint = false
+        var italic = false
+        var underline = false
+        var inverse = false
+        var strike = false
+
+        fun reset() {
+            fg = Color.Unspecified
+            bg = Color.Unspecified
+            bold = false
+            faint = false
+            italic = false
+            underline = false
+            inverse = false
+            strike = false
+        }
+    }
+
     private fun parseAnsiSgrString(normalized: String): AnnotatedString = buildAnnotatedString {
-        var currentFg: Color = HerdrColors.Foreground
-        var currentBg: Color = Color.Unspecified
-        var isBold = false
+        val state = SgrState()
 
         var cursor = 0
         for (match in csiRegex.findAll(normalized)) {
             if (match.range.first > cursor) {
-                val segment = normalized.substring(cursor, match.range.first)
-                appendStyledSegment(segment, currentFg, currentBg, isBold)
+                appendSgrSegment(normalized.substring(cursor, match.range.first), state)
             }
             val paramsRaw = match.groupValues[1]
             val finalByte = match.groupValues[2]
 
-            if (finalByte == "m") {
+            // Private-mode sequences (e.g. ESC[?25l) are not SGR even when ending in 'm'.
+            if (finalByte == "m" && !paramsRaw.startsWith("?")) {
+                // Colon sub-parameters (e.g. "4:3" curly underline, "38:2::r:g:b") are reduced to their
+                // leading selector; semicolon form carries the full color payload.
                 val codes = if (paramsRaw.isEmpty()) listOf(0)
-                else paramsRaw.split(';').mapNotNull { it.toIntOrNull() }
+                else paramsRaw.split(';').map { part ->
+                    part.substringBefore(':').toIntOrNull() ?: 0
+                }
 
                 var idx = 0
                 while (idx < codes.size) {
                     when (val code = codes[idx]) {
-                        0 -> {
-                            currentFg = HerdrColors.Foreground
-                            currentBg = Color.Unspecified
-                            isBold = false
+                        0 -> state.reset()
+                        1 -> state.bold = true
+                        2 -> state.faint = true
+                        3 -> state.italic = true
+                        4, 21 -> state.underline = true
+                        7 -> state.inverse = true
+                        9 -> state.strike = true
+                        22 -> {
+                            state.bold = false
+                            state.faint = false
                         }
-                        1 -> isBold = true
-                        22 -> isBold = false
-                        in 30..37 -> currentFg = activeAnsiPalette[code - 30]
-                        39 -> currentFg = HerdrColors.Foreground
-                        in 40..47 -> currentBg = activeAnsiPalette[code - 40].copy(alpha = 0.25f)
-                        49 -> currentBg = Color.Unspecified
-                        in 90..97 -> currentFg = activeAnsiPalette[code - 90 + 8]
-                        in 100..107 -> currentBg = activeAnsiPalette[code - 100 + 8].copy(alpha = 0.25f)
+                        23 -> state.italic = false
+                        24 -> state.underline = false
+                        27 -> state.inverse = false
+                        29 -> state.strike = false
+                        in 30..37 -> state.fg = activeAnsiPalette[code - 30]
+                        39 -> state.fg = Color.Unspecified
+                        in 40..47 -> state.bg = activeAnsiPalette[code - 40]
+                        49 -> state.bg = Color.Unspecified
+                        in 90..97 -> state.fg = activeAnsiPalette[code - 90 + 8]
+                        in 100..107 -> state.bg = activeAnsiPalette[code - 100 + 8]
                         38, 48 -> {
                             val isForeground = (code == 38)
                             val mode = codes.getOrNull(idx + 1)
                             if (mode == 5) {
                                 val colorIndex = codes.getOrNull(idx + 2) ?: 0
                                 val resolved = xterm256ToColor(colorIndex)
-                                if (isForeground) currentFg = resolved else currentBg = resolved.copy(alpha = 0.35f)
+                                if (isForeground) {
+                                    state.fg = if (colorIndex >= 16) ensureLightThemeContrast(resolved) else resolved
+                                } else {
+                                    state.bg = resolved
+                                }
                                 idx += 2
                             } else if (mode == 2) {
                                 val r = (codes.getOrNull(idx + 2) ?: 255).coerceIn(0, 255)
                                 val g = (codes.getOrNull(idx + 3) ?: 255).coerceIn(0, 255)
                                 val b = (codes.getOrNull(idx + 4) ?: 255).coerceIn(0, 255)
                                 val resolved = Color(r, g, b)
-                                if (isForeground) currentFg = resolved else currentBg = resolved.copy(alpha = 0.35f)
+                                if (isForeground) {
+                                    state.fg = ensureLightThemeContrast(resolved)
+                                } else {
+                                    state.bg = resolved
+                                }
                                 idx += 4
                             }
                         }
@@ -312,8 +377,44 @@ object AnsiTerminalParser {
         }
 
         if (cursor < normalized.length) {
-            appendStyledSegment(normalized.substring(cursor), currentFg, currentBg, isBold)
+            appendSgrSegment(normalized.substring(cursor), state)
         }
+    }
+
+    /** Resolves inverse/faint/background translucency and appends one ANSI-styled run. */
+    private fun AnnotatedString.Builder.appendSgrSegment(text: String, state: SgrState) {
+        if (text.isEmpty()) return
+        val logicalFg = if (state.fg == Color.Unspecified) HerdrColors.Foreground else state.fg
+
+        val fg: Color
+        val bg: Color
+        if (state.inverse) {
+            // Reverse video: swap. Default background maps to the canvas so the run reads as a solid block.
+            fg = if (state.bg == Color.Unspecified) HerdrColors.Canvas else state.bg
+            bg = logicalFg
+        } else {
+            fg = logicalFg
+            bg = if (state.bg == Color.Unspecified) Color.Unspecified else state.bg.copy(alpha = 0.3f)
+        }
+        val finalFg = if (state.faint) fg.copy(alpha = fg.alpha * 0.6f) else fg
+
+        val decorations = buildList {
+            if (state.underline) add(TextDecoration.Underline)
+            if (state.strike) add(TextDecoration.LineThrough)
+        }
+        val start = length
+        append(text)
+        addStyle(
+            SpanStyle(
+                color = finalFg,
+                background = bg,
+                fontWeight = if (state.bold) FontWeight.Bold else FontWeight.Normal,
+                fontStyle = if (state.italic) FontStyle.Italic else FontStyle.Normal,
+                textDecoration = if (decorations.isEmpty()) null else TextDecoration.combine(decorations)
+            ),
+            start,
+            length
+        )
     }
 
     private fun AnnotatedString.Builder.appendStyledSegment(
@@ -334,6 +435,34 @@ object AnsiTerminalParser {
             start,
             length
         )
+    }
+
+    /**
+     * Remote TUIs usually pick 256/truecolor foregrounds for dark backgrounds; on light themes those
+     * (pale yellow, light gray, white) become unreadable. Darken progressively until the contrast
+     * against the canvas reaches [MIN_LIGHT_FG_CONTRAST]. No-op on dark themes.
+     */
+    private fun ensureLightThemeContrast(color: Color): Color {
+        if (!HerdrColors.IsLight) return color
+        val canvasLum = HerdrColors.Canvas.luminance()
+        var adjusted = color
+        var steps = 0
+        while (contrastRatio(adjusted.luminance(), canvasLum) < MIN_LIGHT_FG_CONTRAST && steps < 12) {
+            adjusted = Color(
+                red = adjusted.red * 0.82f,
+                green = adjusted.green * 0.82f,
+                blue = adjusted.blue * 0.82f,
+                alpha = adjusted.alpha
+            )
+            steps++
+        }
+        return adjusted
+    }
+
+    private fun contrastRatio(lumA: Float, lumB: Float): Double {
+        val hi = maxOf(lumA, lumB)
+        val lo = minOf(lumA, lumB)
+        return (hi + 0.05) / (lo + 0.05)
     }
 
     private fun xterm256ToColor(index: Int): Color {
