@@ -62,6 +62,13 @@ data class AgentTreeNode(
     val effectiveUrgencyRank: Int = 0
 )
 
+data class DispatchedReceipt(
+    val address: String,
+    val text: String,
+    val sentAtTurn: Int,
+    val timestampMs: Long = android.os.SystemClock.elapsedRealtime()
+)
+
 class HerdrMainViewModel(
     private val controller: HerdrConnectionController = HerdrConnectionControllerFactory.shared()
 ) : ViewModel() {
@@ -71,7 +78,7 @@ class HerdrMainViewModel(
     private var storageInitialized = false
 
     private val _selectedTab = MutableStateFlow(
-        if (HerdrKeepAliveCoordinator.activeSession.value != null) WorkspaceTab.TERMINAL else WorkspaceTab.CONNECTION
+        if (HerdrKeepAliveCoordinator.activeSession.value != null) WorkspaceTab.TERMINAL else WorkspaceTab.AGENTS
     )
     val selectedTab: StateFlow<WorkspaceTab> = _selectedTab.asStateFlow()
 
@@ -99,6 +106,7 @@ class HerdrMainViewModel(
 
     val connectionState: StateFlow<ConnectionState> = controller.connectionState
     val machines: StateFlow<List<MachineSummary>> = controller.machines
+    val terminals: StateFlow<List<TerminalSummary>> = controller.terminals
 
     private val _statusFilter = MutableStateFlow<AgentStateWord?>(null)
     val statusFilter: StateFlow<AgentStateWord?> = _statusFilter.asStateFlow()
@@ -148,6 +156,18 @@ class HerdrMainViewModel(
 
     private val _appUpdateState = MutableStateFlow(AppUpdateState())
     val appUpdateState: StateFlow<AppUpdateState> = _appUpdateState.asStateFlow()
+
+    private val _acknowledgedDoneTurns = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val acknowledgedDoneTurns: StateFlow<Map<String, Int>> = _acknowledgedDoneTurns.asStateFlow()
+
+    private val _draftsByAddress = MutableStateFlow<Map<String, String>>(emptyMap())
+    val draftsByAddress: StateFlow<Map<String, String>> = _draftsByAddress.asStateFlow()
+
+    private val _dispatchedReceipts = MutableStateFlow<Map<String, DispatchedReceipt>>(emptyMap())
+    val dispatchedReceipts: StateFlow<Map<String, DispatchedReceipt>> = _dispatchedReceipts.asStateFlow()
+
+    private val _requestInputFocusSignal = MutableStateFlow(0L)
+    val requestInputFocusSignal: StateFlow<Long> = _requestInputFocusSignal.asStateFlow()
 
     private var connectJob: Job? = null
     private var autoReconnectJob: Job? = null
@@ -331,8 +351,12 @@ class HerdrMainViewModel(
         _profile.value = current
         saveProfile(current)
 
-        if (intent?.getBooleanExtra("auto_connect", false) == true) {
-            intent.removeExtra("auto_connect")
+        val explicitAutoConnect = intent?.getBooleanExtra("auto_connect", false) == true
+        if (explicitAutoConnect) {
+            intent?.removeExtra("auto_connect")
+        }
+        val canAutoConnectSilently = current.privateKeyPem.contains("PRIVATE KEY") || current.host.startsWith("demo://")
+        if (explicitAutoConnect || (canAutoConnectSilently && controller.connectionState.value is ConnectionState.Disconnected)) {
             connectNow()
         }
     }
@@ -357,7 +381,7 @@ class HerdrMainViewModel(
     fun selectTab(tab: WorkspaceTab) {
         val current = _selectedTab.value
         if (tab == current) return
-        if (tab == WorkspaceTab.CONNECTION) {
+        if (tab == WorkspaceTab.AGENTS) {
             _navHistory.value = emptyList()
         } else {
             val updatedHistory = _navHistory.value.toMutableList()
@@ -379,8 +403,8 @@ class HerdrMainViewModel(
             _selectedTab.value = previous
             return true
         }
-        if (_selectedTab.value != WorkspaceTab.CONNECTION) {
-            _selectedTab.value = WorkspaceTab.CONNECTION
+        if (_selectedTab.value != WorkspaceTab.AGENTS) {
+            _selectedTab.value = WorkspaceTab.AGENTS
             return true
         }
         return false
@@ -708,12 +732,31 @@ class HerdrMainViewModel(
 
         val (title, subtitle) = when (state) {
             is ConnectionState.Connected -> {
-                val termLabel = if (activeTerm != null) {
-                    " · 挂载终端 ${activeTerm.address}"
-                } else {
-                    ""
+                val live = controller.terminals.value.filter { it.state == "live" }
+                val blockedList = live.filter {
+                    it.agentStatus == AgentStateWord.BLOCKED || it.agentStatus == AgentStateWord.ERROR
                 }
-                "Herdr 后台连接保活中 · $host" to "${termCount} 个在线终端$termLabel · 锁屏与切后台不断流"
+                val ackMap = _acknowledgedDoneTurns.value
+                val unackedDoneCount = live.count {
+                    it.agentStatus == AgentStateWord.DONE && (ackMap[it.address] ?: -1) < it.turn
+                }
+                val workingCount = live.count { it.agentStatus == AgentStateWord.WORKING }
+                val topHeadline = when {
+                    blockedList.isNotEmpty() -> {
+                        val names = blockedList.take(2).joinToString("、") { it.name ?: it.address }
+                        "⚠️ ${blockedList.size} 个等你拍板 ($names)"
+                    }
+                    unackedDoneCount > 0 -> "✓ ${unackedDoneCount} 个刚完成待派活 · ${workingCount} 个运行中"
+                    workingCount > 0 -> "Herdr 牧群运行中 · ${workingCount} 个 Agent 正在工作"
+                    else -> "Herdr 牧群在线 · 共 ${termCount} 个终端待命"
+                }
+                val subText = buildString {
+                    append("$host · 共 ${termCount} 个节点")
+                    if (activeTerm != null) {
+                        append(" · 当前在看 ${activeTerm.address}")
+                    }
+                }
+                topHeadline to subText
             }
             is ConnectionState.Connecting -> {
                 "Herdr 正在同步远端会话 · $host" to "正在执行：${state.activeStage.title}"
@@ -860,22 +903,41 @@ class HerdrMainViewModel(
         ensureKeepAliveMonitor()
         syncKeepAliveNotification()
         connectJob = HerdrKeepAliveCoordinator.processScope.launch {
-            val result = controller.connect(_profile.value)
-            result.onSuccess {
+            val initialProfile = _profile.value
+            val result = controller.connect(initialProfile)
+            if (result.isSuccess) {
                 syncKeepAliveNotification()
-                _toastBanner.value = if (_appSettings.value.keepAliveInBackground) {
-                    "已同步远端终端拓扑（后台常驻保活已开启）"
-                } else {
-                    "已通过 hc connect 同步远端终端拓扑"
-                }
-            }.onFailure { err ->
-                val failedState = controller.connectionState.value
-                if (failedState is ConnectionState.Failed && isUnrecoverableErrorKind(failedState.errorKind)) {
-                    HerdrKeepAliveCoordinator.userWantsConnectionAlive = false
-                }
-                syncKeepAliveNotification()
-                _toastBanner.value = "连接未完成：${err.message ?: "请检查四步诊断详情"}"
+                return@launch
             }
+            val failedState = controller.connectionState.value
+            // Automatic LAN -> ZeroTier failover if LAN is unreachable and ZeroTier is configured
+            val canFailoverToZt = !initialProfile.useBuiltInZeroTier &&
+                !initialProfile.host.startsWith("demo://") &&
+                initialProfile.zeroTierNetworkId.length == 16 &&
+                failedState is ConnectionState.Failed &&
+                !isUnrecoverableErrorKind(failedState.errorKind)
+            if (canFailoverToZt) {
+                val ztHost = _appSettings.value.defaultZeroTierHost.ifBlank { "10.147.17.100" }
+                val ztProfile = initialProfile.copy(
+                    displayName = "Windows 主力机 (ZeroTier 自动切换)",
+                    host = ztHost,
+                    useBuiltInZeroTier = true
+                )
+                _profile.value = ztProfile
+                saveProfile(ztProfile)
+                _toastBanner.value = "局域网未响应，已自动切换至内置 ZeroTier 尝试连接..."
+                val ztResult = controller.connect(ztProfile)
+                if (ztResult.isSuccess) {
+                    syncKeepAliveNotification()
+                    _toastBanner.value = "已通过 ZeroTier 自动连入远端牧群"
+                    return@launch
+                }
+            }
+            val finalState = controller.connectionState.value
+            if (finalState is ConnectionState.Failed && isUnrecoverableErrorKind(finalState.errorKind)) {
+                HerdrKeepAliveCoordinator.userWantsConnectionAlive = false
+            }
+            syncKeepAliveNotification()
         }
     }
 
@@ -1014,16 +1076,116 @@ class HerdrMainViewModel(
         }
     }
 
+    fun markTerminalDoneAcknowledged(summary: TerminalSummary) {
+        val updated = _acknowledgedDoneTurns.value.toMutableMap()
+        updated[summary.address] = summary.turn
+        _acknowledgedDoneTurns.value = updated
+        syncKeepAliveNotification()
+    }
+
+    fun updateDraftForTerminal(address: String, draft: String) {
+        val updated = _draftsByAddress.value.toMutableMap()
+        if (draft.isEmpty()) {
+            updated.remove(address)
+        } else {
+            updated[address] = draft
+        }
+        _draftsByAddress.value = updated
+    }
+
+    fun openTerminalAndFocusInput(summary: TerminalSummary) {
+        markTerminalDoneAcknowledged(summary)
+        attachTerminal(summary, AttachMode.TAKEOVER)
+        _requestInputFocusSignal.value = android.os.SystemClock.elapsedRealtime()
+    }
+
+    fun quickDispatchToTerminal(
+        summary: TerminalSummary,
+        payload: String,
+        isSpecialKey: Boolean = false
+    ) {
+        if (payload.isEmpty()) return
+        markTerminalDoneAcknowledged(summary)
+        val displayLabel = if (isSpecialKey) payload.uppercase() else payload
+        _dispatchedReceipts.value = _dispatchedReceipts.value + (
+            summary.address to DispatchedReceipt(
+                address = summary.address,
+                text = displayLabel,
+                sentAtTurn = summary.turn
+            )
+            )
+
+        val currentSession = _activeSession.value
+        if (currentSession != null && currentSession.address == summary.address) {
+            viewModelScope.launch {
+                if (currentSession.mode.value == AttachMode.OBSERVE) {
+                    runCatching { currentSession.setMode(AttachMode.TAKEOVER) }
+                }
+                val res = if (isSpecialKey) {
+                    currentSession.sendSpecialKey(payload)
+                } else {
+                    currentSession.sendLine(payload)
+                }
+                res.onSuccess {
+                    _toastBanner.value = "✓ 已向 ${summary.address} 发送批示：$displayLabel"
+                }.onFailure { err ->
+                    _toastBanner.value = "发送失败：${err.message}"
+                }
+            }
+            return
+        }
+
+        // Dispatch directly from Inbox without forcing navigation
+        HerdrKeepAliveCoordinator.processScope.launch {
+            val opened = controller.openTerminalSession(summary.address, AttachMode.TAKEOVER)
+            opened.onSuccess { tempSession ->
+                val sendRes = if (isSpecialKey) {
+                    tempSession.sendSpecialKey(payload)
+                } else {
+                    tempSession.sendLine(payload)
+                }
+                delay(220)
+                runCatching { tempSession.detach() }
+                controller.refreshTerminals()
+                syncKeepAliveNotification()
+                sendRes.onSuccess {
+                    _toastBanner.value = "✓ 已向 ${summary.address} 下达批示：$displayLabel"
+                }.onFailure { err ->
+                    _toastBanner.value = "发送失败：${err.message}"
+                }
+            }.onFailure { err ->
+                _toastBanner.value = "无法连接 ${summary.address}：${err.message}"
+            }
+        }
+    }
+
     fun sendTerminalLine(line: String, asRawBytes: Boolean = false) {
         if (line.isEmpty()) return
         val session = _activeSession.value ?: return
+        val curSummary = _activeTerminalSummary.value
+        if (curSummary != null) {
+            markTerminalDoneAcknowledged(curSummary)
+            _dispatchedReceipts.value = _dispatchedReceipts.value + (
+                session.address to DispatchedReceipt(
+                    address = session.address,
+                    text = line,
+                    sentAtTurn = curSummary.turn
+                )
+                )
+        }
+        updateDraftForTerminal(session.address, "")
         viewModelScope.launch {
+            if (session.mode.value == AttachMode.OBSERVE) {
+                runCatching { session.setMode(AttachMode.TAKEOVER) }
+            }
             val result = if (asRawBytes) {
                 session.sendRawInput((line + "\r").encodeToByteArray())
             } else {
                 session.sendLine(line)
             }
-            result.onFailure { err ->
+            result.onSuccess {
+                _toastBanner.value = "✓ 已发送给 ${session.address}"
+            }.onFailure { err ->
                 _toastBanner.value = err.message ?: "发送失败"
             }
         }
@@ -1031,11 +1193,21 @@ class HerdrMainViewModel(
 
     fun sendSpecialKey(keyName: String) {
         val session = _activeSession.value ?: return
-        if (session.mode.value == AttachMode.OBSERVE) {
-            _toastBanner.value = "当前为只读观看模式，请先点底部「接管输入」后再发送按键"
-            return
+        val curSummary = _activeTerminalSummary.value
+        if (curSummary != null) {
+            markTerminalDoneAcknowledged(curSummary)
+            _dispatchedReceipts.value = _dispatchedReceipts.value + (
+                session.address to DispatchedReceipt(
+                    address = session.address,
+                    text = "[按键 ${keyName.uppercase()}]",
+                    sentAtTurn = curSummary.turn
+                )
+                )
         }
         viewModelScope.launch {
+            if (session.mode.value == AttachMode.OBSERVE) {
+                runCatching { session.setMode(AttachMode.TAKEOVER) }
+            }
             session.sendSpecialKey(keyName).onFailure { err ->
                 _toastBanner.value = err.message ?: "按键发送被拒绝"
             }
@@ -1044,19 +1216,18 @@ class HerdrMainViewModel(
 
     fun interruptActiveTerminal() {
         val session = _activeSession.value ?: return
-        if (session.mode.value == AttachMode.OBSERVE) {
-            _toastBanner.value = "当前为只读观看模式，请先切换为「接管输入」后再执行中断"
-            return
-        }
         val now = android.os.SystemClock.elapsedRealtime()
         if (lastInterruptTargetAddress != session.address || now - lastInterruptTapMs > 2500L) {
             lastInterruptTargetAddress = session.address
             lastInterruptTapMs = now
-            _toastBanner.value = "再按一次 CTRL+C 确认向 ${session.address} 发送中断信号"
+            _toastBanner.value = "再按一次 CTRL+C 确认中断 ${session.address}"
             return
         }
         lastInterruptTapMs = 0L
         viewModelScope.launch {
+            if (session.mode.value == AttachMode.OBSERVE) {
+                runCatching { session.setMode(AttachMode.TAKEOVER) }
+            }
             session.interrupt()
                 .onSuccess { _toastBanner.value = "已向 ${session.address} 发送中断指令" }
                 .onFailure { _toastBanner.value = "中断失败：${it.message}" }
