@@ -77,6 +77,7 @@ import dev.herdr.android.protocol.AgentStateWord
 import dev.herdr.android.protocol.AttachMode
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.service.HerdrKeepAliveCoordinator
 import dev.herdr.android.ui.terminal.AnsiTerminalParser
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
@@ -107,9 +108,14 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
 
     var showQuickThemeDrawer by remember { mutableStateOf(false) }
 
-    val canGoBack = navHistory.isNotEmpty() || selectedTab != WorkspaceTab.CONNECTION
-    BackHandler(enabled = canGoBack) {
-        viewModel.navigateBack()
+    val notificationPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ -> }
+
+    BackHandler(enabled = true) {
+        if (!viewModel.navigateBack()) {
+            (context as? android.app.Activity)?.moveTaskToBack(true)
+        }
     }
 
     LaunchedEffect(toastBanner) {
@@ -255,6 +261,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                     zeroTierState = zeroTierState,
                     agentCount = agentNodes.size,
                     onUpdateProfile = viewModel::updateProfile,
+                    onUpdateAppSettings = viewModel::updateAppSettings,
                     onSelectTheme = { preset ->
                         viewModel.updateAppSettings { it.copy(themePreset = preset) }
                     },
@@ -262,7 +269,14 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                     onApplyPreset = viewModel::applyPreset,
                     onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
                     onShowBanner = viewModel::showBanner,
-                    onConnect = viewModel::connectNow,
+                    onConnect = {
+                        if (android.os.Build.VERSION.SDK_INT >= 33 && appSettings.keepAliveInBackground) {
+                            runCatching {
+                                notificationPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        }
+                        viewModel.connectNow()
+                    },
                     onDisconnect = viewModel::disconnectNow,
                     onJumpToAgents = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                 )
@@ -642,6 +656,7 @@ private fun ConnectionAndDiagnosticsPane(
     zeroTierState: ZeroTierOverlayState,
     agentCount: Int,
     onUpdateProfile: ((ConnectionProfile) -> ConnectionProfile) -> Unit,
+    onUpdateAppSettings: ((HerdrAppSettings) -> HerdrAppSettings) -> Unit,
     onSelectTheme: (HerdrThemePreset) -> Unit,
     onApplyLanPreset: () -> Unit,
     onApplyPreset: (Boolean) -> Unit,
@@ -651,8 +666,12 @@ private fun ConnectionAndDiagnosticsPane(
     onDisconnect: () -> Unit,
     onJumpToAgents: () -> Unit
 ) {
+    val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     var showQuickTargetOverride by remember { mutableStateOf(false) }
+    var batteryWhitelisted by remember {
+        mutableStateOf(HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context))
+    }
 
     val lanDefaultHost = appSettings.defaultLanHost.ifBlank { "192.168.1.100" }
     val ztDefaultHost = appSettings.defaultZeroTierHost.ifBlank { "10.147.17.100" }
@@ -1013,6 +1032,76 @@ private fun ConnectionAndDiagnosticsPane(
                             maxLines = 1
                         )
                     }
+                }
+            }
+
+            // Background Keep-Alive & Auto-Reconnect Status Strip
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(HerdrColors.Canvas.copy(alpha = 0.55f))
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.5.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (appSettings.keepAliveInBackground) HerdrColors.Done else HerdrColors.Muted
+                            )
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            text = if (appSettings.keepAliveInBackground) {
+                                "后台常驻保活已开启"
+                            } else {
+                                "后台常驻保活已关闭"
+                            },
+                            color = HerdrColors.Foreground,
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = if (appSettings.keepAliveInBackground) {
+                                "前台服务 + 唤醒锁 + 断线自动恢复终端流"
+                            } else {
+                                "切后台时可能被系统冻结断流"
+                            },
+                            color = HerdrColors.Muted,
+                            fontSize = 10.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    if (appSettings.keepAliveInBackground && !batteryWhitelisted) {
+                        TacticalActionPill(
+                            text = "省电白名单",
+                            accent = false,
+                            onClick = {
+                                HerdrKeepAliveCoordinator.requestIgnoreBatteryOptimizations(context)
+                                batteryWhitelisted = HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context)
+                            }
+                        )
+                    }
+                    TacticalActionPill(
+                        text = if (appSettings.keepAliveInBackground) "保活中" else "开启",
+                        accent = appSettings.keepAliveInBackground,
+                        onClick = {
+                            onUpdateAppSettings { it.copy(keepAliveInBackground = !it.keepAliveInBackground) }
+                        }
+                    )
                 }
             }
         }
@@ -1392,6 +1481,44 @@ private fun DefaultSettingsPane(
                         text = "接管输入",
                         accent = appSettings.defaultAttachMode == AttachMode.TAKEOVER,
                         onClick = { onUpdateAppSettings { it.copy(defaultAttachMode = AttachMode.TAKEOVER) } }
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "后台连接常驻保活",
+                        color = HerdrColors.Foreground,
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        text = "切后台与锁屏时保持 SSH / ZeroTier 不断流并自动重连",
+                        color = HerdrColors.Muted,
+                        fontSize = 11.sp
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (!HerdrKeepAliveCoordinator.isIgnoringBatteryOptimizations(context)) {
+                        TacticalActionPill(
+                            text = "省电白名单",
+                            accent = false,
+                            onClick = {
+                                HerdrKeepAliveCoordinator.requestIgnoreBatteryOptimizations(context)
+                            }
+                        )
+                    }
+                    TacticalActionPill(
+                        text = if (appSettings.keepAliveInBackground) "已开启" else "已关闭",
+                        accent = appSettings.keepAliveInBackground,
+                        onClick = {
+                            onUpdateAppSettings { it.copy(keepAliveInBackground = !it.keepAliveInBackground) }
+                        }
                     )
                 }
             }

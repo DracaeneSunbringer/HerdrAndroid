@@ -18,18 +18,21 @@ import dev.herdr.android.protocol.AttachMode
 import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.service.HerdrKeepAliveCoordinator
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -47,7 +50,8 @@ data class HerdrAppSettings(
     val defaultDesktopFallbackCols: Int = 138,
     val defaultAttachMode: AttachMode = AttachMode.OBSERVE,
     val autoHideTerminalTopBar: Boolean = true,
-    val autoHideObserveKeyStrip: Boolean = true
+    val autoHideObserveKeyStrip: Boolean = true,
+    val keepAliveInBackground: Boolean = true
 )
 
 data class AgentTreeNode(
@@ -58,13 +62,16 @@ data class AgentTreeNode(
 )
 
 class HerdrMainViewModel(
-    private val controller: HerdrConnectionController = HerdrConnectionControllerFactory.create()
+    private val controller: HerdrConnectionController = HerdrConnectionControllerFactory.shared()
 ) : ViewModel() {
 
+    private var appContext: Context? = null
     private var prefs: SharedPreferences? = null
     private var storageInitialized = false
 
-    private val _selectedTab = MutableStateFlow(WorkspaceTab.CONNECTION)
+    private val _selectedTab = MutableStateFlow(
+        if (HerdrKeepAliveCoordinator.activeSession.value != null) WorkspaceTab.TERMINAL else WorkspaceTab.CONNECTION
+    )
     val selectedTab: StateFlow<WorkspaceTab> = _selectedTab.asStateFlow()
 
     private val _navHistory = MutableStateFlow<List<WorkspaceTab>>(emptyList())
@@ -100,12 +107,12 @@ class HerdrMainViewModel(
         _statusFilter
     ) { allTerminals, filter ->
         buildAgentTree(allTerminals, filter)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    private val _activeSession = MutableStateFlow<TerminalSession?>(null)
+    private val _activeSession: MutableStateFlow<TerminalSession?> = HerdrKeepAliveCoordinator.activeSession
     val activeSession: StateFlow<TerminalSession?> = _activeSession.asStateFlow()
 
-    private val _activeTerminalSummary = MutableStateFlow<TerminalSummary?>(null)
+    private val _activeTerminalSummary: MutableStateFlow<TerminalSummary?> = HerdrKeepAliveCoordinator.activeTerminalSummary
     val activeTerminalSummary: StateFlow<TerminalSummary?> = _activeTerminalSummary.asStateFlow()
 
     private val _savedDesktopDims = MutableStateFlow<Map<String, Pair<Int, Int>>>(emptyMap())
@@ -123,9 +130,14 @@ class HerdrMainViewModel(
     private val _appUpdateState = MutableStateFlow(AppUpdateState())
     val appUpdateState: StateFlow<AppUpdateState> = _appUpdateState.asStateFlow()
 
+    private var connectJob: Job? = null
+    private var autoReconnectJob: Job? = null
     private var sessionJob: Job? = null
+    private var sessionWatchJob: Job? = null
+    private var keepAliveWatchJob: Job? = null
     private var ztStateJob: Job? = null
     private var updateJob: Job? = null
+    private var lastDesiredAttachMode: AttachMode = AttachMode.OBSERVE
 
     fun bindZeroTierTransport(transport: ZeroTierOverlayTransport) {
         ZeroTierOverlayRegistry.transport = transport
@@ -142,6 +154,8 @@ class HerdrMainViewModel(
     }
 
     fun initializeFromContext(context: Context, intent: Intent?) {
+        appContext = context.applicationContext
+        HerdrKeepAliveCoordinator.onDisconnectRequested = { disconnectNow() }
         val sp = context.getSharedPreferences("herdr_connection_prefs", Context.MODE_PRIVATE)
         prefs = sp
         var current = _profile.value
@@ -183,8 +197,10 @@ class HerdrMainViewModel(
                     AttachMode.OBSERVE
                 },
                 autoHideTerminalTopBar = sp.getBoolean("auto_hide_terminal_topbar", true),
-                autoHideObserveKeyStrip = sp.getBoolean("auto_hide_observe_keystrip", true)
+                autoHideObserveKeyStrip = sp.getBoolean("auto_hide_observe_keystrip", true),
+                keepAliveInBackground = sp.getBoolean("keep_alive_in_background", true)
             )
+            ensureKeepAliveMonitor()
             val restoredDims = mutableMapOf<String, Pair<Int, Int>>()
             for ((k, v) in sp.all) {
                 if (k.startsWith("desktop_dims_") && v is String) {
@@ -350,8 +366,10 @@ class HerdrMainViewModel(
             putString("default_attach_mode", updated.defaultAttachMode.name)
             putBoolean("auto_hide_terminal_topbar", updated.autoHideTerminalTopBar)
             putBoolean("auto_hide_observe_keystrip", updated.autoHideObserveKeyStrip)
+            putBoolean("keep_alive_in_background", updated.keepAliveInBackground)
             apply()
         }
+        syncKeepAliveNotification()
     }
 
     fun setDefaultMobilePtyCols(cols: Int) {
@@ -609,22 +627,222 @@ class HerdrMainViewModel(
         _toastBanner.value = null
     }
 
+    private fun isUnrecoverableErrorKind(kind: String): Boolean {
+        return kind in setOf(
+            "host_key_untrusted",
+            "host_key_changed",
+            "private_key_unavailable",
+            "invalid_profile",
+            "windows_session_permission",
+            "hc_missing",
+            "hc_not_running"
+        )
+    }
+
+    private fun syncKeepAliveNotification() {
+        val ctx = appContext ?: return
+        val keepAliveEnabled = _appSettings.value.keepAliveInBackground
+        val state = controller.connectionState.value
+        val activeTerm = _activeTerminalSummary.value
+        val termCount = controller.terminals.value.size
+        val host = _profile.value.host
+
+        val shouldRunService = keepAliveEnabled && (
+            HerdrKeepAliveCoordinator.userWantsConnectionAlive ||
+                state is ConnectionState.Connected ||
+                state is ConnectionState.Connecting
+            )
+
+        if (!shouldRunService) {
+            HerdrKeepAliveCoordinator.updateStatus(ctx, active = false, title = "", subtitle = "")
+            return
+        }
+
+        val (title, subtitle) = when (state) {
+            is ConnectionState.Connected -> {
+                val termLabel = if (activeTerm != null) {
+                    " · 挂载终端 ${activeTerm.address}"
+                } else {
+                    ""
+                }
+                "Herdr 后台连接保活中 · $host" to "${termCount} 个在线终端$termLabel · 锁屏与切后台不断流"
+            }
+            is ConnectionState.Connecting -> {
+                "Herdr 正在同步远端会话 · $host" to "正在执行：${state.activeStage.title}"
+            }
+            is ConnectionState.Failed -> {
+                if (HerdrKeepAliveCoordinator.isReconnectingInBackground) {
+                    "Herdr 后台自动重连中 · $host" to "检测到连接中断，正在后台静默恢复会话..."
+                } else {
+                    "Herdr 连接受阻 · $host" to state.message
+                }
+            }
+            ConnectionState.Disconnected -> {
+                "Herdr 后台连接待命 · $host" to "准备恢复远端连接..."
+            }
+        }
+        HerdrKeepAliveCoordinator.updateStatus(ctx, active = true, title = title, subtitle = subtitle)
+    }
+
+    private fun ensureKeepAliveMonitor() {
+        if (keepAliveWatchJob?.isActive == true) return
+        keepAliveWatchJob = HerdrKeepAliveCoordinator.processScope.launch {
+            var wasConnectedBefore = controller.connectionState.value is ConnectionState.Connected
+            controller.connectionState.collect { state ->
+                syncKeepAliveNotification()
+                when (state) {
+                    is ConnectionState.Connected -> {
+                        wasConnectedBefore = true
+                        HerdrKeepAliveCoordinator.isReconnectingInBackground = false
+                        // If there was an active terminal before a brief drop, restore it automatically
+                        val targetSummary = _activeTerminalSummary.value
+                        val currentSession = _activeSession.value
+                        if (targetSummary != null && (currentSession == null || !currentSession.isAttached.value)) {
+                            reattachSavedTerminalSilently(targetSummary, lastDesiredAttachMode)
+                        }
+                    }
+                    is ConnectionState.Failed -> {
+                        val shouldAutoReconnect =
+                            HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
+                                _appSettings.value.keepAliveInBackground &&
+                                wasConnectedBefore &&
+                                !isUnrecoverableErrorKind(state.errorKind)
+                        if (shouldAutoReconnect) {
+                            triggerBackgroundAutoReconnect()
+                        }
+                    }
+                    ConnectionState.Disconnected -> {
+                        if (!HerdrKeepAliveCoordinator.isReconnectingInBackground) {
+                            wasConnectedBefore = false
+                        }
+                    }
+                    is ConnectionState.Connecting -> Unit
+                }
+            }
+        }
+    }
+
+    private fun triggerBackgroundAutoReconnect() {
+        if (autoReconnectJob?.isActive == true) return
+        autoReconnectJob = HerdrKeepAliveCoordinator.processScope.launch {
+            HerdrKeepAliveCoordinator.isReconnectingInBackground = true
+            syncKeepAliveNotification()
+            val delaysMs = listOf(1200L, 2500L, 4000L, 6000L)
+            var attemptIndex = 0
+            while (isActive &&
+                HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
+                _appSettings.value.keepAliveInBackground &&
+                controller.connectionState.value !is ConnectionState.Connected
+            ) {
+                val waitMs = delaysMs[minOf(attemptIndex, delaysMs.lastIndex)]
+                delay(waitMs)
+                if (!HerdrKeepAliveCoordinator.userWantsConnectionAlive || !_appSettings.value.keepAliveInBackground) {
+                    break
+                }
+                if (controller.connectionState.value is ConnectionState.Connected ||
+                    controller.connectionState.value is ConnectionState.Connecting
+                ) {
+                    break
+                }
+                val result = controller.connect(_profile.value)
+                if (result.isSuccess) {
+                    HerdrKeepAliveCoordinator.isReconnectingInBackground = false
+                    _toastBanner.value = "后台保活已自动恢复远端连接"
+                    val savedSummary = _activeTerminalSummary.value
+                    if (savedSummary != null) {
+                        reattachSavedTerminalSilently(savedSummary, lastDesiredAttachMode)
+                    }
+                    break
+                } else {
+                    val currentState = controller.connectionState.value
+                    if (currentState is ConnectionState.Failed && isUnrecoverableErrorKind(currentState.errorKind)) {
+                        break
+                    }
+                }
+                attemptIndex++
+            }
+            HerdrKeepAliveCoordinator.isReconnectingInBackground = false
+            syncKeepAliveNotification()
+        }
+    }
+
+    private fun reattachSavedTerminalSilently(summary: TerminalSummary, mode: AttachMode) {
+        sessionJob?.cancel()
+        sessionJob = HerdrKeepAliveCoordinator.processScope.launch {
+            val refreshedSummary = controller.terminals.value.find { it.address == summary.address } ?: summary
+            _activeTerminalSummary.value = refreshedSummary
+            controller.openTerminalSession(refreshedSummary.address, mode)
+                .onSuccess { session ->
+                    _activeSession.value = session
+                    watchSessionAttachment(session, refreshedSummary)
+                    syncKeepAliveNotification()
+                }
+        }
+    }
+
+    private fun watchSessionAttachment(session: TerminalSession, summary: TerminalSummary) {
+        sessionWatchJob?.cancel()
+        sessionWatchJob = HerdrKeepAliveCoordinator.processScope.launch {
+            session.isAttached.collect { attached ->
+                if (!attached &&
+                    _activeSession.value === session &&
+                    HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
+                    _appSettings.value.keepAliveInBackground &&
+                    controller.connectionState.value is ConnectionState.Connected
+                ) {
+                    delay(600)
+                    if (_activeSession.value === session &&
+                        HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
+                        controller.connectionState.value is ConnectionState.Connected
+                    ) {
+                        reattachSavedTerminalSilently(summary, session.mode.value)
+                    }
+                }
+            }
+        }
+    }
+
     fun connectNow() {
-        viewModelScope.launch {
+        autoReconnectJob?.cancel()
+        connectJob?.cancel()
+        HerdrKeepAliveCoordinator.userWantsConnectionAlive = true
+        HerdrKeepAliveCoordinator.isReconnectingInBackground = false
+        ensureKeepAliveMonitor()
+        syncKeepAliveNotification()
+        connectJob = HerdrKeepAliveCoordinator.processScope.launch {
             val result = controller.connect(_profile.value)
             result.onSuccess {
-                _toastBanner.value = "已通过 hc connect 同步远端终端拓扑"
+                syncKeepAliveNotification()
+                _toastBanner.value = if (_appSettings.value.keepAliveInBackground) {
+                    "已同步远端终端拓扑（后台常驻保活已开启）"
+                } else {
+                    "已通过 hc connect 同步远端终端拓扑"
+                }
             }.onFailure { err ->
+                val failedState = controller.connectionState.value
+                if (failedState is ConnectionState.Failed && isUnrecoverableErrorKind(failedState.errorKind)) {
+                    HerdrKeepAliveCoordinator.userWantsConnectionAlive = false
+                }
+                syncKeepAliveNotification()
                 _toastBanner.value = "连接未完成：${err.message ?: "请检查四步诊断详情"}"
             }
         }
     }
 
     fun disconnectNow() {
-        viewModelScope.launch {
-            _activeSession.value?.detach()
+        HerdrKeepAliveCoordinator.userWantsConnectionAlive = false
+        HerdrKeepAliveCoordinator.isReconnectingInBackground = false
+        autoReconnectJob?.cancel()
+        connectJob?.cancel()
+        sessionWatchJob?.cancel()
+        sessionJob?.cancel()
+        syncKeepAliveNotification()
+        HerdrKeepAliveCoordinator.processScope.launch {
+            runCatching { _activeSession.value?.detach() }
             _activeSession.value = null
+            _activeTerminalSummary.value = null
             controller.disconnect()
+            syncKeepAliveNotification()
             _toastBanner.value = "已安全断开手机端连接（远端终端与 Agent 继续保持运行）"
         }
     }
@@ -632,15 +850,19 @@ class HerdrMainViewModel(
     fun refreshTerminals() {
         viewModelScope.launch {
             controller.refreshTerminals()
-                .onSuccess { _toastBanner.value = "已刷新 ${it.size} 个在线终端" }
+                .onSuccess {
+                    syncKeepAliveNotification()
+                    _toastBanner.value = "已刷新 ${it.size} 个在线终端"
+                }
                 .onFailure { _toastBanner.value = "刷新失败：${it.message}" }
         }
     }
 
     fun attachTerminal(summary: TerminalSummary, initialMode: AttachMode = AttachMode.OBSERVE) {
         sessionJob?.cancel()
-        sessionJob = viewModelScope.launch {
-            _activeSession.value?.detach()
+        lastDesiredAttachMode = initialMode
+        sessionJob = HerdrKeepAliveCoordinator.processScope.launch {
+            runCatching { _activeSession.value?.detach() }
             _activeTerminalSummary.value = summary
             if (summary.cols > 88) {
                 rememberDesktopDimensions(summary.address, summary.cols, summary.rows)
@@ -648,14 +870,16 @@ class HerdrMainViewModel(
             val opened = controller.openTerminalSession(summary.address, initialMode)
             opened.onSuccess { session ->
                 _activeSession.value = session
+                watchSessionAttachment(session, summary)
+                syncKeepAliveNotification()
                 selectTab(WorkspaceTab.TERMINAL)
                 val curCols = session.dimensions.value.first
                 _toastBanner.value = if (curCols <= 88) {
-                    "已连接 ${summary.address}（当前保持手机 PTY 宽度 ${curCols}列，断联不重置）"
+                    "已连接 ${summary.address}（当前保持手机 PTY 宽度 ${curCols}列，切后台不断流）"
                 } else if (initialMode == AttachMode.OBSERVE) {
-                    "已进入 ${summary.address} 只读模式（${summary.cols}×${summary.rows}，点「PTY 接管」可同步手机宽度）"
+                    "已进入 ${summary.address} 只读模式（${summary.cols}×${summary.rows}，后台保活中）"
                 } else {
-                    "已进入 ${summary.address} 互动接管模式"
+                    "已进入 ${summary.address} 互动接管模式（后台保活中）"
                 }
             }.onFailure { err ->
                 _toastBanner.value = "打开终端流失败：${err.message}"
@@ -725,6 +949,7 @@ class HerdrMainViewModel(
             } else {
                 AttachMode.OBSERVE
             }
+            lastDesiredAttachMode = next
             current.setMode(next)
             _toastBanner.value = if (next == AttachMode.OBSERVE) {
                 "已切换为 Observe 只读观看模式"

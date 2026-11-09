@@ -168,7 +168,17 @@ object HerdrConnectionControllerFactory {
     @Volatile
     var provider: () -> HerdrConnectionController = { SshHcConnectionController() }
 
+    @Volatile
+    private var sharedInstance: HerdrConnectionController? = null
+
     fun create(): HerdrConnectionController = provider()
+
+    @Synchronized
+    fun shared(): HerdrConnectionController {
+        val current = sharedInstance
+        if (current != null) return current
+        return provider().also { sharedInstance = it }
+    }
 }
 
 /**

@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -37,7 +38,11 @@ internal class HcLiveTerminalSession(
     private var streamEpoch = 0L
     private val _mode = MutableStateFlow(initialMode)
     override val mode: StateFlow<AttachMode> = _mode.asStateFlow()
-    private val _outputFrames = MutableSharedFlow<ByteArray>(replay = 64, extraBufferCapacity = 32)
+    private val _outputFrames = MutableSharedFlow<ByteArray>(
+        replay = 64,
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     override val outputFrames: Flow<ByteArray> = _outputFrames.asSharedFlow()
     private val _screenSnapshot = MutableStateFlow("")
     override val screenSnapshot: StateFlow<String> = _screenSnapshot.asStateFlow()

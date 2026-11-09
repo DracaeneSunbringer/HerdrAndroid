@@ -193,11 +193,13 @@ class SshHcConnectionController(
             }
         }
         pollJob = scope.launch {
+            var consecutiveFailures = 0
             while (isActive && attempt.get() == epoch) {
                 delay(pollIntervalMs)
                 try {
                     val inventory = connected.listTerminals()
                     val remoteMachines = readMachines(connected)
+                    consecutiveFailures = 0
                     if (attempt.get() == epoch) {
                         _terminals.value = inventory
                         _machines.value = remoteMachines
@@ -205,8 +207,11 @@ class SshHcConnectionController(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: Exception) {
-                    connected.close() // monitor reports the loss; mutating calls are never replayed
-                    break
+                    consecutiveFailures++
+                    if (!connected.isConnected.value || consecutiveFailures >= 3) {
+                        connected.close() // monitor reports the loss; mutating calls are never replayed
+                        break
+                    }
                 }
             }
         }
