@@ -106,7 +106,7 @@ object StructuredTerminalReader {
     private val emptyBoxRowRegex = Regex("^│\\s*(?:[>❯›]\\s*)?│?$")
     private val lonePromptRegex = Regex("^[>❯›]\\s*$")
     private val progressBarRegex = Regex("[█▉▊▋▌▍▎▏░▒▓]{3,}")
-    private val tipRegex = Regex("^(?:[※⎿*]\\s*)?Tip:")
+    private val tipRegex = Regex("^(?:[※⎿*└├][─\\s]*)?Tip:")
 
     private val commonFooterRegex = Regex(
         "(?i)(\\? for shortcuts|esc to (?:cancel|interrupt)|ctrl\\+c to (?:exit|quit|cancel)|" +
@@ -117,13 +117,8 @@ object StructuredTerminalReader {
             "⚠\\s*\\d+\\s*warnings?\\s*·\\s*f2 to view)"
     )
 
-    // Antigravity bottom dock lines: model badge & background daemon task rows
-    private val agyModelFooterRegex = Regex(
-        "(?i)(?:Claude\\s+(?:Opus|Sonnet|Haiku)|Gemini\\s+[\\w.-]+(?:\\s+[\\w.-]+)?|GPT-[\\w.-]+)\\s*·\\s*(?:low|medium|high|xhigh)\\b"
-    )
-    private val agyDaemonTaskRegex = Regex("^\\s*●\\s+\\[\\d{2}:\\d{2}:\\d{2}]\\s+.*\\brunning\\s*$")
-
-    // Codex bottom dock & transcript grammar are defined in CodexTranscriptSpec (`codex-rs/tui` source truth).
+    // Antigravity (`agy`) & Codex bottom docks and transcript grammars live in
+    // AntigravityTranscriptSpec & CodexTranscriptSpec.
 
     // Pi specific patterns
     private val piClickToJumpPromptRegex = Regex("^(.+?)\\s{2,}\\[click to jump]\\s*$")
@@ -307,11 +302,16 @@ object StructuredTerminalReader {
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { yesNoRegex.containsMatchIn(it) }
         val looksWorking = rawTail.takeLast(8).any {
-            workingHintRegex.containsMatchIn(it) || CodexTranscriptSpec.liveStatusIndicatorRegex.matches(it)
+            workingHintRegex.containsMatchIn(it) ||
+                CodexTranscriptSpec.liveStatusIndicatorRegex.matches(it) ||
+                AntigravityTranscriptSpec.modelRetryStatusRegex.matches(it) ||
+                Regex("^\\s*[\\u2800-\\u28FF]\\s{1,3}\\S").containsMatchIn(it)
         }
         val looksBlocked = menuOptions.isNotEmpty() || hasYesNo ||
+            rawTail.takeLast(8).any { AntigravityTranscriptSpec.subagentQuestionRegex.matches(it) } ||
             cleanTail.takeLast(8).any {
                 blockingPromptRegex.containsMatchIn(it) ||
+                    AntigravityTranscriptSpec.permissionTitleRegex.matches(it) ||
                     CodexTranscriptSpec.approvalOverlayTitleRegex.matches(it) ||
                     CodexTranscriptSpec.requestUserInputOverlayRegex.matches(it)
             }
@@ -467,7 +467,7 @@ object StructuredTerminalReader {
                 boxCornerOrCrossRegex.containsMatchIn(nextTrimmed)
 
             if (!partOfBoxTable && !piPipeSummaryRegex.matches(line)) {
-                line = unwrapFramedMessageRow(line)
+                line = unwrapFramedMessageRow(line, dialect)
             }
 
             val trimmed = line.trim()
@@ -506,23 +506,35 @@ object StructuredTerminalReader {
         when (dialect) {
             TerminalDialect.ANTIGRAVITY -> {
                 var end = lines.lastIndex
-                val floor = (lines.size - 28).coerceAtLeast(0)
+                val floor = (lines.size - 32).coerceAtLeast(0)
                 var sawBottomRule = false
                 while (end >= floor) {
-                    val t = lines[end].trim()
+                    val raw = lines[end]
+                    val t = raw.trim()
                     when {
                         t.isEmpty() -> end--
-                        commonFooterRegex.containsMatchIn(t) || agyModelFooterRegex.containsMatchIn(t) -> end--
-                        agyDaemonTaskRegex.matches(lines[end]) -> end--
+                        commonFooterRegex.containsMatchIn(t) ||
+                            AntigravityTranscriptSpec.modelStatusFooterRegex.containsMatchIn(t) ||
+                            AntigravityTranscriptSpec.keyHintFooterRegex.containsMatchIn(t) ||
+                            AntigravityTranscriptSpec.customStatusLineRegex.containsMatchIn(t) ||
+                            AntigravityTranscriptSpec.exitResumeHeaderRegex.matches(raw) ||
+                            AntigravityTranscriptSpec.exitResumeCmdRegex.matches(raw) -> end--
+                        AntigravityTranscriptSpec.trayTaskRowRegex.matches(raw) ||
+                            AntigravityTranscriptSpec.traySubagentRowRegex.matches(raw) -> end--
                         longRuleRegex.matches(t) -> {
                             sawBottomRule = true
                             end--
                         }
-                        sawBottomRule && (t == ">" || t.startsWith("> ")) -> {
+                        sawBottomRule && (t == ">" || (t.startsWith("> ") && !promptMenuOptionRegex.matches(raw))) &&
+                            !t.contains("<hc") -> {
                             // Live composer prompt `> ...` is sandwiched between two `───` rules at the bottom.
                             val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].isNotBlank() }
                             if (aboveIdx != null && longRuleRegex.matches(lines[aboveIdx].trim())) {
                                 end = aboveIdx - 1
+                            }
+                            // Also strip right-aligned `N artifact(s) · /artifact to review` immediately above the top rule.
+                            while (end >= floor && (lines[end].isBlank() || AntigravityTranscriptSpec.keyHintFooterRegex.containsMatchIn(lines[end]))) {
+                                end--
                             }
                             break
                         }
@@ -605,7 +617,8 @@ object StructuredTerminalReader {
                     val t = lines[end].trim()
                     when {
                         t.isEmpty() -> end--
-                        commonFooterRegex.containsMatchIn(t) || agyModelFooterRegex.containsMatchIn(t) -> end--
+                        commonFooterRegex.containsMatchIn(t) ||
+                            AntigravityTranscriptSpec.modelStatusFooterRegex.containsMatchIn(t) -> end--
                         longRuleRegex.matches(t) || inputBoxBorderRegex.matches(t) -> {
                             sawBottomRule = true
                             end--
@@ -681,10 +694,12 @@ object StructuredTerminalReader {
     }
 
     /** `│ text │` or `│ text` (a framed message, not a multi-column table) -> `text`, keeping relative indent. */
-    private fun unwrapFramedMessageRow(line: String): String {
+    private fun unwrapFramedMessageRow(line: String, dialect: TerminalDialect = TerminalDialect.GENERIC): String {
         val pipeCount = line.count { it == '│' }
         val trimmedStart = line.trimStart()
         if (!trimmedStart.startsWith("│")) return line
+        // In Antigravity (`agy`), single-pipe `  │ <text>` is a Markdown blockquote / callout (`> [!NOTE]`), not a box frame!
+        if (dialect == TerminalDialect.ANTIGRAVITY && pipeCount == 1) return line
         val leading = line.length - trimmedStart.length
         return when {
             pipeCount == 1 -> " ".repeat(leading) + trimmedStart.removePrefix("│").removePrefix(" ")
@@ -707,7 +722,13 @@ object StructuredTerminalReader {
 
         return when (dialect) {
             TerminalDialect.ANTIGRAVITY ->
-                agyModelFooterRegex.containsMatchIn(trimmed) || agyDaemonTaskRegex.matches(trimmed)
+                AntigravityTranscriptSpec.modelStatusFooterRegex.containsMatchIn(trimmed) ||
+                    AntigravityTranscriptSpec.keyHintFooterRegex.containsMatchIn(trimmed) ||
+                    AntigravityTranscriptSpec.customStatusLineRegex.containsMatchIn(trimmed) ||
+                    AntigravityTranscriptSpec.trayTaskRowRegex.matches(trimmed) ||
+                    AntigravityTranscriptSpec.traySubagentRowRegex.matches(trimmed) ||
+                    AntigravityTranscriptSpec.exitResumeHeaderRegex.matches(trimmed) ||
+                    AntigravityTranscriptSpec.exitResumeCmdRegex.matches(trimmed)
             TerminalDialect.CODEX ->
                 CodexTranscriptSpec.composerPlaceholderRegex.matches(trimmed) ||
                     CodexTranscriptSpec.quotaHeadsUpRegex.matches(trimmed) ||
@@ -845,6 +866,26 @@ object StructuredTerminalReader {
                         flushParagraph()
                         consumeCodexStructuredAlert()
                     }
+                    dialect == TerminalDialect.ANTIGRAVITY && AntigravityTranscriptSpec.attachmentBadgeRegex.matches(line) -> {
+                        val badge = AntigravityTranscriptSpec.attachmentBadgeRegex.find(line)!!.groupValues[1].trim()
+                        val prev = blocks.lastOrNull()
+                        if (paraText == null && prev is TerminalSemanticBlock.UserPromptBlock) {
+                            blocks[blocks.lastIndex] = prev.copy(text = "${prev.text}\n[📎 $badge]")
+                        } else {
+                            flushParagraph()
+                            blocks.add(TerminalSemanticBlock.UserPromptBlock("[📎 $badge]"))
+                        }
+                        i++
+                    }
+                    dialect == TerminalDialect.ANTIGRAVITY && isAgyLoneListMarkerStart(i) -> {
+                        flushParagraph()
+                        consumeAgyLoneListMarker()
+                    }
+                    dialect == TerminalDialect.ANTIGRAVITY && !isAgyPipeTableStart(i) &&
+                        !isTableLine(line) && AntigravityTranscriptSpec.calloutPipeLineRegex.matches(line) -> {
+                        consumeAgyCalloutLine(line)
+                        i++
+                    }
                     dialect == TerminalDialect.PI && piTodosHeaderRegex.matches(line) -> {
                         flushParagraph()
                         consumePiTodos()
@@ -886,11 +927,16 @@ object StructuredTerminalReader {
                         flushParagraph()
                         consumeJson()
                     }
-                    dialect == TerminalDialect.CODEX && paraText == null &&
+                    (dialect == TerminalDialect.CODEX || dialect == TerminalDialect.ANTIGRAVITY) && paraText == null &&
                         CodexTranscriptSpec.detectUnfencedCodeBlockEnd(lines, i, wrapThreshold) != null -> {
                         val endIdx = CodexTranscriptSpec.detectUnfencedCodeBlockEnd(lines, i, wrapThreshold)!!
                         addCode(lines.subList(i, endIdx).joinToString("\n"), kindLabel = "代码")
                         i = endIdx
+                    }
+                    dialect == TerminalDialect.ANTIGRAVITY && isAgyInlineUnfencedCodeLine(line) -> {
+                        flushParagraph()
+                        addCode(line.trim(), kindLabel = "代码")
+                        i++
                     }
                     isIndentedCode(line) -> {
                         flushParagraph()
@@ -965,6 +1011,19 @@ object StructuredTerminalReader {
             val promptIndent = indentOf(rawFirst)
             i++
 
+            // In Antigravity (`agy`), slash commands (`> /artifact`, `> /agents`) are immediately followed by `  ⎿  <outcome>`
+            if (dialect == TerminalDialect.ANTIGRAVITY && AntigravityTranscriptSpec.slashPromptRegex.matches(first)) {
+                if (i < lines.size && AntigravityTranscriptSpec.slashOutcomeRowRegex.matches(lines[i])) {
+                    val outcome = AntigravityTranscriptSpec.slashOutcomeRowRegex.find(lines[i])!!.groupValues[1].trim()
+                    i++
+                    if (AntigravityTranscriptSpec.noopSlashOutcomeRegex.matches(outcome)) {
+                        return
+                    }
+                    blocks.add(TerminalSemanticBlock.UserPromptBlock("$first → $outcome"))
+                    return
+                }
+            }
+
             if (first.contains("<hc") && !first.contains("</hc>")) {
                 var combined = first
                 var lastWidth = displayWidth(rawFirst)
@@ -1018,16 +1077,98 @@ object StructuredTerminalReader {
             var prevTruncated = first.endsWith("…")
             while (i < lines.size) {
                 val l = lines[i]
-                if (prevTruncated && !l.trim().startsWith("<hc")) break
+                val t = l.trim()
+                if (dialect == TerminalDialect.ANTIGRAVITY && AntigravityTranscriptSpec.attachmentBadgeRegex.matches(l)) {
+                    val badge = AntigravityTranscriptSpec.attachmentBadgeRegex.find(l)!!.groupValues[1].trim()
+                    text = "$text\n[📎 $badge]"
+                    i++
+                    continue
+                }
+                if (prevTruncated && !t.startsWith("<hc")) break
                 if (l.isBlank()) break
                 if (indentOf(l) <= promptIndent) break
                 if (isPromptBoundary(l)) break
-                text = joinWrapped(text, l.trim(), lastWidth >= wrapThreshold)
+                text = if (dialect == TerminalDialect.ANTIGRAVITY && AntigravityTranscriptSpec.artifactVerdictLineRegex.matches(t)) {
+                    "$text\n$t"
+                } else {
+                    joinWrapped(text, t, lastWidth >= wrapThreshold)
+                }
                 lastWidth = displayWidth(l)
-                prevTruncated = l.trim().endsWith("…")
+                prevTruncated = t.endsWith("…")
                 i++
             }
             blocks.add(TerminalSemanticBlock.UserPromptBlock(text))
+        }
+
+        // ---- Antigravity (`agy`) specific blocks ----
+
+        private fun isAgyLoneListMarkerStart(idx: Int): Boolean {
+            if (idx + 1 >= lines.size) return false
+            val cur = lines[idx]
+            val isLone = AntigravityTranscriptSpec.loneOrderedMarkerRegex.matches(cur) ||
+                AntigravityTranscriptSpec.loneUnorderedMarkerRegex.matches(cur)
+            if (!isLone) return false
+            val next = lines[idx + 1]
+            if (next.isBlank()) return false
+            if (indentOf(next) < indentOf(cur)) return false
+            return !isPromptLine(next) && !isToolHead(next) && !isAlertLine(next) && !isTableLine(next)
+        }
+
+        private fun consumeAgyLoneListMarker() {
+            val markerLine = lines[i]
+            val bodyLine = lines[i + 1]
+            val indent = indentOf(markerLine)
+            val level = bulletIndentLevel(indent)
+            val width = displayWidth(bodyLine)
+            val ordMatch = AntigravityTranscriptSpec.loneOrderedMarkerRegex.find(markerLine)
+            if (ordMatch != null) {
+                val marker = ordMatch.groupValues[2].trim()
+                startParagraph("$marker ${bodyLine.trim()}", bullet = true, indent = indent, indentLevel = level, width = width)
+            } else {
+                startParagraph(bodyLine.trim(), bullet = true, indent = indent, indentLevel = level, width = width)
+            }
+            i += 2
+        }
+
+        private fun consumeAgyCalloutLine(line: String) {
+            val m = AntigravityTranscriptSpec.calloutPipeLineRegex.find(line) ?: return
+            val indent = m.groupValues[1].length
+            val rawBody = m.groupValues[2].trim()
+            if (rawBody.isEmpty()) {
+                flushParagraph()
+                return
+            }
+            val width = displayWidth(line)
+            val bulletMatch = unorderedBulletRegex.find(rawBody)
+            if (bulletMatch != null) {
+                flushParagraph()
+                startParagraph("▎ ${bulletMatch.groupValues[2].trim()}", bullet = true, indent = indent, indentLevel = 0, width = width)
+                return
+            }
+            val current = paraText
+            if (current != null && current.startsWith("▎ ") && !paraBullet) {
+                val joined = joinWrapped(current.toString(), rawBody, paraLastWidth >= wrapThreshold)
+                current.setLength(0)
+                current.append(joined)
+                paraLastWidth = width
+                return
+            }
+            flushParagraph()
+            startParagraph("▎ $rawBody", bullet = false, indent = indent, indentLevel = 0, width = width)
+        }
+
+        private val agyInlineCodeStartRegex = Regex(
+            "^(?:const|let|var|val|fun|def|function|async\\s+function|export\\s+(?:const|function|class)|import\\s+\\{)\\s+\\w+"
+        )
+        private val agyInlineCodeTokenRegex = Regex(
+            "(?:===|!==|==|!=|<=|>=|=>|->|&&|\\|\\||;\\s*$|\\{\\s*$)"
+        )
+
+        private fun isAgyInlineUnfencedCodeLine(line: String): Boolean {
+            if (indentOf(line) < 2) return false
+            val t = line.trim()
+            if (t.isEmpty() || t.any { isCjk(it) }) return false
+            return agyInlineCodeStartRegex.containsMatchIn(t) && agyInlineCodeTokenRegex.containsMatchIn(t)
         }
 
         // ---- Codex specific blocks (`codex-rs/tui` source bijection) ----
@@ -1499,15 +1640,42 @@ object StructuredTerminalReader {
                     }
 
                     isToolHead(line) -> {
-                        headCount++
                         headIndent = indentOf(line)
+                        val isExpandedAgyThought = dialect == TerminalDialect.ANTIGRAVITY &&
+                            (trimmed.startsWith("▾") || trimmed.startsWith("▼")) &&
+                            AntigravityTranscriptSpec.thoughtRowRegex.matches(line)
                         val clean = cleanStepText(cleanToolHead(trimmed))
+                        val stepCount = if (dialect == TerminalDialect.ANTIGRAVITY &&
+                            !AntigravityTranscriptSpec.thoughtRowRegex.matches(line) &&
+                            !spinnerRegex.matches(line)
+                        ) {
+                            AntigravityTranscriptSpec.countActionsInSummary(clean)
+                        } else {
+                            1
+                        }
+                        headCount += stepCount
                         running = spinnerRegex.matches(line) ||
+                            AntigravityTranscriptSpec.modelRetryStatusRegex.matches(line) ||
                             clean.startsWith("Running") || clean.startsWith("Generating") ||
                             clean.startsWith("Loading") || clean.startsWith("Thinking") || clean.endsWith("…")
-                        if (stepErrorRegex.containsMatchIn(clean) && !zeroFailures(clean)) hasError = true
+                        val failed = if (dialect == TerminalDialect.ANTIGRAVITY) {
+                            AntigravityTranscriptSpec.hasRealStepFailure(trimmed) && !zeroFailures(clean)
+                        } else {
+                            stepErrorRegex.containsMatchIn(clean) && !zeroFailures(clean)
+                        }
+                        if (failed) hasError = true
                         if (steps.size < MAX_GROUP_STEPS) steps.add(clean)
                         i++
+                        // When a thought is expanded (`▾ Thought for ...`), `agy` separates the expanded thinking body
+                        // from the assistant response with a blank line (`changelog`: collapsed/expanded thought separator).
+                        if (isExpandedAgyThought) {
+                            while (i < lines.size && lines[i].isNotBlank() &&
+                                indentOf(lines[i]) >= 2 && !isPromptLine(lines[i]) && !isToolHead(lines[i])
+                            ) {
+                                if (steps.size < MAX_GROUP_STEPS) steps.add("  ${lines[i].trim()}")
+                                i++
+                            }
+                        }
                     }
 
                     toolChildRegex.matches(line) -> {
@@ -1620,6 +1788,7 @@ object StructuredTerminalReader {
 
         private fun cleanStepText(text: String): String =
             text
+                .replace(AntigravityTranscriptSpec.ctrlOSuffixRegex, "")
                 .replace(ctrlExpandSuffixRegex, "")
                 .replace(clickShowMoreSuffixRegex, "")
                 .trim()
@@ -1633,6 +1802,11 @@ object StructuredTerminalReader {
         private fun isAlertLine(line: String): Boolean =
             errorRegex.matches(line) ||
                 agyWarningErrorRegex.matches(line) ||
+                (dialect == TerminalDialect.ANTIGRAVITY && (
+                    AntigravityTranscriptSpec.warningBannerRegex.matches(line) ||
+                        AntigravityTranscriptSpec.subagentQuestionRegex.matches(line) ||
+                        AntigravityTranscriptSpec.permissionTitleRegex.matches(line)
+                    )) ||
                 tracebackRegex.matches(line) ||
                 permissionErrorRegex.containsMatchIn(line) ||
                 blockingPromptRegex.containsMatchIn(line)
@@ -1656,6 +1830,69 @@ object StructuredTerminalReader {
                         i++
                     }
                     blocks.add(TerminalSemanticBlock.UrgentAlertBlock("运行异常", sb.toString().trim(), true))
+                    continue
+                }
+
+                // General `⚠ ...` warning in Antigravity (e.g. `⚠ The <plugin> plugin needs you to sign in...`)
+                if (dialect == TerminalDialect.ANTIGRAVITY && AntigravityTranscriptSpec.warningBannerRegex.matches(rawAlert)) {
+                    val detailSb = StringBuilder(AntigravityTranscriptSpec.warningBannerRegex.find(rawAlert)!!.groupValues[1].trim())
+                    i++
+                    while (i < lines.size && lines[i].isNotBlank() && !isPromptLine(lines[i]) && !isToolHead(lines[i])) {
+                        detailSb.append(" ").append(lines[i].trim())
+                        i++
+                    }
+                    val detailStr = detailSb.toString().trim()
+                    val needsAction = detailStr.contains("sign in", ignoreCase = true)
+                    blocks.add(
+                        TerminalSemanticBlock.UrgentAlertBlock(
+                            title = if (needsAction) "需要你的授权" else "提示",
+                            detail = detailStr,
+                            isError = false
+                        )
+                    )
+                    continue
+                }
+
+                // Interactive permission / question picker in Antigravity (`Allow calling this tool?` + numbered options)
+                if (dialect == TerminalDialect.ANTIGRAVITY && (
+                        AntigravityTranscriptSpec.permissionTitleRegex.matches(rawAlert) ||
+                            AntigravityTranscriptSpec.subagentQuestionRegex.matches(rawAlert)
+                        )
+                ) {
+                    val isQuestion = AntigravityTranscriptSpec.subagentQuestionRegex.matches(rawAlert)
+                    val detailLines = ArrayList<String>()
+                    detailLines.add(rawAlert)
+                    i++
+                    var blanks = 0
+                    while (i < lines.size) {
+                        val l = lines[i]
+                        val t = l.trim()
+                        if (t.isEmpty()) {
+                            blanks++
+                            val next = nextNonBlank(i + 1)
+                            if (next == null || blanks > 2) break
+                            val nl = lines[next]
+                            if (menuOptionRegex.matches(nl) || promptMenuOptionRegex.matches(nl) ||
+                                (indentOf(nl) >= 2 && !isPromptLine(nl) && !isToolHead(nl))
+                            ) {
+                                i = next
+                                continue
+                            }
+                            break
+                        }
+                        if (isPromptLine(l) || isToolHead(l)) break
+                        detailLines.add(
+                            if (promptMenuOptionRegex.matches(l)) l.replaceFirst(Regex("[>❯›]"), " ").trim() else t
+                        )
+                        i++
+                    }
+                    blocks.add(
+                        TerminalSemanticBlock.UrgentAlertBlock(
+                            title = if (isQuestion) "子代理待回答" else "需要你的授权",
+                            detail = detailLines.joinToString("\n"),
+                            isError = false
+                        )
+                    )
                     continue
                 }
 
@@ -1897,8 +2134,8 @@ object StructuredTerminalReader {
         // ---- prose ----
 
         private fun bulletIndentLevel(indent: Int): Int = when (dialect) {
-            // `markdown_render.rs:5341` + `messages.rs:1378`: depth 1 = indent 2, depth 2 = indent 6, depth 3 = indent 10
-            TerminalDialect.CODEX -> ((indent - 2).coerceAtLeast(0) / 4).coerceAtMost(2)
+            // Both `codex` and `agy` render Markdown lists at `indent = 2 + level * 4` (2, 6, 10 spaces).
+            TerminalDialect.CODEX, TerminalDialect.ANTIGRAVITY -> ((indent - 2).coerceAtLeast(0) / 4).coerceAtMost(2)
             else -> if (indent >= baseIndent + 3) 1 else 0
         }
 
@@ -1990,7 +2227,10 @@ object StructuredTerminalReader {
             if (current != null) {
                 val previousWasFull = paraLastWidth >= wrapThreshold
                 val bulletContinuation = paraBullet && indent >= paraIndent
-                val endsSentence = current.isNotEmpty() && current.last() in "。！？.!?；;:："
+                val midTokenDotCont = current.length >= 2 && current.last() == '.' &&
+                    current[current.length - 2].isLetterOrDigit() &&
+                    text.isNotEmpty() && (text.first() in 'a'..'z' || text.first().isDigit())
+                val endsSentence = !midTokenDotCont && current.isNotEmpty() && current.last() in "。！？.!?；;:："
                 if (previousWasFull || !endsSentence || bulletContinuation) {
                     val joined = joinWrapped(current.toString(), text, true)
                     current.setLength(0)
@@ -2040,8 +2280,12 @@ object StructuredTerminalReader {
                     thoughtRegex.matches(line) ||
                     spinnerRegex.matches(line)
             TerminalDialect.ANTIGRAVITY ->
-                thoughtRegex.matches(line) || agyToolVerbRegex.matches(line) ||
-                    toolCallParenRegex.matches(line) || moreActionsRegex.matches(line) || spinnerRegex.matches(line)
+                AntigravityTranscriptSpec.thoughtRowRegex.matches(line) ||
+                    AntigravityTranscriptSpec.actionRowRegex.matches(line) ||
+                    AntigravityTranscriptSpec.moreActionsRowRegex.matches(line) ||
+                    AntigravityTranscriptSpec.modelRetryStatusRegex.matches(line) ||
+                    toolCallParenRegex.matches(line) ||
+                    spinnerRegex.matches(line)
             TerminalDialect.PI ->
                 piThoughtHeaderRegex.matches(line) || piToolGroupHeaderRegex.matches(line) ||
                     piCheckToolRegex.matches(line) || piPipeSummaryRegex.matches(line) ||
@@ -2151,17 +2395,15 @@ object StructuredTerminalReader {
         if (!wrapped) return "$previous $next"
         val a = previous.last()
         val b = next.first()
-        val tailToken = previous.takeLastWhile { !it.isWhitespace() }
-        val looksLikePathOrUrlDot = a == '.' && b.isLetterOrDigit() && (
-            tailToken.contains('/') || tailToken.contains('\\') ||
-                tailToken.contains('_') || tailToken.contains("www.", ignoreCase = true) ||
-                tailToken.contains("http", ignoreCase = true)
-            )
+        val prev2 = if (previous.length >= 2) previous[previous.length - 2] else ' '
+        val looksLikeFilenameIpOrUrlDot = a == '.' && prev2.isLetterOrDigit() && (b in 'a'..'z' || b.isDigit())
+        val looksLikeDigitComma = a == ',' && prev2.isDigit() && b.isDigit()
         val noSpace = isCjk(a) || isCjk(b) ||
             a == '/' || a == '\\' || b == '/' || b == '\\' ||
             a == '(' || b == ')' ||
-            looksLikePathOrUrlDot ||
-            (a == '-' && previous.length > 1 && (previous[previous.length - 2].isLetterOrDigit() || previous[previous.length - 2] == '-'))
+            looksLikeFilenameIpOrUrlDot ||
+            looksLikeDigitComma ||
+            (a == '-' && previous.length > 1 && (prev2.isLetterOrDigit() || prev2 == '-'))
         return if (noSpace) previous + next else "$previous $next"
     }
 

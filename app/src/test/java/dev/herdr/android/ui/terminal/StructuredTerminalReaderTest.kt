@@ -476,4 +476,149 @@ class StructuredTerminalReaderTest {
         assertFalse(prose.any { it.text.contains("输出要求") || it.text.contains("<hc") })
         assertTrue(prose[1].text.startsWith("终审通过。"))
     }
+
+    @Test
+    fun antigravityBijection_parsesAttachmentsSlashOutcomesSubagentToolsCalloutsLoneMarkersAndCustomDock() {
+        val agyScreen = """
+            > 我这里有这个情况吗
+              ▸ 📎 1 image(s) (96 KB)  (ctrl+o to expand)
+
+            > /agents
+              ⎿  Exited /agents command
+
+            > /artifact
+              ⎿  Review submitted
+
+            ────────────────────────────────────────────────────────────
+            > [Approved] ui_v030_redesign.md
+              [Approved] herdr_ui_review.md
+
+            ▾ Thought for 12s, 180 tokens (ctrl+o to collapse)
+              Inspecting subagent reports and verifying task logs before replying.
+
+            ● Spawned 2 subagents
+            ● Messaged 1 subagent
+            ● Scheduled 1 timer (30s: Check subagent output.)
+            ● Ran 6 commands, checked 1 task, killed 1 task (Select-String -Pattern "failed" build.log) (ctrl+o to expand)
+            ● Listed tasks
+            └ Tip: View and review artifacts with /artifact.
+
+              已完成连接至 192.
+              168.1.249，复核了 policy.test.
+              mjs:535（共 1,
+              458 轮思考样本）：
+
+              1.
+              两处小修：把返回按钮上的数字徽章挪开，避免贴着箭头。
+              •
+              在 03:12 修改策略时写了：
+                  const isCheapRation = cid === 'tide_snack' || (def && def.price / def.eat <= 234)
+                  • 二级说明项
+                      • 三级说明项
+              │ 补充一个容易引起误判的细节：当某一步思考较短时，服务端只返回加密的
+              │ thought_signature 签名块，不代表 0 思考。
+
+            ⚠ The Canva plugin needs you to sign in. Open /plugin to sign in.
+
+            Resume with -c (or command below):
+            agy --conversation=1dc59769-31f6-4d79-8043-033d5803e5df
+                                                                               1 artifact · /artifact to review
+            ───────────────────────────────────────────────────────────────────────────────────────────────────
+            > draft not sent yet
+            ───────────────────────────────────────────────────────────────────────────────────────────────────
+              ● helper · Claude Opus 5.5 · Running...
+              ● [10:02:46] cron (every hour at minute 55) running
+            ───────────────────────────────────────────────────────────────────────────────────────────────────
+            ╭─ ● READY ╱ Gemini 4 Argon (High) ╱ main*
+            ╰─ ctx ███············ 18.4% · artifacts 1 · subagents 1 · tasks 1 · sandbox off
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(agyScreen, agentApp = "antigravity")
+
+        // 1. Prompts: `/agents -> Exited` dropped; attachment formatted; `/artifact -> Review submitted` combined;
+        //    multi-artifact approvals kept on separate lines; bottom live draft stripped!
+        val prompts = blocks.filterIsInstance<TerminalSemanticBlock.UserPromptBlock>()
+        assertEquals(3, prompts.size)
+        assertEquals("我这里有这个情况吗\n[📎 1 image(s) (96 KB)]", prompts[0].text)
+        assertEquals("/artifact → Review submitted", prompts[1].text)
+        assertEquals("[Approved] ui_v030_redesign.md\n[Approved] herdr_ui_review.md", prompts[2].text)
+
+        // 2. ToolGroupBlock: expanded thought body folded, Spawned(2)+Messaged(1)+Scheduled(1)+Compound(8)+Listed(1)+Thought(1) = 14,
+        //    and `"failed"` inside Select-String argument did NOT falsely set hasError!
+        val tools = blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(1, tools.size)
+        assertTrue(tools.single().summaryLabel.contains("14"))
+        assertFalse(tools.single().hasError)
+        assertFalse(tools.single().steps.any { it.contains("Tip:") })
+
+        // 3. Inline unfenced code line extracted cleanly as CodeOrTableBlock("代码")
+        val codes = blocks.filterIsInstance<TerminalSemanticBlock.CodeOrTableBlock>()
+        assertEquals(1, codes.size)
+        assertEquals("代码", codes.single().kindLabel)
+        assertTrue(codes.single().content.startsWith("const isCheapRation"))
+
+        // 4. Prose: wrapped IPv4 (`192.168.1.249`), filename (`policy.test.mjs:535`), comma digits (`1,458`),
+        //    lone `1.` and `•` markers, 3-level nesting (`0, 1, 2`), and `│` callout separated from preceding bullet!
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        val intro = prose.first()
+        assertTrue(intro.text.contains("192.168.1.249"))
+        assertTrue(intro.text.contains("policy.test.mjs:535"))
+        assertTrue(intro.text.contains("1,458"))
+
+        val loneOrd = prose.first { it.text.startsWith("1. 两处小修") }
+        assertTrue(loneOrd.isBullet && loneOrd.indentLevel == 0)
+        val loneUnord = prose.first { it.text.startsWith("在 03:12 修改策略时写了") }
+        assertTrue(loneUnord.isBullet && loneUnord.indentLevel == 0)
+        assertEquals(1, prose.first { it.text == "二级说明项" }.indentLevel)
+        assertEquals(2, prose.first { it.text == "三级说明项" }.indentLevel)
+
+        val callout = prose.first { it.text.startsWith("▎ 补充一个容易引起误判的细节") }
+        assertFalse(callout.isBullet)
+        assertTrue(callout.text.contains("thought_signature"))
+
+        // Exit resume hint, subagent tray, artifact review hint & custom statusline never leaked!
+        assertFalse(prose.any {
+            it.text.contains("Resume with") || it.text.contains("--conversation") ||
+                it.text.contains("sandbox off") || it.text.contains("draft not sent")
+        })
+
+        // 5. Plugin sign-in warning extracted as UrgentAlertBlock
+        val alerts = blocks.filterIsInstance<TerminalSemanticBlock.UrgentAlertBlock>()
+        assertEquals(1, alerts.size)
+        assertEquals("需要你的授权", alerts.single().title)
+        assertTrue(alerts.single().detail.contains("Canva plugin needs you to sign in"))
+    }
+
+    @Test
+    fun antigravityPermissionDialog_stripsNavigateFooterAndExtractsNumberedActions() {
+        val blockedAgy = """
+            ● Running (powershell -File deploy.ps1)
+
+              Allow calling this tool?
+
+              powershell -File deploy.ps1
+
+            > 1. Allow once
+              2. Always allow for this conversation
+              3. Deny
+
+            ↑/↓ Navigate · tab Amend · e edit command
+            🔧 TOOL ╱ Gemini 4 Argon (High) │ ctx █·············· 4.6% · artifacts 3 · subagents 1 · tasks 0 · sandbox off
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(blockedAgy, agentApp = "antigravity")
+        assertTrue(blocks.none { it is TerminalSemanticBlock.UserPromptBlock })
+        val alert = blocks.filterIsInstance<TerminalSemanticBlock.UrgentAlertBlock>().single()
+        assertEquals("需要你的授权", alert.title)
+        assertTrue(alert.detail.contains("Allow calling this tool?"))
+        assertTrue(alert.detail.contains("1. Allow once"))
+        assertFalse(alert.detail.contains("Navigate"))
+
+        val actions = StructuredTerminalReader.extractQuickActions(blockedAgy, null)
+        assertEquals("1", actions[0].payload)
+        assertEquals("2", actions[1].payload)
+        assertEquals("3", actions[2].payload)
+        assertEquals("enter", actions[3].payload)
+        assertEquals("esc", actions[4].payload)
+    }
 }
