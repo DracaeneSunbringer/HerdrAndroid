@@ -157,6 +157,32 @@ internal object AntigravityTranscriptSpec {
     /** Expand/collapse suffix (`(ctrl+o to expand)` / `(ctrl+o to collapse)`). */
     val ctrlOSuffixRegex = Regex("\\s*\\(ctrl\\+o to (?:expand|collapse)\\)\\s*$", RegexOption.IGNORE_CASE)
 
+    /** Explicit `Ctrl+O` expanded marker (`(ctrl+o to collapse)`). */
+    val ctrlOCollapseMarkerRegex = Regex("\\(ctrl\\+o to collapse\\)", RegexOption.IGNORE_CASE)
+
+    /** Explicit collapsed marker (`(ctrl+o to expand)`). */
+    val ctrlOExpandMarkerRegex = Regex("\\(ctrl\\+o to expand\\)", RegexOption.IGNORE_CASE)
+
+    /** Expanded tool/action header (`▾ Ran ...` or `● Ran ... (ctrl+o to collapse)`). */
+    val expandedActionRowRegex = Regex(
+        "^\\s*(?:[▾▼]\\s+.*|[●⏺○◦▸▾▼✓✔✗✘]\\s+.*\\(ctrl\\+o to collapse\\)\\s*)$",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** `agy changelog:65`: Fold divider row (`↕ ···`) inside expanded diffs. */
+    val diffFoldDividerRegex = Regex("^\\s*↕\\s*···.*$")
+
+    /**
+     * Common English internal-monologue starters in `agy` expanded `▾ Thought` blocks,
+     * used as a fallback boundary signal when ANSI SGR codes have already been stripped.
+     */
+    val englishMonologueStartRegex = Regex(
+        "^(?:I(?:'m| am| need| should| will| can| have|'ve|'ll)\\b|Let's\\b|Wait[,:\\s]|" +
+            "First[,\\s]|Second[,\\s]|Next[,\\s]|Looking at\\b|The user\\b|Considering\\b|" +
+            "We (?:need|should|can|have)\\b|Now (?:I|let's|we)\\b|Checking\\b|Inspecting\\b|" +
+            "To (?:fix|solve|handle|address)\\b|This (?:means|suggests|indicates)\\b).*"
+    )
+
     /**
      * Extracts total action count from a compound `agy` summary row such as
      * `Ran 6 commands, checked 1 task, killed 1 task (...)` -> `8`, or `1` for a single action.

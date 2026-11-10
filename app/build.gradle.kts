@@ -12,8 +12,8 @@ android {
         applicationId = "dev.herdr.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.3.1"
+        versionCode = 9
+        versionName = "0.3.2"
     }
 
     buildTypes {

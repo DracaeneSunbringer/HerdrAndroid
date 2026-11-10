@@ -256,13 +256,16 @@ object StructuredTerminalReader {
                 rawScreen.contains("← for agents") ||
                 rawScreen.contains("ctrl+t to expand") ||
                 rawScreen.contains("ctrl+t to view transcript") ||
+                rawScreen.contains("T R A N S C R I P T") ||
                 Regex("\\bWorked for (?:<1s|\\d+[dhms])").containsMatchIn(rawScreen) ||
                 Regex("(?m)^\\s*■[\\s\\u200A]+\\S").containsMatchIn(rawScreen) -> TerminalDialect.CODEX
             rawScreen.contains("[click to jump]") ||
                 rawScreen.contains("click to show more") ||
                 rawScreen.contains("Cline upstream:") -> TerminalDialect.PI
             rawScreen.contains("(ctrl+o to expand)") ||
+                rawScreen.contains("(ctrl+o to collapse)") ||
                 rawScreen.contains("▸ Thought for ") ||
+                rawScreen.contains("▾ Thought for ") ||
                 rawScreen.contains("○ Thought for ") ||
                 rawScreen.contains("/artifact to review") ||
                 rawScreen.contains("Conversation compacted") -> TerminalDialect.ANTIGRAVITY
@@ -277,10 +280,10 @@ object StructuredTerminalReader {
         if (rawScreen.isBlank()) return emptyList()
         val dialect = detectDialect(agentApp, rawScreen)
         return runCatching {
-            val cleaned = cleanLines(rawScreen, dialect)
-            if (cleaned.isEmpty()) return emptyList()
+            val cleaned = cleanScreen(rawScreen, dialect)
+            if (cleaned.lines.isEmpty()) return emptyList()
             if (dialect == TerminalDialect.SHELL) {
-                parseShellBlocks(cleaned)
+                parseShellBlocks(cleaned.lines)
             } else {
                 BlockParser(cleaned, dialect).parse()
             }
@@ -297,7 +300,8 @@ object StructuredTerminalReader {
             .map { it.trimEnd('\r').substringAfterLast('\r').trimEnd() }
             .filter { it.isNotBlank() }
             .takeLast(30)
-        val cleanTail = cleanLines(raw, dialect).filter { it.isNotBlank() }.takeLast(16)
+        val cleaned = cleanScreen(raw, dialect)
+        val cleanTail = cleaned.lines.filter { it.isNotBlank() }.takeLast(16)
 
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { yesNoRegex.containsMatchIn(it) }
@@ -332,9 +336,19 @@ object StructuredTerminalReader {
             else -> s
         }
 
+        val isExpanded = cleaned.isExpandedMode
         val expandKey = if (dialect == TerminalDialect.CODEX) "ctrl+t" else "ctrl+o"
-        val expandLabel = if (dialect == TerminalDialect.CODEX) "展开输出 Ctrl+T" else "展开详情 Ctrl+O"
-        val errorExpandLabel = if (dialect == TerminalDialect.CODEX) "展开报错" else "查看报错"
+        val expandLabel = when {
+            dialect == TerminalDialect.CODEX && isExpanded -> "收起视图 Ctrl+T"
+            dialect == TerminalDialect.CODEX -> "展开输出 Ctrl+T"
+            isExpanded -> "收起详情 Ctrl+O"
+            else -> "展开详情 Ctrl+O"
+        }
+        val errorExpandLabel = when {
+            isExpanded -> expandLabel
+            dialect == TerminalDialect.CODEX -> "展开报错"
+            else -> "查看报错"
+        }
 
         val actions = when (status) {
             AgentStateWord.BLOCKED -> blockedActions(menuOptions, hasYesNo)
@@ -349,12 +363,22 @@ object StructuredTerminalReader {
                 QuickReplyAction("⏎ 回车", "enter", isSpecialKey = true),
                 QuickReplyAction("■ 中断 Ctrl+C", "ctrl+c", isSpecialKey = true, isDanger = true)
             )
-            AgentStateWord.DONE, AgentStateWord.IDLE, AgentStateWord.NONE -> listOf(
-                QuickReplyAction("继续推进", "继续", isPrimary = true),
-                QuickReplyAction("按这个先做", "按这个先做"),
-                QuickReplyAction("跑测试验证", "跑一遍测试，修复所有失败项后汇报结果"),
-                QuickReplyAction("提交并推送", "提交当前改动并推送到远端")
-            )
+            AgentStateWord.DONE, AgentStateWord.IDLE, AgentStateWord.NONE -> if (isExpanded) {
+                listOf(
+                    QuickReplyAction(expandLabel, expandKey, isSpecialKey = true, isPrimary = true),
+                    QuickReplyAction("继续推进", "继续"),
+                    QuickReplyAction("按这个先做", "按这个先做"),
+                    QuickReplyAction("跑测试验证", "跑一遍测试，修复所有失败项后汇报结果"),
+                    QuickReplyAction("提交并推送", "提交当前改动并推送到远端")
+                )
+            } else {
+                listOf(
+                    QuickReplyAction("继续推进", "继续", isPrimary = true),
+                    QuickReplyAction("按这个先做", "按这个先做"),
+                    QuickReplyAction("跑测试验证", "跑一遍测试，修复所有失败项后汇报结果"),
+                    QuickReplyAction("提交并推送", "提交当前改动并推送到远端")
+                )
+            }
         }
         return actions.take(5)
     }
@@ -427,8 +451,31 @@ object StructuredTerminalReader {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Cleaning & Dialect Bottom-Dock Stripping
+    // Cleaning, Pre-Strip ANSI SGR Metadata & Dialect Bottom-Dock Stripping
     // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Per-line SGR style metadata extracted BEFORE ANSI CSI sequences are stripped.
+     * Used to disambiguate `Ctrl+T` (`Codex` `ReasoningSummaryCell` & dim tool output)
+     * and `Ctrl+O` (`Antigravity` expanded thinking & tool output) from formal assistant prose.
+     */
+    private data class LineStyle(
+        val isDim: Boolean = false,
+        val isItalic: Boolean = false
+    )
+
+    private data class StyledLine(
+        var text: String,
+        val style: LineStyle = LineStyle()
+    )
+
+    private data class CleanedScreen(
+        val lines: List<String>,
+        val styles: List<LineStyle>,
+        val isExpandedMode: Boolean
+    )
+
+    private val sgrMarkerChars = setOf('•', '●', '⏺', '○', '◦', '▸', '▾', '▼', '│', '└', '├', '⎿', '↳')
 
     private fun stripControl(raw: String): String {
         var s = oscRegex.replace(raw, "")
@@ -440,13 +487,125 @@ object StructuredTerminalReader {
         return controlCharRegex.replace(s, "")
     }
 
-    private fun cleanLines(raw: String, dialect: TerminalDialect): List<String> {
-        val rawLines = stripControl(raw)
+    private fun extractStyledLines(raw: String): MutableList<StyledLine> {
+        var preCleaned = oscRegex.replace(raw, "")
+        preCleaned = charsetRegex.replace(preCleaned, "")
+        preCleaned = escTwoCharRegex.replace(preCleaned, "")
+        preCleaned = preCleaned.replace("\t", "    ")
+        val rawSplit = preCleaned
             .replace("\r\n", "\n")
             .split('\n')
             .takeLast(MAX_INPUT_LINES)
-            .map { it.trimEnd('\r').substringAfterLast('\r').replace('\u00A0', ' ').trimEnd() }
-            .toMutableList()
+
+        val result = ArrayList<StyledLine>(rawSplit.size)
+        var dim = false
+        var italic = false
+        var fgDim = false
+
+        for (rawLine in rawSplit) {
+            val crCleaned = rawLine.trimEnd('\r').substringAfterLast('\r').replace('\u00A0', ' ')
+            val sb = StringBuilder(crCleaned.length)
+            var visibleChars = 0
+            var dimChars = 0
+            var italicChars = 0
+            var idx = 0
+            while (idx < crCleaned.length) {
+                val ch = crCleaned[idx]
+                if (ch == '\u001B' && idx + 1 < crCleaned.length && crCleaned[idx + 1] == '[') {
+                    var end = idx + 2
+                    while (end < crCleaned.length && crCleaned[end].code in 0x30..0x3F) end++
+                    while (end < crCleaned.length && crCleaned[end].code in 0x20..0x2F) end++
+                    if (end < crCleaned.length && crCleaned[end].code in 0x40..0x7E) {
+                        val finalByte = crCleaned[end]
+                        if (finalByte == 'm') {
+                            val params = crCleaned.substring(idx + 2, end)
+                            if (params.isEmpty()) {
+                                dim = false
+                                italic = false
+                                fgDim = false
+                            } else {
+                                val parts = params.split(';', ':')
+                                var p = 0
+                                while (p < parts.size) {
+                                    val code = parts[p].toIntOrNull() ?: 0
+                                    when (code) {
+                                        0 -> {
+                                            dim = false
+                                            italic = false
+                                            fgDim = false
+                                        }
+                                        1 -> dim = false
+                                        2 -> dim = true
+                                        3 -> italic = true
+                                        22 -> dim = false
+                                        23 -> italic = false
+                                        39 -> fgDim = false
+                                        90 -> fgDim = true
+                                        38 -> {
+                                            val mode = parts.getOrNull(p + 1)?.toIntOrNull()
+                                            if (mode == 5) {
+                                                val colorIdx = parts.getOrNull(p + 2)?.toIntOrNull() ?: -1
+                                                fgDim = colorIdx in 236..248
+                                                p += 2
+                                            } else if (mode == 2) {
+                                                val r = parts.getOrNull(p + 2)?.toIntOrNull() ?: 255
+                                                val g = parts.getOrNull(p + 3)?.toIntOrNull() ?: 255
+                                                val b = parts.getOrNull(p + 4)?.toIntOrNull() ?: 255
+                                                fgDim = r in 70..165 && g in 70..165 && b in 70..165 &&
+                                                    kotlin.math.abs(r - g) <= 18 && kotlin.math.abs(g - b) <= 18
+                                                p += 4
+                                            }
+                                        }
+                                    }
+                                    p++
+                                }
+                            }
+                        }
+                        idx = end + 1
+                        continue
+                    }
+                }
+                if (ch != '\u001B' && !controlCharRegex.matches(ch.toString())) {
+                    sb.append(ch)
+                    if (!ch.isWhitespace() && ch !in sgrMarkerChars) {
+                        visibleChars++
+                        if (dim || fgDim) dimChars++
+                        if (italic) italicChars++
+                    }
+                }
+                idx++
+            }
+            val cleanText = sb.toString().trimEnd()
+            val lineStyle = LineStyle(
+                isDim = visibleChars > 0 && dimChars * 2 >= visibleChars,
+                isItalic = visibleChars > 0 && italicChars * 2 >= visibleChars
+            )
+            result.add(StyledLine(cleanText, lineStyle))
+        }
+        return result
+    }
+
+    private fun cleanLines(raw: String, dialect: TerminalDialect): List<String> =
+        cleanScreen(raw, dialect).lines
+
+    private fun cleanScreen(raw: String, dialect: TerminalDialect): CleanedScreen {
+        val rawLines = extractStyledLines(raw)
+
+        val isExpandedMode = when (dialect) {
+            TerminalDialect.CODEX -> rawLines.any {
+                val t = it.text.trim()
+                CodexTranscriptSpec.transcriptOverlayHeaderRegex.matches(t) ||
+                    CodexTranscriptSpec.transcriptOverlayFooterRegex.matches(t) ||
+                    CodexTranscriptSpec.expandedDisclosureRegex.matches(t) ||
+                    (it.text.startsWith("• ") && !CodexTranscriptSpec.activityHeadRegex.matches(it.text) &&
+                        it.style.isDim && it.style.isItalic)
+            }
+            TerminalDialect.ANTIGRAVITY -> rawLines.any {
+                AntigravityTranscriptSpec.ctrlOCollapseMarkerRegex.containsMatchIn(it.text) ||
+                    AntigravityTranscriptSpec.expandedActionRowRegex.matches(it.text)
+            }
+            else -> false
+        }
 
         stripBottomDock(rawLines, dialect)
         if (dialect == TerminalDialect.PI) {
@@ -455,14 +614,16 @@ object StructuredTerminalReader {
             stripCodexBanners(rawLines)
         }
 
-        val out = ArrayList<String>(rawLines.size)
+        val outLines = ArrayList<String>(rawLines.size)
+        val outStyles = ArrayList<LineStyle>(rawLines.size)
         var lastBlank = true
         var insideCodexStatusCard = false
 
         for (idx in rawLines.indices) {
-            var line = rawLines[idx]
-            val prevTrimmed = rawLines.getOrNull(idx - 1)?.trim().orEmpty()
-            val nextTrimmed = rawLines.getOrNull(idx + 1)?.trim().orEmpty()
+            var line = rawLines[idx].text
+            val style = rawLines[idx].style
+            val prevTrimmed = rawLines.getOrNull(idx - 1)?.text?.trim().orEmpty()
+            val nextTrimmed = rawLines.getOrNull(idx + 1)?.text?.trim().orEmpty()
             val partOfBoxTable = boxCornerOrCrossRegex.containsMatchIn(prevTrimmed) ||
                 boxCornerOrCrossRegex.containsMatchIn(nextTrimmed)
 
@@ -472,7 +633,10 @@ object StructuredTerminalReader {
 
             val trimmed = line.trim()
             if (trimmed.isEmpty()) {
-                if (!lastBlank) out.add("")
+                if (!lastBlank) {
+                    outLines.add("")
+                    outStyles.add(LineStyle())
+                }
                 lastBlank = true
                 if (insideCodexStatusCard && !nextTrimmed.startsWith("Server:") &&
                     !nextTrimmed.startsWith("Model:") && !nextTrimmed.startsWith("5h limit:") &&
@@ -488,11 +652,15 @@ object StructuredTerminalReader {
             }
 
             if (isNoise(trimmed, dialect, insideCodexStatusCard)) continue
-            out.add(line)
+            outLines.add(line)
+            outStyles.add(style)
             lastBlank = false
         }
-        while (out.isNotEmpty() && out.last().isEmpty()) out.removeAt(out.lastIndex)
-        return out
+        while (outLines.isNotEmpty() && outLines.last().isEmpty()) {
+            outLines.removeAt(outLines.lastIndex)
+            outStyles.removeAt(outStyles.lastIndex)
+        }
+        return CleanedScreen(outLines, outStyles, isExpandedMode)
     }
 
     /**
@@ -500,7 +668,7 @@ object StructuredTerminalReader {
      * of each agent's TUI so live drafts, placeholders (`Ask Codex to do anything`), model badges,
      * and background cron bars never leak into the conversation blocks.
      */
-    private fun stripBottomDock(lines: MutableList<String>, dialect: TerminalDialect) {
+    private fun stripBottomDock(lines: MutableList<StyledLine>, dialect: TerminalDialect) {
         if (lines.isEmpty()) return
 
         when (dialect) {
@@ -509,7 +677,7 @@ object StructuredTerminalReader {
                 val floor = (lines.size - 32).coerceAtLeast(0)
                 var sawBottomRule = false
                 while (end >= floor) {
-                    val raw = lines[end]
+                    val raw = lines[end].text
                     val t = raw.trim()
                     when {
                         t.isEmpty() -> end--
@@ -528,12 +696,12 @@ object StructuredTerminalReader {
                         sawBottomRule && (t == ">" || (t.startsWith("> ") && !promptMenuOptionRegex.matches(raw))) &&
                             !t.contains("<hc") -> {
                             // Live composer prompt `> ...` is sandwiched between two `───` rules at the bottom.
-                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].isNotBlank() }
-                            if (aboveIdx != null && longRuleRegex.matches(lines[aboveIdx].trim())) {
+                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].text.isNotBlank() }
+                            if (aboveIdx != null && longRuleRegex.matches(lines[aboveIdx].text.trim())) {
                                 end = aboveIdx - 1
                             }
                             // Also strip right-aligned `N artifact(s) · /artifact to review` immediately above the top rule.
-                            while (end >= floor && (lines[end].isBlank() || AntigravityTranscriptSpec.keyHintFooterRegex.containsMatchIn(lines[end]))) {
+                            while (end >= floor && (lines[end].text.isBlank() || AntigravityTranscriptSpec.keyHintFooterRegex.containsMatchIn(lines[end].text))) {
                                 end--
                             }
                             break
@@ -548,17 +716,19 @@ object StructuredTerminalReader {
 
             TerminalDialect.CODEX -> {
                 var end = lines.lastIndex
-                val floor = (lines.size - 24).coerceAtLeast(0)
+                val floor = (lines.size - 28).coerceAtLeast(0)
                 var sawFooterBelow = false
                 while (end >= floor) {
-                    val raw = lines[end]
+                    val raw = lines[end].text
                     val t = raw.trim()
                     when {
                         t.isEmpty() -> end--
+                        CodexTranscriptSpec.transcriptOverlayTildeRowRegex.matches(t) -> end--
                         commonFooterRegex.containsMatchIn(t) ||
                             CodexTranscriptSpec.modelCwdBarRegex.matches(raw) ||
                             CodexTranscriptSpec.quotaInlineRegex.matches(raw) ||
-                            CodexTranscriptSpec.quotaHeadsUpRegex.matches(raw) -> {
+                            CodexTranscriptSpec.quotaHeadsUpRegex.matches(raw) ||
+                            CodexTranscriptSpec.transcriptOverlayFooterRegex.matches(t) -> {
                             sawFooterBelow = true
                             end--
                         }
@@ -586,7 +756,7 @@ object StructuredTerminalReader {
                 val floor = (lines.size - 18).coerceAtLeast(0)
                 var sawBottomRule = false
                 while (end >= floor) {
-                    val t = lines[end].trim()
+                    val t = lines[end].text.trim()
                     when {
                         t.isEmpty() -> end--
                         commonFooterRegex.containsMatchIn(t) || piTelemetryLineRegex.matches(t) -> end--
@@ -595,8 +765,8 @@ object StructuredTerminalReader {
                             end--
                         }
                         sawBottomRule && (t == "❯" || t.startsWith("❯ ")) -> {
-                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].isNotBlank() }
-                            if (aboveIdx != null && longRuleRegex.matches(lines[aboveIdx].trim())) {
+                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].text.isNotBlank() }
+                            if (aboveIdx != null && longRuleRegex.matches(lines[aboveIdx].text.trim())) {
                                 end = aboveIdx - 1
                             }
                             break
@@ -614,7 +784,7 @@ object StructuredTerminalReader {
                 val floor = (lines.size - 16).coerceAtLeast(0)
                 var sawBottomRule = false
                 while (end >= floor) {
-                    val t = lines[end].trim()
+                    val t = lines[end].text.trim()
                     when {
                         t.isEmpty() -> end--
                         commonFooterRegex.containsMatchIn(t) ||
@@ -624,8 +794,8 @@ object StructuredTerminalReader {
                             end--
                         }
                         sawBottomRule && lonePromptRegex.matches(t) -> {
-                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].isNotBlank() }
-                            if (aboveIdx != null && (longRuleRegex.matches(lines[aboveIdx].trim()) || inputBoxBorderRegex.matches(lines[aboveIdx].trim()))) {
+                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].text.isNotBlank() }
+                            if (aboveIdx != null && (longRuleRegex.matches(lines[aboveIdx].text.trim()) || inputBoxBorderRegex.matches(lines[aboveIdx].text.trim()))) {
                                 end = aboveIdx - 1
                             }
                             break
@@ -643,16 +813,16 @@ object StructuredTerminalReader {
     }
 
     /** Strips Pi's `Package Updates Available` box between horizontal rules. */
-    private fun stripPiBanners(lines: MutableList<String>) {
+    private fun stripPiBanners(lines: MutableList<StyledLine>) {
         var i = 0
         while (i < lines.size) {
-            if (lines[i].trim() == "Package Updates Available") {
-                val start = if (i > 0 && longRuleRegex.matches(lines[i - 1].trim())) i - 1 else i
+            if (lines[i].text.trim() == "Package Updates Available") {
+                val start = if (i > 0 && longRuleRegex.matches(lines[i - 1].text.trim())) i - 1 else i
                 var end = i + 1
-                while (end < lines.size && !longRuleRegex.matches(lines[end].trim())) {
+                while (end < lines.size && !longRuleRegex.matches(lines[end].text.trim())) {
                     end++
                 }
-                if (end < lines.size && longRuleRegex.matches(lines[end].trim())) {
+                if (end < lines.size && longRuleRegex.matches(lines[end].text.trim())) {
                     lines.subList(start, end + 1).clear()
                     i = start
                     continue
@@ -663,22 +833,22 @@ object StructuredTerminalReader {
     }
 
     /** Strips Codex's `UpdateAvailableHistoryCell` (`notices.rs:2964`) boxed or plain update banner. */
-    private fun stripCodexBanners(lines: MutableList<String>) {
+    private fun stripCodexBanners(lines: MutableList<StyledLine>) {
         var i = 0
         while (i < lines.size) {
-            val unwrapped = unwrapFramedMessageRow(lines[i]).trim()
+            val unwrapped = unwrapFramedMessageRow(lines[i].text).trim()
             if (CodexTranscriptSpec.updateAvailableBannerRegex.matches(unwrapped)) {
-                val hasTopBorder = i > 0 && inputBoxBorderRegex.matches(lines[i - 1].trim())
+                val hasTopBorder = i > 0 && inputBoxBorderRegex.matches(lines[i - 1].text.trim())
                 val start = if (hasTopBorder) i - 1 else i
                 var end = i + 1
                 val limit = (i + 12).coerceAtMost(lines.size)
                 while (end < limit) {
-                    val t = lines[end].trim()
+                    val t = lines[end].text.trim()
                     if (hasTopBorder && inputBoxBorderRegex.matches(t)) {
                         end++
                         break
                     }
-                    val u = unwrapFramedMessageRow(lines[end]).trim()
+                    val u = unwrapFramedMessageRow(lines[end].text).trim()
                     if (!hasTopBorder && u.startsWith("https://github.com/openai/codex/releases")) {
                         end++
                         break
@@ -700,6 +870,8 @@ object StructuredTerminalReader {
         if (!trimmedStart.startsWith("│")) return line
         // In Antigravity (`agy`), single-pipe `  │ <text>` is a Markdown blockquote / callout (`> [!NOTE]`), not a box frame!
         if (dialect == TerminalDialect.ANTIGRAVITY && pipeCount == 1) return line
+        // In Codex (`exec_cell/render.rs:383`), `  │ <cmd>` is a multi-line command continuation under `• Ran` / `• Running`!
+        if (dialect == TerminalDialect.CODEX && pipeCount == 1 && CodexTranscriptSpec.commandContPipeRegex.matches(line)) return line
         val leading = line.length - trimmedStart.length
         return when {
             pipeCount == 1 -> " ".repeat(leading) + trimmedStart.removePrefix("│").removePrefix(" ")
@@ -733,7 +905,10 @@ object StructuredTerminalReader {
                 CodexTranscriptSpec.composerPlaceholderRegex.matches(trimmed) ||
                     CodexTranscriptSpec.quotaHeadsUpRegex.matches(trimmed) ||
                     CodexTranscriptSpec.quotaInlineRegex.matches(trimmed) ||
-                    CodexTranscriptSpec.modelCwdBarRegex.matches(trimmed)
+                    CodexTranscriptSpec.modelCwdBarRegex.matches(trimmed) ||
+                    CodexTranscriptSpec.transcriptOverlayHeaderRegex.matches(trimmed) ||
+                    CodexTranscriptSpec.transcriptOverlayTildeRowRegex.matches(trimmed) ||
+                    CodexTranscriptSpec.transcriptOverlayFooterRegex.matches(trimmed)
             TerminalDialect.PI ->
                 piSessionNoiseRegex.matches(trimmed) || piTelemetryLineRegex.matches(trimmed)
             else ->
@@ -782,9 +957,12 @@ object StructuredTerminalReader {
     // ---------------------------------------------------------------------------------------------
 
     private class BlockParser(
-        private val lines: List<String>,
+        private val screen: CleanedScreen,
         private val dialect: TerminalDialect
     ) {
+        private val lines: List<String> = screen.lines
+        private val styles: List<LineStyle> = screen.styles
+        private val isExpandedMode: Boolean = screen.isExpandedMode
         private val blocks = ArrayList<TerminalSemanticBlock>()
         private val maxWidth: Int = lines.maxOfOrNull { displayWidth(it) } ?: 0
         private val wrapThreshold: Int = maxOf(40, (maxWidth * 0.72f).toInt())
@@ -906,7 +1084,7 @@ object StructuredTerminalReader {
                         flushParagraph()
                         consumeAgyPipeTable()
                     }
-                    isToolHead(line) -> {
+                    isToolHead(line) || isCodexReasoningCellStart(i) -> {
                         flushParagraph()
                         if (dialect == TerminalDialect.CODEX) {
                             consumeCodexToolGroup(orphanStart = false)
@@ -1508,6 +1686,59 @@ object StructuredTerminalReader {
             }
         }
 
+        /**
+         * `history_cell/messages.rs`: In `Ctrl+T` (`TranscriptOverlay`), `ReasoningSummaryCell`
+         * (`transcript_only = true`) becomes visible at column 0 (`• ...`) with `dim().italic()` SGR
+         * and/or a bold summary title (`• **<Title>**`) followed by subsequent cells in the same turn.
+         */
+        private fun isCodexReasoningCellStart(idx: Int): Boolean {
+            if (dialect != TerminalDialect.CODEX || idx !in lines.indices) return false
+            val line = lines[idx]
+            val trimmed = line.trim()
+            if (!line.startsWith("• ") ||
+                isToolHead(line) ||
+                isCodexStructuredAlertStart(line) ||
+                CodexTranscriptSpec.proposedPlanHeadRegex.matches(trimmed) ||
+                CodexTranscriptSpec.planUpdateHeadRegex.matches(trimmed) ||
+                CodexTranscriptSpec.delegatedMessageHeadRegex.matches(trimmed) ||
+                CodexTranscriptSpec.questionsResultHeadRegex.matches(trimmed)
+            ) {
+                return false
+            }
+            val style = styles[idx]
+            if (style.isDim && style.isItalic) return true
+            val isBoldReasoningHead = CodexTranscriptSpec.reasoningBoldHeaderRegex.matches(trimmed)
+            if (!isBoldReasoningHead && !(isExpandedMode && (style.isDim || style.isItalic))) return false
+            return isFollowedByCodexCellInSameTurn(idx)
+        }
+
+        private fun isFollowedByCodexCellInSameTurn(fromIdx: Int): Boolean {
+            var j = fromIdx + 1
+            while (j < lines.size) {
+                val l = lines[j]
+                val t = l.trim()
+                if (t.isEmpty()) {
+                    j++
+                    continue
+                }
+                if (isPromptLine(l) ||
+                    CodexTranscriptSpec.finalSeparatorRegex.matches(l) ||
+                    isCodexStructuredAlertStart(l)
+                ) {
+                    return false
+                }
+                if (isToolHead(l) ||
+                    toolChildRegex.matches(l) ||
+                    CodexTranscriptSpec.commandContPipeRegex.matches(l) ||
+                    l.startsWith("• ")
+                ) {
+                    return true
+                }
+                j++
+            }
+            return false
+        }
+
         private fun consumeCodexToolGroup(orphanStart: Boolean) {
             val steps = ArrayList<String>()
             var headCount = if (orphanStart) 1 else 0
@@ -1527,19 +1758,67 @@ object StructuredTerminalReader {
                         val nextTrim = nextLine?.trim().orEmpty()
                         if (next != null && nextLine != null && (
                                 isToolHead(nextLine) ||
+                                    isCodexReasoningCellStart(next) ||
+                                    CodexTranscriptSpec.commandContPipeRegex.matches(nextLine) ||
                                     (toolChildRegex.matches(nextLine) && !CodexTranscriptSpec.threadRecapHeadRegex.matches(nextLine)) ||
                                     CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(nextTrim) ||
-                                    // In `codex-rs/tui`, every top-level cell starts at indent 0 or 2;
-                                    // 4+ space indented lines after an activity header (e.g. multi-hunk single-file diffs
-                                    // or multi-paragraph stdout) always belong to that activity cell.
-                                    (headCount > 0 && indentOf(nextLine) >= 4 &&
+                                    // In `codex-rs/tui`, every top-level cell starts at indent 0 (`• `) or 2;
+                                    // 4+ space indented lines or dim SGR lines after an activity header always belong to that activity cell.
+                                    (headCount > 0 && !nextLine.startsWith("• ") &&
                                         !isPromptLine(nextLine) && !isCodexStructuredAlertStart(nextLine) &&
-                                        !CodexTranscriptSpec.finalSeparatorRegex.matches(nextLine))
+                                        !CodexTranscriptSpec.finalSeparatorRegex.matches(nextLine) &&
+                                        (indentOf(nextLine) >= 4 || styles[next].isDim))
                                 )
                         ) {
                             i = next
                         } else {
                             break
+                        }
+                    }
+
+                    isCodexReasoningCellStart(i) -> {
+                        headCount++
+                        childPreviewLines = 0
+                        val leadClean = cleanInline(trimmed.removePrefix("• ").trim(), dialect)
+                        if (steps.size < MAX_GROUP_STEPS) steps.add("思考：$leadClean")
+                        i++
+                        while (i < lines.size) {
+                            val rl = lines[i]
+                            val rt = rl.trim()
+                            if (rt.isEmpty()) {
+                                val next = nextNonBlank(i + 1)
+                                if (next != null && indentOf(lines[next]) >= 2 &&
+                                    !lines[next].startsWith("• ") &&
+                                    !isToolHead(lines[next]) &&
+                                    !toolChildRegex.matches(lines[next]) &&
+                                    !CodexTranscriptSpec.commandContPipeRegex.matches(lines[next]) &&
+                                    !isPromptLine(lines[next]) &&
+                                    !isCodexStructuredAlertStart(lines[next]) &&
+                                    !CodexTranscriptSpec.finalSeparatorRegex.matches(lines[next]) &&
+                                    ((styles[next].isDim && styles[next].isItalic) || isFollowedByCodexCellInSameTurn(next))
+                                ) {
+                                    i = next
+                                    continue
+                                }
+                                break
+                            }
+                            if (indentOf(rl) >= 2 &&
+                                !rl.startsWith("• ") &&
+                                !isToolHead(rl) &&
+                                !toolChildRegex.matches(rl) &&
+                                !CodexTranscriptSpec.commandContPipeRegex.matches(rl) &&
+                                !isPromptLine(rl) &&
+                                !isCodexStructuredAlertStart(rl) &&
+                                !CodexTranscriptSpec.finalSeparatorRegex.matches(rl)
+                            ) {
+                                if (childPreviewLines < MAX_CODEX_CHILD_PREVIEW_LINES && steps.size < MAX_GROUP_STEPS) {
+                                    steps.add("  ${cleanInline(rt, dialect).take(120)}")
+                                    childPreviewLines++
+                                }
+                                i++
+                            } else {
+                                break
+                            }
                         }
                     }
 
@@ -1553,6 +1832,15 @@ object StructuredTerminalReader {
                                 .containsMatchIn(clean)
                         if (stepErrorRegex.containsMatchIn(clean) && !zeroFailures(clean)) hasError = true
                         if (steps.size < MAX_GROUP_STEPS) steps.add(clean)
+                        i++
+                    }
+
+                    CodexTranscriptSpec.commandContPipeRegex.matches(line) -> {
+                        if (headCount == 0) headCount = 1
+                        val cmdCont = CodexTranscriptSpec.commandContPipeRegex.find(line)?.groupValues?.get(1)?.trim().orEmpty()
+                        if (cmdCont.isNotEmpty() && steps.size < MAX_GROUP_STEPS) {
+                            steps.add("  │ ${cmdCont.take(120)}")
+                        }
                         i++
                     }
 
@@ -1571,7 +1859,10 @@ object StructuredTerminalReader {
                         i++
                     }
 
-                    (headCount > 0 && indent >= 4 && !isPromptLine(line)) -> {
+                    (headCount > 0 && !line.startsWith("• ") && !isPromptLine(line) &&
+                        !isAlertLine(line) && !isCodexStructuredAlertStart(line) &&
+                        !CodexTranscriptSpec.finalSeparatorRegex.matches(line) &&
+                        (indent >= 4 || styles[i].isDim || (indent == 0 && !fenceRegex.matches(line) && !isTableLine(line)))) -> {
                         if (childPreviewLines < MAX_CODEX_CHILD_PREVIEW_LINES && steps.size < MAX_GROUP_STEPS) {
                             steps.add("    ${trimmed.take(120)}")
                             childPreviewLines++
@@ -1642,8 +1933,12 @@ object StructuredTerminalReader {
                     isToolHead(line) -> {
                         headIndent = indentOf(line)
                         val isExpandedAgyThought = dialect == TerminalDialect.ANTIGRAVITY &&
-                            (trimmed.startsWith("▾") || trimmed.startsWith("▼")) &&
+                            (trimmed.startsWith("▾") || trimmed.startsWith("▼") ||
+                                AntigravityTranscriptSpec.ctrlOCollapseMarkerRegex.containsMatchIn(line)) &&
                             AntigravityTranscriptSpec.thoughtRowRegex.matches(line)
+                        val isExpandedAgyTool = dialect == TerminalDialect.ANTIGRAVITY &&
+                            !isExpandedAgyThought &&
+                            AntigravityTranscriptSpec.expandedActionRowRegex.matches(line)
                         val clean = cleanStepText(cleanToolHead(trimmed))
                         val stepCount = if (dialect == TerminalDialect.ANTIGRAVITY &&
                             !AntigravityTranscriptSpec.thoughtRowRegex.matches(line) &&
@@ -1666,15 +1961,13 @@ object StructuredTerminalReader {
                         if (failed) hasError = true
                         if (steps.size < MAX_GROUP_STEPS) steps.add(clean)
                         i++
-                        // When a thought is expanded (`▾ Thought for ...`), `agy` separates the expanded thinking body
-                        // from the assistant response with a blank line (`changelog`: collapsed/expanded thought separator).
+                        // In Antigravity (`Ctrl+O` expanded trajectory / `Verbosity: high`), expanded thoughts
+                        // (`▾ Thought for ...`) and expanded tool rows (`● Ran/Read/Edited ... (ctrl+o to collapse)`)
+                        // render multi-paragraph thinking bodies and tool outputs below the header.
                         if (isExpandedAgyThought) {
-                            while (i < lines.size && lines[i].isNotBlank() &&
-                                indentOf(lines[i]) >= 2 && !isPromptLine(lines[i]) && !isToolHead(lines[i])
-                            ) {
-                                if (steps.size < MAX_GROUP_STEPS) steps.add("  ${lines[i].trim()}")
-                                i++
-                            }
+                            consumeExpandedAgyThoughtBody(steps)
+                        } else if (isExpandedAgyTool) {
+                            if (consumeExpandedAgyToolOutput(steps)) hasError = true
                         }
                     }
 
@@ -1711,6 +2004,149 @@ object StructuredTerminalReader {
             }
             val label = buildToolSummaryLabel(headCount.coerceAtLeast(1), hasError, running)
             blocks.add(TerminalSemanticBlock.ToolGroupBlock(label, steps, hasError))
+        }
+
+        private fun isFollowedByAgyToolInSameTurn(fromIdx: Int): Boolean {
+            var j = fromIdx
+            while (j < lines.size) {
+                val l = lines[j]
+                if (l.isBlank()) {
+                    j++
+                    continue
+                }
+                if (isPromptLine(l) || isAlertLine(l)) return false
+                if (isToolHead(l) || toolChildRegex.matches(l) || moreActionsRegex.matches(l)) return true
+                j++
+            }
+            return false
+        }
+
+        private fun hasLaterAgyParagraphInSameTurn(fromIdx: Int): Boolean {
+            var j = fromIdx
+            var sawBlank = false
+            while (j < lines.size) {
+                val l = lines[j]
+                if (l.isBlank()) {
+                    sawBlank = true
+                    j++
+                    continue
+                }
+                if (isPromptLine(l) || isAlertLine(l) || isToolHead(l) || toolChildRegex.matches(l)) return false
+                if (sawBlank) return true
+                j++
+            }
+            return false
+        }
+
+        /**
+         * Consumes multi-paragraph expanded `▾ Thought for ... (ctrl+o to collapse)` bodies in `Antigravity`,
+         * stopping before the assistant's final response paragraph.
+         */
+        private fun consumeExpandedAgyThoughtBody(steps: MutableList<String>) {
+            var previewCount = 0
+            var sawStyledLine = false
+            while (i < lines.size) {
+                val l = lines[i]
+                val t = l.trim()
+                if (t.isEmpty()) {
+                    val next = nextNonBlank(i + 1) ?: break
+                    val nl = lines[next]
+                    val nt = nl.trim()
+                    if (indentOf(nl) < 2 || isPromptLine(nl) || isToolHead(nl) ||
+                        toolChildRegex.matches(nl) || moreActionsRegex.matches(nl) || isAlertLine(nl)
+                    ) {
+                        break
+                    }
+                    val nextStyled = styles[next].isDim || styles[next].isItalic
+                    val continuesThought = when {
+                        nextStyled -> true
+                        sawStyledLine -> isFollowedByAgyToolInSameTurn(next)
+                        else -> isFollowedByAgyToolInSameTurn(next) ||
+                            AntigravityTranscriptSpec.englishMonologueStartRegex.matches(nt)
+                    }
+                    if (continuesThought) {
+                        i = next
+                        continue
+                    }
+                    break
+                }
+                if (indentOf(l) < 2 || isPromptLine(l) || isToolHead(l) ||
+                    toolChildRegex.matches(l) || moreActionsRegex.matches(l) || isAlertLine(l)
+                ) {
+                    break
+                }
+                if (styles[i].isDim || styles[i].isItalic) sawStyledLine = true
+                if (previewCount < 6 && steps.size < MAX_GROUP_STEPS) {
+                    steps.add("  ${t.take(120)}")
+                }
+                previewCount++
+                i++
+            }
+        }
+
+        /**
+         * Consumes expanded tool output (`stdout`, file content, diffs with `↕ ···` fold dividers)
+         * immediately following `● Ran/Read/Edited ... (ctrl+o to collapse)` in `Antigravity`.
+         */
+        private fun consumeExpandedAgyToolOutput(steps: MutableList<String>): Boolean {
+            var previewCount = 0
+            var sawError = false
+            var inFirstContiguousBlock = true
+            while (i < lines.size) {
+                val l = lines[i]
+                val t = l.trim()
+                if (t.isEmpty()) {
+                    inFirstContiguousBlock = false
+                    val next = nextNonBlank(i + 1) ?: break
+                    val nl = lines[next]
+                    if (indentOf(nl) < 2 || isPromptLine(nl) || isToolHead(nl) ||
+                        toolChildRegex.matches(nl) || moreActionsRegex.matches(nl) || isAlertLine(nl)
+                    ) {
+                        break
+                    }
+                    val continuesToolOutput = styles[next].isDim ||
+                        indentOf(nl) >= 4 ||
+                        isDiffLine(nl) ||
+                        AntigravityTranscriptSpec.diffFoldDividerRegex.matches(nl) ||
+                        isFollowedByAgyToolInSameTurn(next)
+                    if (continuesToolOutput) {
+                        i = next
+                        continue
+                    }
+                    break
+                }
+                if (indentOf(l) < 2 || isPromptLine(l) || isToolHead(l) ||
+                    moreActionsRegex.matches(l) || isAlertLine(l) ||
+                    AntigravityTranscriptSpec.calloutPipeLineRegex.matches(l) ||
+                    isAgyPipeTableStart(i)
+                ) {
+                    break
+                }
+                val isExplicitToolLine = styles[i].isDim ||
+                    indentOf(l) >= 4 ||
+                    isDiffLine(l) ||
+                    AntigravityTranscriptSpec.diffFoldDividerRegex.matches(l) ||
+                    toolChildRegex.matches(l) ||
+                    isFollowedByAgyToolInSameTurn(i)
+                if (!isExplicitToolLine) {
+                    val looksLikeFinalProseLead = headingRegex.matches(l) ||
+                        boldHeadingRegex.matches(l) ||
+                        (t.any { isCjk(it) } && !hasLaterAgyParagraphInSameTurn(i))
+                    if (!inFirstContiguousBlock || looksLikeFinalProseLead || !hasLaterAgyParagraphInSameTurn(i)) {
+                        break
+                    }
+                }
+                val clean = t.replace(Regex("^(?:[└├][─\\s]*|⎿|↳)\\s*"), "")
+                if (AntigravityTranscriptSpec.hasRealStepFailure(clean) && !zeroFailures(clean)) {
+                    sawError = true
+                }
+                if (previewCount < 6 && clean.isNotEmpty() && steps.size < MAX_GROUP_STEPS) {
+                    steps.add("  ${clean.take(120)}")
+                }
+                previewCount++
+                i++
+            }
+            return sawError
         }
 
         /**

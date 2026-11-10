@@ -168,6 +168,40 @@ internal object CodexTranscriptSpec {
         RegexOption.IGNORE_CASE
     )
 
+    /** Explicit expanded-disclosure marker (`− Hide details` / `− Show less`). */
+    val expandedDisclosureRegex = Regex("^\\s*[−-]\\s*(?:Hide details|Show less)\\s*$", RegexOption.IGNORE_CASE)
+
+    /**
+     * `pager_overlay/transcript.rs:104-106`: `TranscriptOverlay` (`Ctrl+T`) top banner:
+     * `Span::from("/ ".repeat(area.width / 2))` overlaid with `"/ T R A N S C R I P T"`.
+     */
+    val transcriptOverlayHeaderRegex = Regex("^(?:/\\s*)*T\\s+R\\s+A\\s+N\\s+S\\s+C\\s+R\\s+I\\s+P\\s+T(?:\\s*/)*\\s*$")
+
+    /** `pager_overlay.rs:108`: Empty viewport row marker (`~` at column 0 below transcript end). */
+    val transcriptOverlayTildeRowRegex = Regex("^~\\s*$")
+
+    /** `pager_overlay/transcript.rs:110-135`: Bottom pager status / key-hint rows in `Ctrl+T` overlay. */
+    val transcriptOverlayFooterRegex = Regex(
+        "(?i)^\\s*(?:" +
+            ".*(?:\\bq\\s+or\\s+esc\\b|\\besc\\s+close\\b|\\bctrl\\+t\\s+(?:to\\s+)?(?:close|back)\\b|" +
+            "\\bpgup/pgdn\\b|\\bhome/end\\b|\\b/\\s+find\\b|\\bn/N\\s+next\\b).*|" +
+            "Line\\s+\\d+(?:[–-]\\d+)?\\s+of\\s+\\d+.*|" +
+            "Viewing\\s+transcript\\b.*" +
+            ")$"
+    )
+
+    /**
+     * `exec_cell/render.rs:383`: `EXEC_DISPLAY_LAYOUT` prefixes wrapped/multi-line commands
+     * under `• Ran` / `• Running` / `• You ran` with `"  │ "`.
+     */
+    val commandContPipeRegex = Regex("^\\s{2}│(?:\\s?(.*))?$")
+
+    /**
+     * `history_cell/messages.rs`: In `Ctrl+T` transcript mode, `ReasoningSummaryCell` becomes visible
+     * and frequently starts with a bold summary title line (`• **Analyzing parser state**`).
+     */
+    val reasoningBoldHeaderRegex = Regex("^•\\s+\\*\\*([^*]{2,90})\\*\\*\\s*$")
+
     // ---------------------------------------------------------------------------------------------
     // 3. Errors, Warnings, Safety Blocks & Approval Overlay (`notices.rs`, `approval_overlay.rs`)
     // ---------------------------------------------------------------------------------------------

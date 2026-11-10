@@ -621,4 +621,125 @@ class StructuredTerminalReaderTest {
         assertEquals("enter", actions[3].payload)
         assertEquals("esc", actions[4].payload)
     }
+
+    @Test
+    fun codexCtrlTTranscriptOverlay_foldsReasoningMultiLineCmdPipesAndLongStdoutWithoutLeakingIntoProse() {
+        val ctrlTScreen = """
+            / / / / T R A N S C R I P T / / / /
+
+            › 检查一下为什么 Ctrl+T 展开后解析会乱
+
+            ${"\u001B"}[2;3m• **Inspecting transcript_lines in codex-rs/tui**${"\u001B"}[0m
+            ${"\u001B"}[2;3m  In compact mode, ReasoningSummaryCell returns an empty Vec from display_lines().${"\u001B"}[0m
+
+            ${"\u001B"}[2;3m  When the user presses Ctrl+T, transcript_lines() includes every ReasoningSummaryCell.${"\u001B"}[0m
+
+            • Ran git log -n 2 --oneline
+              │ --decorate
+              │ --stat
+              └ 083d324 feat(terminal): transcript-verified antigravity (agy) TUI bijection parser
+                app/src/main/java/dev/herdr/android/ui/terminal/AntigravityTranscriptSpec.kt | 250 +++
+
+                54dfd38 feat(terminal): source-verified codex-rs/tui transcript bijection parser
+            https://raw.githubusercontent.com/openai/codex/main/codex-rs/tui/src/pager_overlay/transcript.rs
+              − Hide details
+
+            • **Verifying EXEC_DISPLAY_LAYOUT continuation**
+              Multi-line commands use "  │ " which must not be unwrapped into plain prose.
+
+            • 已经定位到 `Ctrl+T` 展开视图下的三处核心差异，并完成了雙模式解析兼容。
+
+              Worked for 12s • 16:40
+
+            ~
+            ~
+            Line 1-24 of 24 · PgUp/PgDn scroll · / find · q or Esc close
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(ctrlTScreen, agentApp = "codex")
+        val prompts = blocks.filterIsInstance<TerminalSemanticBlock.UserPromptBlock>()
+        assertEquals(1, prompts.size)
+        assertEquals("检查一下为什么 Ctrl+T 展开后解析会乱", prompts.single().text)
+
+        val tools = blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(1, tools.size)
+        val group = tools.single()
+        // 2 ReasoningSummaryCells + 1 Ran command = 3 steps, plus Worked for 12s
+        assertTrue(group.summaryLabel.contains("3"))
+        assertTrue(group.summaryLabel.contains("12s"))
+        assertTrue(group.steps.any { it.startsWith("思考：Inspecting transcript_lines") })
+        assertTrue(group.steps.any { it.contains("│ --decorate") })
+        assertTrue(group.steps.any { it.startsWith("思考：Verifying EXEC_DISPLAY_LAYOUT") })
+
+        // Formal assistant prose has ONLY the final answer—no reasoning, tilde rows, or pager chrome!
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertEquals(1, prose.size)
+        assertTrue(prose.single().text.startsWith("已经定位到"))
+        assertFalse(prose.single().text.contains("T R A N S C R I P T"))
+        assertFalse(prose.single().text.contains("PgUp/PgDn"))
+
+        // Quick actions offer "收起视图 Ctrl+T" as primary action when expanded
+        val actions = StructuredTerminalReader.extractQuickActions(ctrlTScreen, null)
+        assertEquals("收起视图 Ctrl+T", actions.first().label)
+        assertEquals("ctrl+t", actions.first().payload)
+        assertTrue(actions.first().isSpecialKey)
+    }
+
+    @Test
+    fun antigravityCtrlOExpandedMode_foldsMultiParagraphThoughtsAndExpandedToolOutputsWhilePreservingFinalResponse() {
+        val ctrlOAgyScreen = """
+            > 看看按了 Ctrl+O 之后解析对不对
+
+              ▾ Thought for 5s (ctrl+o to collapse)
+                I need to check how Antigravity renders expanded trajectory blocks when Ctrl+O is active.
+
+                First, expanded thoughts can have multiple paragraphs separated by blank lines.
+                Second, expanded tool calls show full stdout and diffs with ↕ ··· fold dividers.
+
+              ● Ran ./gradlew :app:testDebugUnitTest (ctrl+o to collapse)
+                > Task :hc-protocol:test UP-TO-DATE
+                > Task :app:testDebugUnitTest
+
+                ${"\u001B"}[2mBUILD SUCCESSFUL in 2s${"\u001B"}[0m
+
+              ● Edited StructuredTerminalReader.kt (ctrl+o to collapse)
+                1689 - private fun consumeCodexToolGroup(orphanStart: Boolean) {
+                1689 + private fun isCodexReasoningCellStart(idx: Int): Boolean {
+                ↕ ···
+                1820 + val isExpandedAgyTool = dialect == TerminalDialect.ANTIGRAVITY
+
+              现在按 `Ctrl+O` 展开后的多段思考内容、命令输出以及带折叠分隔符的 Diff 都已经收敛进工具组，不会再污染正式回复正文。
+
+            ────────────────────────────────────────────────────────────────────────────────
+            >
+            ────────────────────────────────────────────────────────────────────────────────
+              Gemini 3.1 Pro (High) · 4.2k tokens · 94% context left · ? for help
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(ctrlOAgyScreen, agentApp = "antigravity")
+        val prompts = blocks.filterIsInstance<TerminalSemanticBlock.UserPromptBlock>()
+        assertEquals(1, prompts.size)
+        assertEquals("看看按了 Ctrl+O 之后解析对不对", prompts.single().text)
+
+        val tools = blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(1, tools.size)
+        val group = tools.single()
+        assertTrue(group.summaryLabel.contains("3"))
+        assertFalse(group.hasError)
+        assertTrue(group.steps.any { it.contains("First, expanded thoughts") })
+        assertTrue(group.steps.any { it.contains("Task :app:testDebugUnitTest") })
+        assertTrue(group.steps.any { it.contains("↕ ···") })
+
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertEquals(1, prose.size)
+        assertEquals(
+            "现在按 `Ctrl+O` 展开后的多段思考内容、命令输出以及带折叠分隔符的 Diff 都已经收敛进工具组，不会再污染正式回复正文。",
+            prose.single().text
+        )
+
+        val actions = StructuredTerminalReader.extractQuickActions(ctrlOAgyScreen, null)
+        assertEquals("收起详情 Ctrl+O", actions.first().label)
+        assertEquals("ctrl+o", actions.first().payload)
+        assertTrue(actions.first().isSpecialKey)
+    }
 }
