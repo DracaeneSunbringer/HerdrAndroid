@@ -181,11 +181,31 @@ class HerdrMainViewModel(
         viewModelScope.launch {
             controller.terminals.collect { list ->
                 val live = list.filter { it.state == "live" }
+                val curActive = _activeTerminalSummary.value
+                if (curActive != null) {
+                    val refreshedActive = live.find { it.address == curActive.address }
+                    if (refreshedActive != null && refreshedActive != curActive) {
+                        _activeTerminalSummary.value = refreshedActive
+                    }
+                }
                 val liveAddrs = live.map { it.address }.toSet()
                 previewCacheKeys.keys.retainAll(liveAddrs)
                 previewLastFetchMs.keys.retainAll(liveAddrs)
                 if (_terminalPreviews.value.keys.any { it !in liveAddrs }) {
                     _terminalPreviews.value = _terminalPreviews.value.filterKeys { it in liveAddrs }
+                }
+                if (_dispatchedReceipts.value.isNotEmpty()) {
+                    val byAddr = live.associateBy { it.address }
+                    val nowElapsed = android.os.SystemClock.elapsedRealtime()
+                    val filteredReceipts = _dispatchedReceipts.value.filter { (addr, rec) ->
+                        val term = byAddr[addr] ?: return@filter false
+                        term.turn <= rec.sentAtTurn &&
+                            term.agentStatus != AgentStateWord.WORKING &&
+                            (nowElapsed - rec.timestampMs) < 12_000L
+                    }
+                    if (filteredReceipts.size != _dispatchedReceipts.value.size) {
+                        _dispatchedReceipts.value = filteredReceipts
+                    }
                 }
 
                 val nowMs = System.currentTimeMillis()
@@ -1237,6 +1257,10 @@ class HerdrMainViewModel(
             }
             result.onSuccess {
                 _toastBanner.value = "✓ 已发送给 ${session.address}"
+                delay(400)
+                controller.refreshTerminals()
+                delay(1400)
+                controller.refreshTerminals()
             }.onFailure { err ->
                 _toastBanner.value = err.message ?: "发送失败"
             }
@@ -1248,13 +1272,6 @@ class HerdrMainViewModel(
         val curSummary = _activeTerminalSummary.value
         if (curSummary != null) {
             markTerminalDoneAcknowledged(curSummary)
-            _dispatchedReceipts.value = _dispatchedReceipts.value + (
-                session.address to DispatchedReceipt(
-                    address = session.address,
-                    text = "[按键 ${keyName.uppercase()}]",
-                    sentAtTurn = curSummary.turn
-                )
-                )
         }
         viewModelScope.launch {
             if (session.mode.value == AttachMode.OBSERVE) {

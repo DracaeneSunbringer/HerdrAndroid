@@ -293,8 +293,13 @@ object StructuredTerminalReader {
         }
     }
 
-    fun extractQuickActions(rawScreen: String?, summary: TerminalSummary?): List<QuickReplyAction> {
+    fun resolveLiveStatus(
+        rawScreen: String?,
+        summary: TerminalSummary?,
+        preParsedBlocks: List<TerminalSemanticBlock>? = null
+    ): AgentStateWord {
         val raw = rawScreen.orEmpty()
+        if (raw.isBlank()) return summary?.agentStatus ?: AgentStateWord.NONE
         val dialect = detectDialect(summary?.agentApp, raw)
         val rawTail = stripControl(raw).replace("\r\n", "\n").split('\n')
             .map { it.trimEnd('\r').substringAfterLast('\r').trimEnd() }
@@ -302,14 +307,27 @@ object StructuredTerminalReader {
             .takeLast(30)
         val cleaned = cleanScreen(raw, dialect)
         val cleanTail = cleaned.lines.filter { it.isNotBlank() }.takeLast(16)
-
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { yesNoRegex.containsMatchIn(it) }
-        val looksWorking = rawTail.takeLast(8).any {
+        return resolveStatusInternal(rawTail, cleanTail, menuOptions, hasYesNo, summary, preParsedBlocks)
+    }
+
+    private fun resolveStatusInternal(
+        rawTail: List<String>,
+        cleanTail: List<String>,
+        menuOptions: List<Pair<String, String>>,
+        hasYesNo: Boolean,
+        summary: TerminalSummary?,
+        preParsedBlocks: List<TerminalSemanticBlock>? = null
+    ): AgentStateWord {
+        val lastBlockRunning = (preParsedBlocks?.lastOrNull() as? TerminalSemanticBlock.ToolGroupBlock)
+            ?.summaryLabel?.endsWith("· 进行中") == true
+        val looksWorking = lastBlockRunning || rawTail.takeLast(8).any {
             workingHintRegex.containsMatchIn(it) ||
                 CodexTranscriptSpec.liveStatusIndicatorRegex.matches(it) ||
                 AntigravityTranscriptSpec.modelRetryStatusRegex.matches(it) ||
-                Regex("^\\s*[\\u2800-\\u28FF]\\s{1,3}\\S").containsMatchIn(it)
+                Regex("^\\s*[\\u2800-\\u28FF]\\s{1,3}\\S").containsMatchIn(it) ||
+                Regex("(?i)^(?:[╭╰]─\\s*|[●◆⚙🔧⏳]\\s+)(?:[●◆⚙🔧⏳]\\s*)?(?:THINKING|WORKING|TOOL)\\b").containsMatchIn(it)
         }
         val looksBlocked = menuOptions.isNotEmpty() || hasYesNo ||
             rawTail.takeLast(8).any { AntigravityTranscriptSpec.subagentQuestionRegex.matches(it) } ||
@@ -326,15 +344,33 @@ object StructuredTerminalReader {
                 CodexTranscriptSpec.safetyBlockRegex.matches(it)
         }
 
-        val status = when (val s = summary?.agentStatus ?: AgentStateWord.NONE) {
-            AgentStateWord.NONE -> when {
-                looksBlocked -> AgentStateWord.BLOCKED
-                looksWorking -> AgentStateWord.WORKING
-                looksError -> AgentStateWord.ERROR
-                else -> AgentStateWord.DONE
-            }
-            else -> s
+        return when {
+            looksBlocked -> AgentStateWord.BLOCKED
+            looksWorking -> AgentStateWord.WORKING
+            summary?.agentStatus != null && summary.agentStatus != AgentStateWord.NONE -> summary.agentStatus
+            looksError -> AgentStateWord.ERROR
+            else -> AgentStateWord.DONE
         }
+    }
+
+    fun extractQuickActions(rawScreen: String?, summary: TerminalSummary?): List<QuickReplyAction> {
+        val raw = rawScreen.orEmpty()
+        val dialect = detectDialect(summary?.agentApp, raw)
+        val rawTail = stripControl(raw).replace("\r\n", "\n").split('\n')
+            .map { it.trimEnd('\r').substringAfterLast('\r').trimEnd() }
+            .filter { it.isNotBlank() }
+            .takeLast(30)
+        val cleaned = cleanScreen(raw, dialect)
+        val cleanTail = cleaned.lines.filter { it.isNotBlank() }.takeLast(16)
+
+        val menuOptions = findMenuOptions(cleanTail)
+        val hasYesNo = cleanTail.any { yesNoRegex.containsMatchIn(it) }
+        val blocks = if (cleaned.lines.isEmpty() || dialect == TerminalDialect.SHELL) {
+            emptyList()
+        } else {
+            runCatching { BlockParser(cleaned, dialect).parse() }.getOrDefault(emptyList())
+        }
+        val status = resolveStatusInternal(rawTail, cleanTail, menuOptions, hasYesNo, summary, blocks)
 
         val isExpanded = cleaned.isExpandedMode
         val expandKey = if (dialect == TerminalDialect.CODEX) "ctrl+t" else "ctrl+o"
@@ -588,22 +624,52 @@ object StructuredTerminalReader {
     private fun cleanLines(raw: String, dialect: TerminalDialect): List<String> =
         cleanScreen(raw, dialect).lines
 
+    private fun detectCodexExpandedMode(rawLines: List<StyledLine>): Boolean {
+        val window = rawLines.takeLast(120)
+        var latestState: Boolean? = null
+        for (styled in window) {
+            val line = styled.text
+            val t = line.trim()
+            when {
+                CodexTranscriptSpec.transcriptOverlayHeaderRegex.matches(t) ||
+                    CodexTranscriptSpec.transcriptOverlayFooterRegex.matches(t) ||
+                    CodexTranscriptSpec.expandedDisclosureRegex.matches(t) ||
+                    (line.startsWith("• ") && !CodexTranscriptSpec.activityHeadRegex.matches(line) &&
+                        styled.style.isDim && styled.style.isItalic) -> latestState = true
+                ctrlExpandSuffixRegex.containsMatchIn(line) -> latestState = false
+            }
+        }
+        return latestState == true
+    }
+
+    private fun detectAntigravityExpandedMode(rawLines: List<StyledLine>): Boolean {
+        var latestState: Boolean? = null
+        for (styled in rawLines) {
+            val line = styled.text
+            val trimmed = line.trimStart()
+            val isTrajectoryRow = AntigravityTranscriptSpec.thoughtRowRegex.matches(line) ||
+                AntigravityTranscriptSpec.actionRowRegex.matches(line) ||
+                AntigravityTranscriptSpec.attachmentBadgeRegex.matches(line) ||
+                AntigravityTranscriptSpec.moreActionsRowRegex.matches(line)
+            if (!isTrajectoryRow) continue
+            when {
+                AntigravityTranscriptSpec.ctrlOCollapseMarkerRegex.containsMatchIn(line) ||
+                    trimmed.startsWith("▾ ") ||
+                    trimmed.startsWith("▼ ") -> latestState = true
+                AntigravityTranscriptSpec.ctrlOExpandMarkerRegex.containsMatchIn(line) ||
+                    trimmed.startsWith("▸ ") ||
+                    AntigravityTranscriptSpec.moreActionsRowRegex.matches(line) -> latestState = false
+            }
+        }
+        return latestState == true
+    }
+
     private fun cleanScreen(raw: String, dialect: TerminalDialect): CleanedScreen {
         val rawLines = extractStyledLines(raw)
 
         val isExpandedMode = when (dialect) {
-            TerminalDialect.CODEX -> rawLines.any {
-                val t = it.text.trim()
-                CodexTranscriptSpec.transcriptOverlayHeaderRegex.matches(t) ||
-                    CodexTranscriptSpec.transcriptOverlayFooterRegex.matches(t) ||
-                    CodexTranscriptSpec.expandedDisclosureRegex.matches(t) ||
-                    (it.text.startsWith("• ") && !CodexTranscriptSpec.activityHeadRegex.matches(it.text) &&
-                        it.style.isDim && it.style.isItalic)
-            }
-            TerminalDialect.ANTIGRAVITY -> rawLines.any {
-                AntigravityTranscriptSpec.ctrlOCollapseMarkerRegex.containsMatchIn(it.text) ||
-                    AntigravityTranscriptSpec.expandedActionRowRegex.matches(it.text)
-            }
+            TerminalDialect.CODEX -> detectCodexExpandedMode(rawLines)
+            TerminalDialect.ANTIGRAVITY -> detectAntigravityExpandedMode(rawLines)
             else -> false
         }
 

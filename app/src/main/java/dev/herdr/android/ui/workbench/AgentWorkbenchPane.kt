@@ -167,6 +167,33 @@ fun AgentWorkbenchPane(
     }
     val quickActions = remember(rawScreen, summary) { StructuredTerminalReader.extractQuickActions(rawScreen, summary) }
 
+    val shouldShowPendingReceipt = remember(dispatchedReceipt, blocks, summary.turn) {
+        val receipt = dispatchedReceipt ?: return@remember false
+        if (summary.turn > receipt.sentAtTurn) return@remember false
+        val normReceipt = receipt.text.trim().replace(Regex("\\s+"), "")
+        if (normReceipt.isEmpty()) return@remember false
+        val alreadyEchoedInBlocks = blocks.takeLast(8).any { b ->
+            if (b is TerminalSemanticBlock.UserPromptBlock) {
+                val body = splitHcPrompt(b.text).second.trim().replace(Regex("\\s+"), "")
+                body == normReceipt ||
+                    (normReceipt.length >= 4 && (body.contains(normReceipt) || normReceipt.contains(body)))
+            } else {
+                false
+            }
+        }
+        val tailRunningGroup = (blocks.lastOrNull() as? TerminalSemanticBlock.ToolGroupBlock)
+            ?.summaryLabel?.endsWith("· 进行中") == true
+        !alreadyEchoedInBlocks && !tailRunningGroup
+    }
+
+    val effectiveStatus = remember(rawScreen, summary, blocks, shouldShowPendingReceipt) {
+        if (shouldShowPendingReceipt) {
+            AgentStateWord.WORKING
+        } else {
+            StructuredTerminalReader.resolveLiveStatus(rawScreen, summary, blocks)
+        }
+    }
+
     val switchList = remember(allLiveTerminals, acknowledgedDoneTurns, summary.address) {
         allLiveTerminals.sortedWith(
             compareBy<TerminalSummary> { t ->
@@ -274,7 +301,9 @@ fun AgentWorkbenchPane(
                 Spacer(Modifier.width(4.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     OneLine(workbenchTitleOf(summary), HerdrType.Heading, HerdrColors.Foreground)
-                    val tone = statusToneOf(summary.agentStatus, acknowledgedDoneTurns[summary.address] == summary.turn)
+                    val isAckedDone = effectiveStatus == AgentStateWord.DONE &&
+                        acknowledgedDoneTurns[summary.address] == summary.turn
+                    val tone = statusToneOf(effectiveStatus, isAckedDone)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         StatusDot(tone.color, 6.dp, tone.pulsing)
                         Spacer(Modifier.width(6.dp))
@@ -397,7 +426,7 @@ fun AgentWorkbenchPane(
                                 )
                             }
                         }
-                        if (dispatchedReceipt != null) {
+                        if (shouldShowPendingReceipt && dispatchedReceipt != null) {
                             SentBubble(dispatchedReceipt.text)
                         }
                     }

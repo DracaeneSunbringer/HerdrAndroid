@@ -742,4 +742,46 @@ class StructuredTerminalReaderTest {
         assertEquals("ctrl+o", actions.first().payload)
         assertTrue(actions.first().isSpecialKey)
     }
+
+    @Test
+    fun antigravityCompactMode_ignoresProseCtrlOMentionAndOverridesStaleDoneSummaryWhenWorking() {
+        val screen = """
+            > 之前讨论过 (ctrl+o to collapse) 和 ▾ Thought for 5s 的兼容
+              • 我们已经支持了 `(ctrl+o to collapse)` 展开态解析。
+
+            > 存在问题 为什么我给你发后命令界面会是这样的
+
+              ○ Thought for 2s (ctrl+o to expand)
+              ⣟  Running command... (ctrl+o to expand)
+
+            ────────────────────────────────────────────────────────────────────────────────
+            >
+            ────────────────────────────────────────────────────────────────────────────────
+              esc to cancel                                  Gemini 3.1 Pro · high · 1 task(s)
+        """.trimIndent()
+
+        val staleDoneSummary = TerminalSummary(
+            address = "t1q",
+            name = "HerdrAndroid",
+            state = "live",
+            cols = 120,
+            rows = 40,
+            turn = 152,
+            agentStatus = AgentStateWord.DONE,
+            agentApp = "antigravity"
+        )
+
+        val blocks = StructuredTerminalReader.parseBlocks(screen, agentApp = "antigravity")
+        val lastToolGroup = blocks.last() as TerminalSemanticBlock.ToolGroupBlock
+        assertTrue(lastToolGroup.summaryLabel.endsWith("· 进行中"))
+
+        val liveStatus = StructuredTerminalReader.resolveLiveStatus(screen, staleDoneSummary, blocks)
+        assertEquals(AgentStateWord.WORKING, liveStatus)
+
+        val actions = StructuredTerminalReader.extractQuickActions(screen, staleDoneSummary)
+        assertEquals("展开详情 Ctrl+O", actions.first().label)
+        assertEquals("ctrl+o", actions.first().payload)
+        assertTrue(actions.none { it.label == "收起详情 Ctrl+O" })
+        assertTrue(actions.none { it.label == "继续推进" })
+    }
 }
