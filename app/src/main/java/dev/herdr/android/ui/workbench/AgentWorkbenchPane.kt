@@ -162,7 +162,9 @@ fun AgentWorkbenchPane(
     val isMobilePtyLocked = curCols in 1..88
     val desktopOrigDims = savedDesktopDims[summary.address]
 
-    val blocks = remember(rawScreen) { StructuredTerminalReader.parseBlocks(rawScreen) }
+    val blocks = remember(rawScreen, summary.agentApp) {
+        StructuredTerminalReader.parseBlocks(rawScreen, summary.agentApp)
+    }
     val quickActions = remember(rawScreen, summary) { StructuredTerminalReader.extractQuickActions(rawScreen, summary) }
 
     val switchList = remember(allLiveTerminals, acknowledgedDoneTurns, summary.address) {
@@ -686,7 +688,7 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
                 val ordered = Regex("^(\\d{1,2}[.)、]|[（(]\\d{1,2}[)）])\\s*").find(block.text)
                 val marker = ordered?.value?.trim() ?: "•"
                 val body = if (ordered != null) block.text.substring(ordered.value.length) else block.text
-                Row(modifier = Modifier.fillMaxWidth()) {
+                Row(modifier = Modifier.fillMaxWidth().padding(start = (block.indentLevel * 16).dp)) {
                     Box(modifier = Modifier.widthIn(min = 18.dp).padding(end = 6.dp)) {
                         Text(marker, style = HerdrType.Body, color = HerdrColors.Dim)
                     }
@@ -760,7 +762,8 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
                     modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("$lines 行", style = HerdrType.Caption, color = HerdrColors.Dim, modifier = Modifier.weight(1f))
+                    val headerLabel = if (!block.kindLabel.isNullOrBlank()) "${block.kindLabel} · $lines 行" else "$lines 行"
+                    Text(headerLabel, style = HerdrType.Caption, color = HerdrColors.Dim, modifier = Modifier.weight(1f))
                     Text(
                         "复制",
                         style = HerdrType.Caption,

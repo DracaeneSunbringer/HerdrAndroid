@@ -158,6 +158,7 @@ interface HerdrConnectionController {
         initialMode: AttachMode = AttachMode.OBSERVE
     ): Result<TerminalSession>
     suspend fun sendMessageToTerminal(address: String, message: String): Result<Unit>
+    suspend fun readTerminalPreview(address: String): Result<String> = Result.success("")
 }
 
 /**

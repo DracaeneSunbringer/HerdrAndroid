@@ -262,6 +262,11 @@ class SshHcConnectionController(
         return capture { requireClient().sendTerminal(address, message) }
     }
 
+    override suspend fun readTerminalPreview(address: String): Result<String> {
+        demo?.let { return it.readTerminalPreview(address) }
+        return capture { requireClient().readTerminal(address, lines = 0) }
+    }
+
     private fun requireClient(): HcFramedClient = client?.takeIf { it.isConnected.value }
         ?: throw IllegalStateException("尚未连接 HC")
 

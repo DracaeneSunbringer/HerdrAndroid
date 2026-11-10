@@ -138,6 +138,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val acknowledgedDoneTurns by viewModel.acknowledgedDoneTurns.collectAsState()
     val draftsByAddress by viewModel.draftsByAddress.collectAsState()
     val dispatchedReceipts by viewModel.dispatchedReceipts.collectAsState()
+    val terminalPreviews by viewModel.terminalPreviews.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
     val context = LocalContext.current
 
@@ -226,6 +227,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         currentFilter = statusFilter,
                         acknowledgedDoneTurns = acknowledgedDoneTurns,
                         dispatchedReceipts = dispatchedReceipts,
+                        terminalPreviews = terminalPreviews,
                         onSelectFilter = viewModel::setStatusFilter,
                         onRefresh = viewModel::refreshTerminals,
                         onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },

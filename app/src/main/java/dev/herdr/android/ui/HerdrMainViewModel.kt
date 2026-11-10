@@ -166,8 +166,49 @@ class HerdrMainViewModel(
     private val _dispatchedReceipts = MutableStateFlow<Map<String, DispatchedReceipt>>(emptyMap())
     val dispatchedReceipts: StateFlow<Map<String, DispatchedReceipt>> = _dispatchedReceipts.asStateFlow()
 
+    private val _terminalPreviews = MutableStateFlow<Map<String, String>>(emptyMap())
+    val terminalPreviews: StateFlow<Map<String, String>> = _terminalPreviews.asStateFlow()
+
     private val _requestInputFocusSignal = MutableStateFlow(0L)
     val requestInputFocusSignal: StateFlow<Long> = _requestInputFocusSignal.asStateFlow()
+
+    private val previewCacheKeys = mutableMapOf<String, String>()
+    private val previewLastFetchMs = mutableMapOf<String, Long>()
+
+    init {
+        viewModelScope.launch {
+            controller.terminals.collect { list ->
+                val live = list.filter { it.state == "live" }
+                val liveAddrs = live.map { it.address }.toSet()
+                previewCacheKeys.keys.retainAll(liveAddrs)
+                previewLastFetchMs.keys.retainAll(liveAddrs)
+                if (_terminalPreviews.value.keys.any { it !in liveAddrs }) {
+                    _terminalPreviews.value = _terminalPreviews.value.filterKeys { it in liveAddrs }
+                }
+
+                val nowMs = System.currentTimeMillis()
+                for (t in live) {
+                    val needsScreen = t.agentMessage.isNullOrBlank() ||
+                        t.agentStatus == AgentStateWord.BLOCKED ||
+                        t.agentStatus == AgentStateWord.ERROR
+                    if (!needsScreen) continue
+
+                    val key = "${t.turn}:${t.agentStatus.wireName}"
+                    val lastMs = previewLastFetchMs[t.address] ?: 0L
+                    val shouldRefreshWorking = t.agentStatus == AgentStateWord.WORKING && (nowMs - lastMs >= 8_000L)
+                    if (previewCacheKeys[t.address] == key && !shouldRefreshWorking) continue
+
+                    previewCacheKeys[t.address] = key
+                    previewLastFetchMs[t.address] = nowMs
+                    controller.readTerminalPreview(t.address).onSuccess { snap ->
+                        if (snap.isNotBlank()) {
+                            _terminalPreviews.value = _terminalPreviews.value + (t.address to snap)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private var connectJob: Job? = null
     private var autoReconnectJob: Job? = null

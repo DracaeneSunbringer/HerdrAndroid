@@ -91,6 +91,7 @@ fun FleetInboxPane(
     currentFilter: AgentStateWord?,
     acknowledgedDoneTurns: Map<String, Int>,
     dispatchedReceipts: Map<String, DispatchedReceipt>,
+    terminalPreviews: Map<String, String> = emptyMap(),
     onSelectFilter: (AgentStateWord?) -> Unit,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -203,6 +204,7 @@ fun FleetInboxPane(
             items(urgentNodes, key = { "u_${it.summary.address}" }) { node ->
                 AgentActionCard(
                     item = node.summary,
+                    rawPreview = terminalPreviews[node.summary.address],
                     acknowledged = false,
                     children = childrenByParent[node.summary.address].orEmpty(),
                     isAttached = node.summary.address == activeTerminalAddress,
@@ -210,8 +212,9 @@ fun FleetInboxPane(
                     onOpen = { onCardClick(node.summary) },
                     onSelectChild = onCardClick
                 ) {
-                    val actions = remember(node.summary) {
-                        StructuredTerminalReader.extractQuickActions(null, node.summary).take(2)
+                    val rawPrev = terminalPreviews[node.summary.address]
+                    val actions = remember(node.summary, rawPrev) {
+                        StructuredTerminalReader.extractQuickActions(rawPrev, node.summary).take(2)
                     }
                     actions.forEachIndexed { idx, action ->
                         HerdrButton(
@@ -231,6 +234,7 @@ fun FleetInboxPane(
             items(readyNodes, key = { "d_${it.summary.address}" }) { node ->
                 AgentActionCard(
                     item = node.summary,
+                    rawPreview = terminalPreviews[node.summary.address],
                     acknowledged = false,
                     children = childrenByParent[node.summary.address].orEmpty(),
                     isAttached = node.summary.address == activeTerminalAddress,
@@ -273,6 +277,7 @@ fun FleetInboxPane(
                         if (idx > 0) HerdrDivider(startIndent = 36.dp)
                         AgentCompactRow(
                             item = node.summary,
+                            rawPreview = terminalPreviews[node.summary.address],
                             childCount = childrenByParent[node.summary.address]?.size ?: 0,
                             isAttached = node.summary.address == activeTerminalAddress,
                             receipt = dispatchedReceipts[node.summary.address],
@@ -313,6 +318,7 @@ fun FleetInboxPane(
                             if (idx > 0) HerdrDivider(startIndent = 36.dp)
                             AgentCompactRow(
                                 item = node.summary,
+                                rawPreview = terminalPreviews[node.summary.address],
                                 childCount = childrenByParent[node.summary.address]?.size ?: 0,
                                 isAttached = node.summary.address == activeTerminalAddress,
                                 receipt = null,
@@ -453,6 +459,7 @@ private fun EmptyInbox(connected: Boolean, filtered: Boolean, totalLiveCount: In
 @Composable
 private fun AgentActionCard(
     item: TerminalSummary,
+    rawPreview: String?,
     acknowledged: Boolean,
     children: List<TerminalSummary>,
     isAttached: Boolean,
@@ -463,7 +470,7 @@ private fun AgentActionCard(
     actions: @Composable () -> Unit
 ) {
     val tone = statusToneOf(item.agentStatus, acknowledged)
-    val headline = remember(item) { StructuredTerminalReader.extractLatestHeadline(null, item) }
+    val headline = remember(item, rawPreview) { StructuredTerminalReader.extractLatestHeadline(rawPreview, item) }
     val isUrgent = item.agentStatus == AgentStateWord.BLOCKED || item.agentStatus == AgentStateWord.ERROR
 
     HerdrCard(onClick = onOpen, contentPadding = PaddingValues(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 14.dp)) {
@@ -575,6 +582,7 @@ private fun ReceiptLine(receipt: DispatchedReceipt) {
 @Composable
 private fun AgentCompactRow(
     item: TerminalSummary,
+    rawPreview: String?,
     childCount: Int,
     isAttached: Boolean,
     receipt: DispatchedReceipt?,
@@ -582,7 +590,7 @@ private fun AgentCompactRow(
     onClick: () -> Unit
 ) {
     val tone = statusToneOf(item.agentStatus, acknowledged)
-    val headline = remember(item) { StructuredTerminalReader.extractLatestHeadline(null, item) }
+    val headline = remember(item, rawPreview) { StructuredTerminalReader.extractLatestHeadline(rawPreview, item) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
