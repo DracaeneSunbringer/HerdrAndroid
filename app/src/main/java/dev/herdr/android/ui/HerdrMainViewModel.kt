@@ -21,6 +21,7 @@ import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.service.HerdrKeepAliveCoordinator
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
+import dev.herdr.android.ui.theme.HerdrThemeTriad
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
@@ -46,6 +47,7 @@ enum class WorkspaceTab(val title: String, val badgeCode: String) {
 
 data class HerdrAppSettings(
     val themePreset: HerdrThemePreset = HerdrThemePreset.LINEAR_OBSIDIAN,
+    val themeTriad: HerdrThemeTriad = HerdrThemeTriad(),
     val defaultLanHost: String = "192.168.1.100",
     val defaultZeroTierHost: String = "10.147.17.100",
     val defaultDesktopFallbackCols: Int = 138,
@@ -278,9 +280,15 @@ class HerdrMainViewModel(
                 sp.edit().putString("default_zt_host", migratedZtHost).apply()
             }
             val savedTheme = HerdrThemePreset.fromId(sp.getString("theme_preset", null))
-            HerdrColors.applyPreset(savedTheme)
+            val savedTriad = HerdrThemeTriad(
+                canvasHex = sp.getString("theme_canvas_hex", "").orEmpty().trim(),
+                accentHex = sp.getString("theme_accent_hex", "").orEmpty().trim(),
+                secondaryHex = sp.getString("theme_secondary_hex", "").orEmpty().trim()
+            )
+            HerdrColors.applyPreset(savedTheme, savedTriad)
             _appSettings.value = HerdrAppSettings(
                 themePreset = savedTheme,
+                themeTriad = savedTriad,
                 defaultLanHost = migratedLanHost,
                 defaultZeroTierHost = migratedZtHost,
                 defaultDesktopFallbackCols = sp.getInt("default_desktop_fallback_cols", 138),
@@ -454,7 +462,7 @@ class HerdrMainViewModel(
     fun updateAppSettings(transform: (HerdrAppSettings) -> HerdrAppSettings) {
         val previous = _appSettings.value
         val updated = transform(previous)
-        HerdrColors.applyPreset(updated.themePreset)
+        HerdrColors.applyPreset(updated.themePreset, updated.themeTriad)
         _appSettings.value = updated
         if (updated.defaultLanHost != previous.defaultLanHost &&
             !_profile.value.useBuiltInZeroTier &&
@@ -471,6 +479,9 @@ class HerdrMainViewModel(
         }
         prefs?.edit()?.apply {
             putString("theme_preset", updated.themePreset.id)
+            putString("theme_canvas_hex", updated.themeTriad.canvasHex)
+            putString("theme_accent_hex", updated.themeTriad.accentHex)
+            putString("theme_secondary_hex", updated.themeTriad.secondaryHex)
             putString("default_lan_host", updated.defaultLanHost)
             putString("default_zt_host", updated.defaultZeroTierHost)
             putInt("default_desktop_fallback_cols", updated.defaultDesktopFallbackCols)

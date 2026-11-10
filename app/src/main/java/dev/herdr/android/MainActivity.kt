@@ -29,7 +29,10 @@ class MainActivity : ComponentActivity() {
         mainViewModel.initializeFromContext(applicationContext, intent)
         setContent {
             val appSettings by mainViewModel.appSettings.collectAsState()
-            HerdrAndroidTheme(preset = appSettings.themePreset) {
+            HerdrAndroidTheme(
+                preset = appSettings.themePreset,
+                triad = appSettings.themeTriad
+            ) {
                 val palette = HerdrColors.currentPalette
                 SideEffect {
                     @Suppress("DEPRECATION")

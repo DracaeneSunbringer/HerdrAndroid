@@ -60,8 +60,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import kotlin.math.roundToInt
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -95,7 +99,14 @@ import dev.herdr.android.ui.terminal.StructuredTerminalReader
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
+import dev.herdr.android.ui.theme.HerdrThemeSlot
+import dev.herdr.android.ui.theme.HerdrThemeTriad
+import dev.herdr.android.ui.theme.basePalette
+import dev.herdr.android.ui.theme.colorToHsv
+import dev.herdr.android.ui.theme.formatColorHex
+import dev.herdr.android.ui.theme.hsvToColor
 import dev.herdr.android.ui.theme.palette
+import dev.herdr.android.ui.theme.parseHexColorOrNull
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
@@ -975,8 +986,13 @@ private fun ConnectionAndDiagnosticsPane(
 @Composable
 private fun ThemeSelectorCard(
     currentPreset: HerdrThemePreset,
-    onSelectPreset: (HerdrThemePreset) -> Unit
+    currentTriad: HerdrThemeTriad,
+    onSelectPreset: (HerdrThemePreset) -> Unit,
+    onUpdateTriad: (HerdrThemeTriad) -> Unit
 ) {
+    val activePalette = currentPreset.palette(currentTriad)
+    var expandedSlot by remember { mutableStateOf<HerdrThemeSlot?>(null) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -984,34 +1000,49 @@ private fun ThemeSelectorCard(
             .background(HerdrColors.Surface)
             .then(if (HerdrColors.IsLight) Modifier.border(1.dp, HerdrColors.Border, RoundedCornerShape(16.dp)) else Modifier)
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // Card Header
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "主题与视觉风格",
+                    text = "界面主题与三原色",
                     color = HerdrColors.Foreground,
                     fontWeight = FontWeight.Bold,
                     fontSize = 14.5.sp
                 )
                 Text(
-                    text = "界面与终端同步换色",
+                    text = "3 原色衍生整套主题 · 点击下方任意色点展开调色盘",
                     color = HerdrColors.Muted,
                     fontSize = 11.sp
                 )
             }
-            Text(
-                text = if (currentPreset.isLight) "浅色" else "深色",
-                color = HerdrColors.Accent,
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (currentTriad.hasCustomOverrides) {
+                    TacticalActionPill(
+                        text = "重置主题",
+                        accent = false,
+                        onClick = { onUpdateTriad(HerdrThemeTriad()) }
+                    )
+                } else {
+                    Text(
+                        text = "${currentPreset.title} · ${currentPreset.subtitle}",
+                        color = HerdrColors.Muted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
 
+        // 1. Preset Theme Cards (each shows its own authentic 3-color triad)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1019,8 +1050,8 @@ private fun ThemeSelectorCard(
             horizontalArrangement = Arrangement.spacedBy(9.dp)
         ) {
             HerdrThemePreset.entries.forEach { preset ->
-                val pal = preset.palette()
                 val selected = preset == currentPreset
+                val pal = if (selected) activePalette else preset.basePalette()
                 Column(
                     modifier = Modifier
                         .width(108.dp)
@@ -1031,7 +1062,9 @@ private fun ThemeSelectorCard(
                             color = if (selected) pal.accent else pal.border,
                             shape = RoundedCornerShape(12.dp)
                         )
-                        .clickable { onSelectPreset(preset) }
+                        .clickable {
+                            onSelectPreset(preset)
+                        }
                         .padding(10.dp),
                     verticalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
@@ -1042,25 +1075,48 @@ private fun ThemeSelectorCard(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                             Box(
                                 modifier = Modifier
-                                    .size(11.dp)
+                                    .size(12.dp)
                                     .clip(CircleShape)
                                     .background(pal.canvas)
-                                    .border(0.5.dp, pal.border, CircleShape)
+                                    .border(0.6.dp, pal.border, CircleShape)
+                                    .then(
+                                        if (selected) {
+                                            Modifier.clickable {
+                                                expandedSlot = if (expandedSlot == HerdrThemeSlot.CANVAS) null else HerdrThemeSlot.CANVAS
+                                            }
+                                        } else Modifier
+                                    )
                             )
                             Box(
                                 modifier = Modifier
-                                    .size(11.dp)
+                                    .size(12.dp)
                                     .clip(CircleShape)
                                     .background(pal.accent)
+                                    .border(0.6.dp, pal.border, CircleShape)
+                                    .then(
+                                        if (selected) {
+                                            Modifier.clickable {
+                                                expandedSlot = if (expandedSlot == HerdrThemeSlot.ACCENT) null else HerdrThemeSlot.ACCENT
+                                            }
+                                        } else Modifier
+                                    )
                             )
                             Box(
                                 modifier = Modifier
-                                    .size(11.dp)
+                                    .size(12.dp)
                                     .clip(CircleShape)
                                     .background(pal.done)
+                                    .border(0.6.dp, pal.border, CircleShape)
+                                    .then(
+                                        if (selected) {
+                                            Modifier.clickable {
+                                                expandedSlot = if (expandedSlot == HerdrThemeSlot.SECONDARY) null else HerdrThemeSlot.SECONDARY
+                                            }
+                                        } else Modifier
+                                    )
                             )
                         }
                         if (selected) {
@@ -1081,8 +1137,8 @@ private fun ThemeSelectorCard(
                             maxLines = 1
                         )
                         Text(
-                            text = preset.subtitle,
-                            color = pal.muted,
+                            text = if (selected && currentTriad.hasCustomOverrides) "已自定义三原色" else preset.subtitle,
+                            color = if (selected && currentTriad.hasCustomOverrides) pal.accent else pal.muted,
                             fontSize = 9.5.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -1091,6 +1147,440 @@ private fun ThemeSelectorCard(
                 }
             }
         }
+
+        // 2. Three Core Color Slots of Current Theme (click any slot to expand color picker)
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "当前主题三原色（点击任意槽位展开调色盘）",
+                    color = HerdrColors.Muted,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                if (expandedSlot != null) {
+                    Text(
+                        text = "点击已选槽位收起",
+                        color = HerdrColors.Dim,
+                        fontSize = 10.5.sp
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                HerdrThemeSlot.entries.forEach { slot ->
+                    val slotColor = activePalette.colorForSlot(slot)
+                    val isSlotExpanded = expandedSlot == slot
+                    val isSlotCustom = parseHexColorOrNull(currentTriad.hexForSlot(slot)) != null
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(11.dp))
+                            .background(if (isSlotExpanded) HerdrColors.AccentSubtle else HerdrColors.Raised)
+                            .border(
+                                width = if (isSlotExpanded) 1.4.dp else 0.7.dp,
+                                color = if (isSlotExpanded) HerdrColors.Accent else HerdrColors.Border,
+                                shape = RoundedCornerShape(11.dp)
+                            )
+                            .clickable {
+                                expandedSlot = if (isSlotExpanded) null else slot
+                            }
+                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(14.dp)
+                                        .clip(CircleShape)
+                                        .background(slotColor)
+                                        .border(0.8.dp, HerdrColors.InputBorder, CircleShape)
+                                )
+                                Text(
+                                    text = slot.title,
+                                    color = HerdrColors.Foreground,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 11.5.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = formatColorHex(slotColor),
+                                color = if (isSlotCustom) HerdrColors.Accent else HerdrColors.Muted,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.5.sp,
+                                fontWeight = if (isSlotCustom) FontWeight.Bold else FontWeight.Normal
+                            )
+                            Text(
+                                text = if (isSlotCustom) "自定" else "默认",
+                                color = if (isSlotCustom) HerdrColors.Accent else HerdrColors.Dim,
+                                fontSize = 9.5.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Expandable Slot Color Picker (Curated Swatches + HSV Sliders + HEX Input)
+        AnimatedVisibility(visible = expandedSlot != null) {
+            val slot = expandedSlot ?: HerdrThemeSlot.ACCENT
+            val currentSlotColor = activePalette.colorForSlot(slot)
+            val defaultSlotColor = currentPreset.basePalette().colorForSlot(slot)
+            val isSlotCustomized = parseHexColorOrNull(currentTriad.hexForSlot(slot)) != null
+
+            val initialHsv = remember(slot, currentPreset) {
+                colorToHsv(currentSlotColor)
+            }
+            var hue by remember(slot, currentPreset) { mutableFloatStateOf(initialHsv[0]) }
+            var saturation by remember(slot, currentPreset) { mutableFloatStateOf(initialHsv[1]) }
+            var brightness by remember(slot, currentPreset) { mutableFloatStateOf(initialHsv[2]) }
+            var hexDraft by remember(slot, currentPreset, currentTriad.hexForSlot(slot)) {
+                mutableStateOf(formatColorHex(currentSlotColor))
+            }
+
+            fun applySlotColor(color: Color, updateHsv: Boolean = true) {
+                val hex = formatColorHex(color)
+                hexDraft = hex
+                if (updateHsv) {
+                    val hsv = colorToHsv(color)
+                    if (hsv[1] > 0.001f) {
+                        hue = hsv[0]
+                    }
+                    saturation = hsv[1]
+                    brightness = hsv[2]
+                }
+                onUpdateTriad(currentTriad.withSlotHex(slot, hex))
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(HerdrColors.Canvas.copy(alpha = if (HerdrColors.IsLight) 0.7f else 0.55f))
+                    .border(0.8.dp, HerdrColors.Border, RoundedCornerShape(12.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(11.dp)
+            ) {
+                // Picker Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clip(CircleShape)
+                                .background(currentSlotColor)
+                                .border(1.dp, HerdrColors.InputBorder, CircleShape)
+                        )
+                        Column {
+                            Text(
+                                text = "槽位 ${slot.index} · ${slot.title}",
+                                color = HerdrColors.Foreground,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.5.sp
+                            )
+                            Text(
+                                text = slot.roleHint,
+                                color = HerdrColors.Muted,
+                                fontSize = 10.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (isSlotCustomized) {
+                            TacticalActionPill(
+                                text = "恢复默认",
+                                accent = false,
+                                onClick = {
+                                    val hsv = colorToHsv(defaultSlotColor)
+                                    hue = hsv[0]
+                                    saturation = hsv[1]
+                                    brightness = hsv[2]
+                                    hexDraft = formatColorHex(defaultSlotColor)
+                                    onUpdateTriad(currentTriad.withSlotHex(slot, ""))
+                                }
+                            )
+                        }
+                        TacticalActionPill(
+                            text = "收起",
+                            accent = false,
+                            onClick = { expandedSlot = null }
+                        )
+                    }
+                }
+
+                // Curated Swatches for this Slot
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(
+                        text = "精选推荐色格",
+                        color = HerdrColors.Muted,
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        slot.recommendedSwatches.forEach { (swatchHex, swatchLabel) ->
+                            val swatchColor = parseHexColorOrNull(swatchHex) ?: return@forEach
+                            val isSelectedSwatch = formatColorHex(currentSlotColor).equals(swatchHex, ignoreCase = true)
+                            Row(
+                                modifier = Modifier
+                                    .height(30.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelectedSwatch) HerdrColors.AccentSubtle else HerdrColors.Surface)
+                                    .border(
+                                        width = if (isSelectedSwatch) 1.2.dp else 0.6.dp,
+                                        color = if (isSelectedSwatch) HerdrColors.Accent else HerdrColors.Border,
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable { applySlotColor(swatchColor, updateHsv = true) }
+                                    .padding(horizontal = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(11.dp)
+                                        .clip(CircleShape)
+                                        .background(swatchColor)
+                                        .border(0.5.dp, HerdrColors.InputBorder, CircleShape)
+                                )
+                                Text(
+                                    text = swatchLabel,
+                                    color = if (isSelectedSwatch) HerdrColors.Foreground else HerdrColors.Muted,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isSelectedSwatch) FontWeight.SemiBold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    softWrap = false
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // HSV Sliders (Hue / Saturation / Brightness)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    // 1. Hue Slider (0..360)
+                    HsvGradientSliderRow(
+                        label = "色相 H",
+                        valueText = "${hue.roundToInt()}°",
+                        value = hue,
+                        valueRange = 0f..360f,
+                        gradientColors = listOf(
+                            Color(0xFFFF0000),
+                            Color(0xFFFFFF00),
+                            Color(0xFF00FF00),
+                            Color(0xFF00FFFF),
+                            Color(0xFF0000FF),
+                            Color(0xFFFF00FF),
+                            Color(0xFFFF0000)
+                        ),
+                        thumbColor = hsvToColor(hue, 1f, 1f),
+                        onValueChange = { newHue ->
+                            hue = newHue
+                            // If saturation was 0 (pure gray/white/black), nudge saturation slightly when dragging hue
+                            val effectiveSat = if (saturation < 0.04f) 0.65f else saturation
+                            val effectiveVal = if (brightness < 0.08f) 0.50f else brightness
+                            saturation = effectiveSat
+                            brightness = effectiveVal
+                            applySlotColor(hsvToColor(newHue, effectiveSat, effectiveVal), updateHsv = false)
+                        }
+                    )
+
+                    // 2. Saturation Slider (0..1)
+                    HsvGradientSliderRow(
+                        label = "饱和度 S",
+                        valueText = "${(saturation * 100).roundToInt()}%",
+                        value = saturation,
+                        valueRange = 0f..1f,
+                        gradientColors = listOf(
+                            hsvToColor(hue, 0f, brightness.coerceAtLeast(0.2f)),
+                            hsvToColor(hue, 1f, brightness.coerceAtLeast(0.2f))
+                        ),
+                        thumbColor = currentSlotColor,
+                        onValueChange = { newSat ->
+                            saturation = newSat
+                            applySlotColor(hsvToColor(hue, newSat, brightness), updateHsv = false)
+                        }
+                    )
+
+                    // 3. Brightness / Value Slider (0..1)
+                    HsvGradientSliderRow(
+                        label = "明度 V",
+                        valueText = "${(brightness * 100).roundToInt()}%",
+                        value = brightness,
+                        valueRange = 0f..1f,
+                        gradientColors = listOf(
+                            Color(0xFF050507),
+                            hsvToColor(hue, saturation, 1f)
+                        ),
+                        thumbColor = currentSlotColor,
+                        onValueChange = { newVal ->
+                            brightness = newVal
+                            applySlotColor(hsvToColor(hue, saturation, newVal), updateHsv = false)
+                        }
+                    )
+                }
+
+                // HEX Input Row
+                val draftParsed = parseHexColorOrNull(hexDraft)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "HEX 色值",
+                        color = HerdrColors.Muted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(36.dp)
+                            .clip(HerdrShapes.Control)
+                            .background(HerdrColors.Surface)
+                            .border(0.8.dp, HerdrColors.InputBorder, HerdrShapes.Control)
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        BasicTextField(
+                            value = hexDraft,
+                            onValueChange = { raw ->
+                                val filtered = raw.uppercase().filterIndexed { idx, c ->
+                                    (idx == 0 && c == '#') || c in '0'..'9' || c in 'A'..'F'
+                                }.take(7)
+                                hexDraft = filtered
+                                val norm = filtered.removePrefix("#")
+                                if (norm.length == 6) {
+                                    parseHexColorOrNull(norm)?.let { parsed ->
+                                        applySlotColor(parsed, updateHsv = true)
+                                    }
+                                }
+                            },
+                            singleLine = true,
+                            textStyle = TextStyle(
+                                color = HerdrColors.Foreground,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            cursorBrush = SolidColor(HerdrColors.Accent),
+                            modifier = Modifier.fillMaxWidth(),
+                            decorationBox = { inner ->
+                                if (hexDraft.isEmpty()) {
+                                    Text(
+                                        text = "#RRGGBB",
+                                        color = HerdrColors.Dim,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 11.5.sp
+                                    )
+                                }
+                                inner()
+                            }
+                        )
+                    }
+                    if (draftParsed != null) {
+                        TacticalActionPill(
+                            text = "应用",
+                            accent = true,
+                            onClick = { applySlotColor(draftParsed, updateHsv = true) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HsvGradientSliderRow(
+    label: String,
+    valueText: String,
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    gradientColors: List<Color>,
+    thumbColor: Color,
+    onValueChange: (Float) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = label,
+            color = HerdrColors.Muted,
+            fontSize = 10.5.sp,
+            modifier = Modifier.width(48.dp)
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(26.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(10.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(Brush.horizontalGradient(gradientColors))
+                    .border(0.6.dp, HerdrColors.Border, RoundedCornerShape(5.dp))
+            )
+            Slider(
+                value = value,
+                onValueChange = onValueChange,
+                valueRange = valueRange,
+                modifier = Modifier.fillMaxWidth(),
+                colors = SliderDefaults.colors(
+                    thumbColor = thumbColor,
+                    activeTrackColor = Color.Transparent,
+                    inactiveTrackColor = Color.Transparent
+                )
+            )
+        }
+        Text(
+            text = valueText,
+            color = HerdrColors.Foreground,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
+            modifier = Modifier.width(36.dp)
+        )
     }
 }
 
@@ -1190,8 +1680,12 @@ private fun DefaultSettingsPane(
         // Appearance & Theme Card at the top of Settings
         ThemeSelectorCard(
             currentPreset = appSettings.themePreset,
+            currentTriad = appSettings.themeTriad,
             onSelectPreset = { preset ->
-                onUpdateAppSettings { it.copy(themePreset = preset) }
+                onUpdateAppSettings { it.copy(themePreset = preset, themeTriad = HerdrThemeTriad()) }
+            },
+            onUpdateTriad = { triad ->
+                onUpdateAppSettings { it.copy(themeTriad = triad) }
             }
         )
 
