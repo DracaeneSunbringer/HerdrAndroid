@@ -262,4 +262,218 @@ class StructuredTerminalReaderTest {
         assertEquals("y", actions.first().payload)
         assertTrue(actions.first().isPrimary)
     }
+
+    @Test
+    fun codexSourceBijection_parsesUnfencedCodeSubagentsPlansRecapErrorsAndMarkdownConstructs() {
+        val codexScreen = """
+            ╭──────────────────────────────────────────────────╮
+            │ ✨ Update available! 0.165.0 -> 0.167.0          │
+            │ Run npm install -g @openai/codex to update.      │
+            │ See full release notes:                          │
+            │ https://github.com/openai/codex/releases/latest  │
+            ╰──────────────────────────────────────────────────╯
+
+            ╭──────────────────────────────────────────────────╮
+            │ >_ OpenAI Codex (v0.167.0)                       │
+            │                                                  │
+            │ model:     gpt-5-codex   /model to change        │
+            │ directory: ~/Code/HerdrAndroid                   │
+            ╰──────────────────────────────────────────────────╯
+
+              [Image #1]
+
+            › 请结合截图修复进程退出竞态并做多代理复核
+
+            • Updated Plan · 2/3 complete
+              └ ✔ 审计 codex-rs/tui 渲染路径
+                ✔ 识别无围栏代码块与单文件多 hunk diff
+                □ 完成真机回归测试
+
+            • Questions 2/2 answered
+              • 是否保留原 UI 主题？
+                answer: 保持不变
+              • 是否需要覆盖子代理条目？
+                answer: 全部覆盖
+
+            • Spawned auditor [Explorer] (gpt-5 high)
+            • Waiting for auditor
+            • Finished waiting
+            • Browsing the web
+            • Opened https://github.com/openai/codex
+            • Called
+              └ github.get_pull_request({"number": 42})
+                … 4 earlier lines hidden
+            ✔ You approved codex to run ./gradlew test
+            ✘ Failed to apply patch
+              └ context mismatch at line 18
+            • Edited app/src/main/Foo.kt (+4 -2)
+                12 -    val ready = false
+                12 +    val ready = true
+
+                44 -    return oldState
+                44 +    return newState
+
+            • Sent by Codex from task task-auditor
+              子代理已完成独立静态核验。
+
+            • ## 根因与修复结论
+
+              > 子进程退出事件必须在流关闭前完成注册，
+              > 否则极端情况下会漏掉退出码。
+
+              If you want to verify this locally on Windows, inspect the session state
+              for each active connection and confirm that reconnect timers reset cleanly.
+
+              const procExited = new Promise((resolve) => {
+                child.once("exit", resolve);
+              });
+
+              ———
+
+              ☑ 已收敛 unfenced 代码块解析
+              ☐ 待推送远端分支
+                  • 二级列表项
+                      • 三级列表项
+
+              Worked for <1s • 10:05 • Local tools: 4 calls (120ms) • Inference: 2 calls
+              (680ms) • TTFT: 210ms
+
+              ↳ Recap: 已完成无围栏代码块与多代理条目映射修复。
+                Next: 运行单元测试并汇报。
+
+            • You ran git status -sb
+              └ ## main...origin/main
+                M app/src/main/Foo.kt
+                + 3 lines (ctrl+t to expand)
+
+            ■ Stream disconnected before completion: transport reset by peer while reading
+            SSE frame
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(codexScreen, agentApp = "codex")
+
+        // 1. Update banner & startup header stripped; image badge attached to prompt + `! git status -sb` extracted
+        val prompts = blocks.filterIsInstance<TerminalSemanticBlock.UserPromptBlock>()
+        assertEquals(2, prompts.size)
+        assertEquals("[Image #1] 请结合截图修复进程退出竞态并做多代理复核", prompts[0].text)
+        assertEquals("! git status -sb", prompts[1].text)
+
+        // 2. PlanUpdateCell, QuestionsResultCell, and unified Activity/Collab/Single-file-multi-hunk-diff group
+        val toolGroups = blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(3, toolGroups.size)
+        assertEquals("任务计划 (2/3)", toolGroups[0].summaryLabel)
+        assertEquals("问答确认 (2/2)", toolGroups[1].summaryLabel)
+        assertTrue(toolGroups[2].summaryLabel.contains("耗时 <1s"))
+        assertTrue(toolGroups[2].hasError)
+
+        // 3. Unfenced 2-space JS code block & `!cmd` shell output preserved as CodeOrTableBlock,
+        //    while single-file diff hunks did NOT leak out of ToolGroupBlock!
+        val codeBlocks = blocks.filterIsInstance<TerminalSemanticBlock.CodeOrTableBlock>()
+        assertEquals(2, codeBlocks.size)
+        assertEquals("代码", codeBlocks[0].kindLabel)
+        assertTrue(codeBlocks[0].content.contains("const procExited = new Promise"))
+        assertFalse(codeBlocks[0].content.contains("return newState"))
+        assertEquals("终端输出", codeBlocks[1].kindLabel)
+        assertTrue(codeBlocks[1].content.contains("## main...origin/main"))
+
+        // 4. Headings, blockquote, wrapped English prose (with `for`!), task list, 3-level nesting, recap
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertTrue(prose.any { it.isHeading && it.text == "来自子任务 task-auditor" })
+        assertTrue(prose.any { it.isHeading && it.text == "根因与修复结论" })
+        assertTrue(prose.any { it.text.startsWith("▎ 子进程退出事件必须在流关闭前完成注册") && it.text.contains("漏掉退出码") })
+        // Wrapped English prose starting with `for` on line 2 stayed prose (NOT misclassified as code!)
+        assertTrue(prose.any { it.text.contains("inspect the session state for each active connection") })
+        // `———` rule and `Worked for <1s` / `TTFT:` / `Update available!` never leaked into prose
+        assertFalse(prose.any {
+            it.text.contains("———") || it.text.contains("TTFT:") ||
+                it.text.contains("Update available") || it.text.contains("OpenAI Codex")
+        })
+        val checkedTask = prose.first { it.text.startsWith("☑") }
+        assertTrue(checkedTask.isBullet && checkedTask.indentLevel == 0)
+        val level2 = prose.first { it.text == "二级列表项" }
+        val level3 = prose.first { it.text == "三级列表项" }
+        assertEquals(1, level2.indentLevel)
+        assertEquals(2, level3.indentLevel)
+        assertTrue(prose.any { it.text.startsWith("会话摘要：已完成无围栏代码块") && it.text.contains("Next: 运行单元测试并汇报") })
+
+        // 5. `■ ` error cell parsed as UrgentAlertBlock("Error", ..., isError = true)
+        val alerts = blocks.filterIsInstance<TerminalSemanticBlock.UrgentAlertBlock>()
+        assertEquals(1, alerts.size)
+        assertEquals("Error", alerts.single().title)
+        assertTrue(alerts.single().isError)
+        assertTrue(alerts.single().detail.contains("Stream disconnected before completion"))
+        assertTrue(alerts.single().detail.contains("SSE frame"))
+    }
+
+    @Test
+    fun codexApprovalOverlay_preservesSelectedBottomOptionAndGeneratesNumberedQuickActions() {
+        val blockedCodexScreen = """
+            • Running git push origin main
+
+              Would you like to run the following command?
+
+              Reason: Pushing release tag to remote repository
+              ${'$'} git push origin main
+
+              1. Yes, proceed (y)
+              2. Yes, and don't ask again for commands starting with `git push` (a)
+            › 3. No, and tell Codex what to do differently (esc)
+
+              Press enter to confirm or esc to cancel
+              GPT-5-codex high · D:\luoyu\Documents\Code\HerdrAndroid
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(blockedCodexScreen, agentApp = "codex")
+        // Option 3 (`› 3. No...`) must NOT be mistaken for a UserPromptBlock or stripped by bottom-dock cleaner!
+        assertTrue(blocks.none { it is TerminalSemanticBlock.UserPromptBlock })
+        val alert = blocks.filterIsInstance<TerminalSemanticBlock.UrgentAlertBlock>().single()
+        assertEquals("需要你的授权", alert.title)
+        assertFalse(alert.isError)
+        assertTrue(alert.detail.contains("${'$'} git push origin main"))
+        assertTrue(alert.detail.contains("3. No, and tell Codex"))
+
+        val actions = StructuredTerminalReader.extractQuickActions(blockedCodexScreen, null)
+        assertEquals("1", actions[0].payload)
+        assertEquals("2", actions[1].payload)
+        assertEquals("3", actions[2].payload)
+        assertEquals("enter", actions[3].payload)
+        assertEquals("esc", actions[4].payload)
+    }
+
+    @Test
+    fun codexLiveSnapshots_handlesBareTreeConnectorStackedAndTruncatedHcPrompts() {
+        val liveCodex = """
+            › <hc from="t1j">请立即读取 codex_final_audit.md 并对 acp-session.mjs 做最后一遍…
+
+            • 我先读取这次的签核要求。
+
+            › <hc from="t19">请立即读取 codex_policy_verify_r2_prompt.md 仅核对本轮 25 行增量修复，请在 2 分钟
+              内返回是否准予上线！</hc>
+              <hc from="t19">开始</hc>
+
+            • Ran Get-Content -LiteralPath 'codex_final_signoff_prompt.md' -Encoding UTF8
+              └
+                ## 输出要求
+                请直接给出最终验收结论（**终审通过** 或 **终审不通过**）。
+                + 28 lines (ctrl+t to expand)
+
+            • 终审通过。本轮限定增量未发现新的阻断项。
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(liveCodex, agentApp = "codex")
+
+        // Truncated `<hc ...…` (without closing `</hc>`) must NEVER swallow subsequent assistant/tool cells!
+        val prompts = blocks.filterIsInstance<TerminalSemanticBlock.UserPromptBlock>()
+        assertEquals(2, prompts.size)
+        assertFalse(prompts[0].text.contains("我先读取"))
+        assertTrue(prompts[1].text.contains("内返回是否准予上线"))
+        assertTrue(prompts[1].text.contains("开始"))
+
+        // Stdout starting with an empty line (`  └` alone) must NEVER leak `## 输出要求` into assistant prose!
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertEquals(2, prose.size)
+        assertTrue(prose[0].text.startsWith("我先读取这次的签核要求"))
+        assertFalse(prose.any { it.text.contains("输出要求") || it.text.contains("<hc") })
+        assertTrue(prose[1].text.startsWith("终审通过。"))
+    }
 }

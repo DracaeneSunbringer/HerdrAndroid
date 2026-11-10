@@ -123,35 +123,7 @@ object StructuredTerminalReader {
     )
     private val agyDaemonTaskRegex = Regex("^\\s*●\\s+\\[\\d{2}:\\d{2}:\\d{2}]\\s+.*\\brunning\\s*$")
 
-    // Codex bottom dock & quota chrome
-    private val codexPlaceholderRegex = Regex(
-        "^›\\s*(?:Ask Codex to do anything|Summarize recent commits|Explain this codebase|Find and fix a bug.*)\\s*$",
-        RegexOption.IGNORE_CASE
-    )
-    private val codexModelCwdBarRegex = Regex(
-        "^\\s*(?:GPT-[\\w.-]+|o[134](?:-[\\w.-]+)?|codex-[\\w.-]+|claude-[\\w.-]+|gemini-[\\w.-]+)" +
-            "(?:\\s+(?:low|medium|high|xhigh))?\\s*·\\s+(?:[A-Za-z]:\\\\|/|~).*$"
-    )
-    private val codexQuotaHeadsUpRegex = Regex(
-        "^\\s*⚠\\s*Heads up,\\s*you have less than \\d+% of your .* limit left\\..*$",
-        RegexOption.IGNORE_CASE
-    )
-    private val codexQuotaInlineRegex = Regex(
-        "^\\s*⚠\\s*(?:5h|weekly|daily)\\s+limit:\\s*\\d+%\\s+left\\b.*$",
-        RegexOption.IGNORE_CASE
-    )
-    private val codexWorkedForRegex = Regex(
-        "^\\s*Worked for\\s+(\\d+[dhms](?:\\s+\\d+[dhms])*)\\s*[•·]\\s*(.+)$",
-        RegexOption.IGNORE_CASE
-    )
-    private val codexSlashCmdRegex = Regex(
-        "^/(?:status|compact|clear|model|diff|review|init|help|approvals|permissions|mcp|mention)\\b.*$"
-    )
-    private val codexTableRuleRegex = Regex("^\\s*[━─]{3,}(?:\\s{2,}[━─]{3,})+\\s*$")
-    private val codexFoldNoiseRegex = Regex(
-        "^\\s*(?:\\+\\s*Show details|\\+\\s*\\d+\\s+lines\\s*(?:\\(ctrl\\+[to] to expand\\))?|⋮|\\.{3})\\s*$",
-        RegexOption.IGNORE_CASE
-    )
+    // Codex bottom dock & transcript grammar are defined in CodexTranscriptSpec (`codex-rs/tui` source truth).
 
     // Pi specific patterns
     private val piClickToJumpPromptRegex = Regex("^(.+?)\\s{2,}\\[click to jump]\\s*$")
@@ -203,17 +175,8 @@ object StructuredTerminalReader {
             "Sent|Sending|Invoked|Invoking|Defined|Defining|Asked|Asking|Worked|Waited|Grepped|Globbed|Patched|Inspected)\\b.*$"
     )
 
-    private val codexToolHeadRegex = Regex(
-        "^•\\s+(?:Exited\\s*\\(status\\s+\\d+\\)|" +
-            "(?:Ran|Run|Running|Edited|Editing|Added|Adding|Deleted|Deleting|Moved|Moving|" +
-            "Renamed|Renaming|Explored|Exploring|Searched|Searching|Read|Reading|Wrote|Writing|" +
-            "Created|Creating|Updated(?!\\s+Plan\\b)|Patched|Patching|Applied|Applying|" +
-            "Called|Calling|Executed|Executing|Fetched|Fetching|Thinking|Thought|Waiting|Waited|" +
-            "Inspected|Viewed)\\b).*$"
-    )
-    private val codexPlanHeadRegex = Regex("^•\\s+(Proposed Plan|Updated Plan)\\b(.*)$")
     private val codexLeadProseRegex = Regex("^•\\s+(.+)$")
-    private val codexOrphanDiffLineRegex = Regex("^\\s{3,}\\d+\\s+[+-].*$")
+    private val codexOrphanDiffLineRegex = Regex("^\\s{3,}\\d+\\s+(?:[+-]|\\s).*$")
 
     private val toolCallParenRegex = Regex("^\\s*[●⏺•]\\s+[A-Z][A-Za-z0-9_.:-]*\\(.*$")
     private val bareToolSummaryRegex = Regex(
@@ -222,7 +185,7 @@ object StructuredTerminalReader {
     // Supports BOTH Unicode horizontal ellipsis `…` (\u2026) and ASCII `...`
     private val moreActionsRegex = Regex("^\\s*(?:…|\\.{2,3})\\s*(\\d+)\\s+more\\s+actions\\b(.*)$", RegexOption.IGNORE_CASE)
     private val spinnerRegex = Regex("^\\s*[\\u2800-\\u28FF✻✽✶✳✢]\\s+\\S.*$")
-    private val toolChildRegex = Regex("^\\s*(?:[└├][─\\s]*|⎿|↳)\\s*\\S.*$")
+    private val toolChildRegex = Regex("^\\s*(?:[└├](?:[─\\s]*\\S.*)?|⎿(?:\\s*\\S.*)?|↳\\s*\\S.*)$")
 
     private val errorRegex = Regex(
         "^\\s*(?:[●⏺•✗✘]\\s*)?(Error|ERROR|error|Fatal|FATAL|fatal|panic|Exception|FAILED)" +
@@ -235,7 +198,8 @@ object StructuredTerminalReader {
     private val permissionErrorRegex = Regex("(?i)(permission denied|access is denied|拒绝访问)")
     private val blockingPromptRegex = Regex(
         "(?i)(locked \\(permission\\)|permission required|requires? (?:your )?(?:approval|permission)|" +
-            "would you like to run|do you want to (?:proceed|make this edit|run|create|allow|continue|apply)|" +
+            "needs your approval\\.|" +
+            "would you like to (?:run|send input|grant|make)|do you want to (?:proceed|make this edit|run|create|allow|continue|apply|approve)|" +
             "allow (?:this|once|always)|waiting for (?:your )?(?:approval|confirmation|input)|" +
             "需要(?:你的)?(?:授权|确认|批准)|是否(?:允许|继续|执行))"
     )
@@ -252,12 +216,13 @@ object StructuredTerminalReader {
 
     private val headingRegex = Regex("^\\s*#{1,6}\\s+(.+)$")
     private val boldHeadingRegex = Regex("^\\s*\\*\\*([^*]{1,80})\\*\\*\\s*[:：]?\\s*$")
+    private val blockquoteLineRegex = Regex("^(\\s*)>+\\s*(.*)$")
     private val unorderedBulletRegex = Regex("^(\\s*)[•\\-*·◦▪‣]\\s+(.+)$")
     private val orderedBulletRegex = Regex("^(\\s*)(\\d{1,2}[.)]\\s+|\\d{1,2}、\\s*|[（(]\\d{1,2}[)）]\\s*)(.+)$")
     private val proseLeadDotRegex = Regex("^(\\s*)[●⏺]\\s+(.+)$")
 
     private val stepErrorRegex = Regex(
-        "(?i)(\\bfailed\\b|\\bfailure\\b|\\berror\\b|status\\s+[1-9]\\d*|exit code [1-9]|\\bexit [1-9]|✗|✘|denied)"
+        "(?i)(\\bfailed\\b|\\bfailure\\b|\\berror\\b|status\\s+[1-9]\\d*|exit code [1-9]|\\bexit [1-9]|✗|✘|denied|timed out)"
     )
 
     // Inline cleanup regexes
@@ -295,7 +260,9 @@ object StructuredTerminalReader {
                 rawScreen.contains("OpenAI Codex") ||
                 rawScreen.contains("← for agents") ||
                 rawScreen.contains("ctrl+t to expand") ||
-                Regex("\\bWorked for \\d+[dhms]").containsMatchIn(rawScreen) -> TerminalDialect.CODEX
+                rawScreen.contains("ctrl+t to view transcript") ||
+                Regex("\\bWorked for (?:<1s|\\d+[dhms])").containsMatchIn(rawScreen) ||
+                Regex("(?m)^\\s*■[\\s\\u200A]+\\S").containsMatchIn(rawScreen) -> TerminalDialect.CODEX
             rawScreen.contains("[click to jump]") ||
                 rawScreen.contains("click to show more") ||
                 rawScreen.contains("Cline upstream:") -> TerminalDialect.PI
@@ -339,10 +306,21 @@ object StructuredTerminalReader {
 
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { yesNoRegex.containsMatchIn(it) }
-        val looksWorking = rawTail.takeLast(8).any { workingHintRegex.containsMatchIn(it) }
+        val looksWorking = rawTail.takeLast(8).any {
+            workingHintRegex.containsMatchIn(it) || CodexTranscriptSpec.liveStatusIndicatorRegex.matches(it)
+        }
         val looksBlocked = menuOptions.isNotEmpty() || hasYesNo ||
-            cleanTail.takeLast(8).any { blockingPromptRegex.containsMatchIn(it) }
-        val looksError = cleanTail.takeLast(6).any { errorRegex.matches(it) || agyWarningErrorRegex.matches(it) }
+            cleanTail.takeLast(8).any {
+                blockingPromptRegex.containsMatchIn(it) ||
+                    CodexTranscriptSpec.approvalOverlayTitleRegex.matches(it) ||
+                    CodexTranscriptSpec.requestUserInputOverlayRegex.matches(it)
+            }
+        val looksError = cleanTail.takeLast(6).any {
+            errorRegex.matches(it) ||
+                agyWarningErrorRegex.matches(it) ||
+                CodexTranscriptSpec.errorSquareRegex.matches(it) ||
+                CodexTranscriptSpec.safetyBlockRegex.matches(it)
+        }
 
         val status = when (val s = summary?.agentStatus ?: AgentStateWord.NONE) {
             AgentStateWord.NONE -> when {
@@ -473,6 +451,8 @@ object StructuredTerminalReader {
         stripBottomDock(rawLines, dialect)
         if (dialect == TerminalDialect.PI) {
             stripPiBanners(rawLines)
+        } else if (dialect == TerminalDialect.CODEX) {
+            stripCodexBanners(rawLines)
         }
 
         val out = ArrayList<String>(rawLines.size)
@@ -564,17 +544,19 @@ object StructuredTerminalReader {
                     when {
                         t.isEmpty() -> end--
                         commonFooterRegex.containsMatchIn(t) ||
-                            codexModelCwdBarRegex.matches(raw) ||
-                            codexQuotaInlineRegex.matches(raw) ||
-                            codexQuotaHeadsUpRegex.matches(raw) -> {
+                            CodexTranscriptSpec.modelCwdBarRegex.matches(raw) ||
+                            CodexTranscriptSpec.quotaInlineRegex.matches(raw) ||
+                            CodexTranscriptSpec.quotaHeadsUpRegex.matches(raw) -> {
                             sawFooterBelow = true
                             end--
                         }
-                        codexPlaceholderRegex.matches(t) -> {
+                        CodexTranscriptSpec.composerPlaceholderRegex.matches(t) -> {
                             end--
                             break
                         }
-                        sawFooterBelow && (t == "›" || t.startsWith("› ")) && !t.contains("<hc") -> {
+                        sawFooterBelow &&
+                            (t == "›" || (t.startsWith("› ") && !promptMenuOptionRegex.matches(raw))) &&
+                            !t.contains("<hc") -> {
                             // Unsubmitted text sitting in the bottom Codex composer right above the model bar.
                             end--
                             break
@@ -667,6 +649,37 @@ object StructuredTerminalReader {
         }
     }
 
+    /** Strips Codex's `UpdateAvailableHistoryCell` (`notices.rs:2964`) boxed or plain update banner. */
+    private fun stripCodexBanners(lines: MutableList<String>) {
+        var i = 0
+        while (i < lines.size) {
+            val unwrapped = unwrapFramedMessageRow(lines[i]).trim()
+            if (CodexTranscriptSpec.updateAvailableBannerRegex.matches(unwrapped)) {
+                val hasTopBorder = i > 0 && inputBoxBorderRegex.matches(lines[i - 1].trim())
+                val start = if (hasTopBorder) i - 1 else i
+                var end = i + 1
+                val limit = (i + 12).coerceAtMost(lines.size)
+                while (end < limit) {
+                    val t = lines[end].trim()
+                    if (hasTopBorder && inputBoxBorderRegex.matches(t)) {
+                        end++
+                        break
+                    }
+                    val u = unwrapFramedMessageRow(lines[end]).trim()
+                    if (!hasTopBorder && u.startsWith("https://github.com/openai/codex/releases")) {
+                        end++
+                        break
+                    }
+                    end++
+                }
+                lines.subList(start, end).clear()
+                i = start
+                continue
+            }
+            i++
+        }
+    }
+
     /** `│ text │` or `│ text` (a framed message, not a multi-column table) -> `text`, keeping relative indent. */
     private fun unwrapFramedMessageRow(line: String): String {
         val pipeCount = line.count { it == '│' }
@@ -684,6 +697,7 @@ object StructuredTerminalReader {
     private fun isNoise(trimmed: String, dialect: TerminalDialect, insideCodexStatusCard: Boolean): Boolean {
         if (compactedDividerRegex.matches(trimmed)) return true
         if (fullRuleRegex.matches(trimmed)) return true
+        if (CodexTranscriptSpec.markdownEmDashRuleRegex.matches(trimmed)) return true
         if (inputBoxBorderRegex.matches(trimmed)) return true
         if (emptyBoxRowRegex.matches(trimmed)) return true
         if (lonePromptRegex.matches(trimmed)) return true
@@ -695,14 +709,14 @@ object StructuredTerminalReader {
             TerminalDialect.ANTIGRAVITY ->
                 agyModelFooterRegex.containsMatchIn(trimmed) || agyDaemonTaskRegex.matches(trimmed)
             TerminalDialect.CODEX ->
-                codexPlaceholderRegex.matches(trimmed) ||
-                    codexQuotaHeadsUpRegex.matches(trimmed) ||
-                    codexQuotaInlineRegex.matches(trimmed) ||
-                    codexModelCwdBarRegex.matches(trimmed)
+                CodexTranscriptSpec.composerPlaceholderRegex.matches(trimmed) ||
+                    CodexTranscriptSpec.quotaHeadsUpRegex.matches(trimmed) ||
+                    CodexTranscriptSpec.quotaInlineRegex.matches(trimmed) ||
+                    CodexTranscriptSpec.modelCwdBarRegex.matches(trimmed)
             TerminalDialect.PI ->
                 piSessionNoiseRegex.matches(trimmed) || piTelemetryLineRegex.matches(trimmed)
             else ->
-                codexPlaceholderRegex.matches(trimmed)
+                CodexTranscriptSpec.composerPlaceholderRegex.matches(trimmed)
         }
     }
 
@@ -789,19 +803,47 @@ object StructuredTerminalReader {
                         flushParagraph()
                         consumeCodexStatusCard()
                     }
-                    dialect == TerminalDialect.CODEX && codexWorkedForRegex.matches(line) -> {
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.finalSeparatorRegex.matches(line) -> {
                         flushParagraph()
-                        consumeCodexWorkedFor(line)
+                        consumeCodexWorkedFor()
+                    }
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(trimmed) -> {
                         i++
                     }
-                    dialect == TerminalDialect.CODEX && codexFoldNoiseRegex.matches(trimmed) -> {
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.userImageBadgeRegex.matches(line) -> {
+                        flushParagraph()
+                        consumeCodexUserImageBadge()
+                    }
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.userShellHeadRegex.matches(trimmed) -> {
+                        flushParagraph()
+                        consumeCodexUserShell()
+                    }
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.delegatedMessageHeadRegex.matches(trimmed) -> {
+                        flushParagraph()
+                        val taskId = CodexTranscriptSpec.delegatedMessageHeadRegex.find(trimmed)!!.groupValues[1]
+                        blocks.add(TerminalSemanticBlock.AgentProseBlock("来自子任务 $taskId", isHeading = true))
                         i++
                     }
-                    dialect == TerminalDialect.CODEX && codexPlanHeadRegex.matches(trimmed) -> {
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.proposedPlanHeadRegex.matches(trimmed) -> {
                         flushParagraph()
-                        val planTitle = codexPlanHeadRegex.find(trimmed)!!.groupValues[1]
-                        blocks.add(TerminalSemanticBlock.AgentProseBlock(planTitle, isHeading = true))
+                        blocks.add(TerminalSemanticBlock.AgentProseBlock("Proposed Plan", isHeading = true))
                         i++
+                    }
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.planUpdateHeadRegex.matches(trimmed) -> {
+                        flushParagraph()
+                        consumeCodexPlanUpdate()
+                    }
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.questionsResultHeadRegex.matches(trimmed) -> {
+                        flushParagraph()
+                        consumeCodexQuestionsResult()
+                    }
+                    dialect == TerminalDialect.CODEX && CodexTranscriptSpec.threadRecapHeadRegex.matches(line) -> {
+                        flushParagraph()
+                        consumeCodexThreadRecap()
+                    }
+                    dialect == TerminalDialect.CODEX && isCodexStructuredAlertStart(line) -> {
+                        flushParagraph()
+                        consumeCodexStructuredAlert()
                     }
                     dialect == TerminalDialect.PI && piTodosHeaderRegex.matches(line) -> {
                         flushParagraph()
@@ -844,6 +886,12 @@ object StructuredTerminalReader {
                         flushParagraph()
                         consumeJson()
                     }
+                    dialect == TerminalDialect.CODEX && paraText == null &&
+                        CodexTranscriptSpec.detectUnfencedCodeBlockEnd(lines, i, wrapThreshold) != null -> {
+                        val endIdx = CodexTranscriptSpec.detectUnfencedCodeBlockEnd(lines, i, wrapThreshold)!!
+                        addCode(lines.subList(i, endIdx).joinToString("\n"), kindLabel = "代码")
+                        i = endIdx
+                    }
                     isIndentedCode(line) -> {
                         flushParagraph()
                         consumeCodeRun(kindLabel = "代码") { isIndentedCode(it) }
@@ -873,16 +921,31 @@ object StructuredTerminalReader {
             return when (dialect) {
                 TerminalDialect.ANTIGRAVITY -> agyPromptRegex.matches(line)
                 TerminalDialect.CODEX ->
-                    (codexPromptRegex.matches(line) && !codexPlaceholderRegex.matches(line.trim())) ||
-                        codexSlashCmdRegex.matches(line)
+                    (codexPromptRegex.matches(line) && !CodexTranscriptSpec.composerPlaceholderRegex.matches(line.trim())) ||
+                        CodexTranscriptSpec.slashCmdRegex.matches(line)
                 TerminalDialect.PI ->
                     piClickToJumpPromptRegex.matches(line) || claudePromptRegex.matches(line)
                 TerminalDialect.CLAUDE -> claudePromptRegex.matches(line)
-                else -> genericPromptRegex.matches(line) && !codexPlaceholderRegex.matches(line.trim())
+                else -> genericPromptRegex.matches(line) && !CodexTranscriptSpec.composerPlaceholderRegex.matches(line.trim())
             }
         }
 
-        private fun consumePrompt() {
+        private fun isPromptBoundary(line: String): Boolean {
+            val t = line.trim()
+            if (t.isEmpty()) return false
+            if (isToolHead(line) || toolChildRegex.matches(line) || isPromptLine(line) || isAlertLine(line)) return true
+            if (dialect == TerminalDialect.CODEX) {
+                if (indentOf(line) < 2) return true
+                if (line.startsWith("• ") || isCodexStructuredAlertStart(line) ||
+                    CodexTranscriptSpec.finalSeparatorRegex.matches(line) ||
+                    CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(t) ||
+                    CodexTranscriptSpec.threadRecapHeadRegex.matches(line)
+                ) return true
+            }
+            return false
+        }
+
+        private fun consumePrompt(leadingPrefix: String = "") {
             val rawFirst = lines[i]
             if (dialect == TerminalDialect.PI) {
                 piClickToJumpPromptRegex.find(rawFirst)?.let { m ->
@@ -891,13 +954,14 @@ object StructuredTerminalReader {
                     return
                 }
             }
-            if (dialect == TerminalDialect.CODEX && codexSlashCmdRegex.matches(rawFirst)) {
+            if (dialect == TerminalDialect.CODEX && CodexTranscriptSpec.slashCmdRegex.matches(rawFirst)) {
                 blocks.add(TerminalSemanticBlock.UserPromptBlock(rawFirst.trim()))
                 i++
                 return
             }
 
-            val first = genericPromptRegex.find(rawFirst)?.groupValues?.get(1)?.trim() ?: rawFirst.trim()
+            val rawBody = genericPromptRegex.find(rawFirst)?.groupValues?.get(1)?.trim() ?: rawFirst.trim()
+            val first = if (leadingPrefix.isNotEmpty()) "$leadingPrefix $rawBody" else rawBody
             val promptIndent = indentOf(rawFirst)
             i++
 
@@ -905,18 +969,45 @@ object StructuredTerminalReader {
                 var combined = first
                 var lastWidth = displayWidth(rawFirst)
                 var consumed = 0
+                var truncatedByEllipsis = first.endsWith("…")
                 while (i < lines.size && consumed < MAX_HC_MESSAGE_LINES) {
                     val l = lines[i]
                     val t = l.trim()
-                    combined = if (t.isEmpty()) {
-                        "$combined\n"
-                    } else {
-                        joinWrapped(combined, t, wrapped = lastWidth >= wrapThreshold || !combined.endsWith('\n'))
+                    if (truncatedByEllipsis) {
+                        if (t.startsWith("<hc") && indentOf(l) > promptIndent) {
+                            combined += "\n"
+                            truncatedByEllipsis = false
+                        } else {
+                            break
+                        }
                     }
+                    if (t.isEmpty()) {
+                        val next = nextNonBlank(i + 1)
+                        if (next == null || isPromptBoundary(lines[next]) || indentOf(lines[next]) <= promptIndent) {
+                            break
+                        }
+                        combined += "\n"
+                        lastWidth = 0
+                        i++
+                        consumed++
+                        continue
+                    }
+                    if (isPromptBoundary(l)) break
+                    combined = joinWrapped(combined, t, wrapped = lastWidth >= wrapThreshold || !combined.endsWith('\n'))
                     lastWidth = displayWidth(l)
                     i++
                     consumed++
-                    if (t.contains("</hc>")) break
+                    if (t.endsWith("…") && !t.contains("</hc>")) {
+                        truncatedByEllipsis = true
+                    }
+                    if (t.contains("</hc>")) {
+                        val hasImmediatePromptCont = i < lines.size &&
+                            lines[i].isNotBlank() &&
+                            indentOf(lines[i]) > promptIndent &&
+                            !isPromptBoundary(lines[i])
+                        if (!hasImmediatePromptCont) break
+                        combined += "\n"
+                    }
                 }
                 blocks.add(TerminalSemanticBlock.UserPromptBlock(combined.trim()))
                 return
@@ -924,75 +1015,354 @@ object StructuredTerminalReader {
 
             var text = first
             var lastWidth = displayWidth(rawFirst)
+            var prevTruncated = first.endsWith("…")
             while (i < lines.size) {
                 val l = lines[i]
+                if (prevTruncated && !l.trim().startsWith("<hc")) break
                 if (l.isBlank()) break
                 if (indentOf(l) <= promptIndent) break
-                if (isToolHead(l) || isAlertLine(l) || isPromptLine(l) || toolChildRegex.matches(l)) break
+                if (isPromptBoundary(l)) break
                 text = joinWrapped(text, l.trim(), lastWidth >= wrapThreshold)
                 lastWidth = displayWidth(l)
+                prevTruncated = l.trim().endsWith("…")
                 i++
             }
             blocks.add(TerminalSemanticBlock.UserPromptBlock(text))
         }
 
-        // ---- Codex specific blocks ----
+        // ---- Codex specific blocks (`codex-rs/tui` source bijection) ----
 
         private fun isCodexOrphanToolStart(): Boolean {
             val firstIdx = lines.indexOfFirst { it.isNotBlank() }
             if (firstIdx < 0) return false
             val first = lines[firstIdx]
-            if (toolChildRegex.matches(first) || codexFoldNoiseRegex.matches(first.trim())) return true
+            if (CodexTranscriptSpec.threadRecapHeadRegex.matches(first)) return false
+            if (toolChildRegex.matches(first) || CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(first.trim())) return true
             if (codexOrphanDiffLineRegex.matches(first) || indentOf(first) >= 4) {
                 val lookahead = lines.drop(firstIdx).take(16)
-                return lookahead.any { toolChildRegex.matches(it) || codexFoldNoiseRegex.matches(it.trim()) }
-            }
-            return false
-        }
-
-        private fun isFollowedByCodexToolMarker(fromIdx: Int): Boolean {
-            val end = (fromIdx + 12).coerceAtMost(lines.size)
-            for (k in fromIdx until end) {
-                val l = lines[k]
-                if (l.isBlank()) continue
-                if (codexFoldNoiseRegex.matches(l.trim()) || toolChildRegex.matches(l) || isToolHead(l)) return true
-                if (indentOf(l) < 4) return false
+                return lookahead.any {
+                    toolChildRegex.matches(it) || CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(it.trim())
+                }
             }
             return false
         }
 
         private fun consumeCodexStatusCard() {
+            val precededByStatusCmd = (blocks.lastOrNull() as? TerminalSemanticBlock.UserPromptBlock)
+                ?.text?.startsWith("/status") == true
             val buf = ArrayList<String>()
             while (i < lines.size) {
                 val l = lines[i]
                 val t = l.trim()
-                if (t.startsWith("• ") || t.startsWith("› ") || isAlertLine(l)) break
+                if (t.startsWith("• ") || t.startsWith("› ") || isAlertLine(l) || isCodexStructuredAlertStart(l)) break
                 if (t.isEmpty()) {
                     val next = nextNonBlank(i + 1)
                     val nextTrim = next?.let { lines[it].trim() }.orEmpty()
                     val continuesCard = nextTrim.startsWith("Visit ") ||
-                        nextTrim.startsWith("Server:") ||
-                        nextTrim.startsWith("Model:") ||
-                        nextTrim.startsWith("5h limit:") ||
-                        nextTrim.startsWith("Weekly limit:")
+                        nextTrim.startsWith("Server:", ignoreCase = true) ||
+                        nextTrim.startsWith("Model:", ignoreCase = true) ||
+                        nextTrim.startsWith("Directory:", ignoreCase = true) ||
+                        nextTrim.startsWith("Account:", ignoreCase = true) ||
+                        nextTrim.startsWith("Session:", ignoreCase = true) ||
+                        nextTrim.startsWith("5h limit:", ignoreCase = true) ||
+                        nextTrim.startsWith("Weekly limit:", ignoreCase = true) ||
+                        nextTrim.startsWith("permissions:", ignoreCase = true)
                     if (!continuesCard) break
                 }
                 buf.add(l)
                 i++
             }
-            addCode(buf.joinToString("\n"), kindLabel = "Codex 状态")
+            val joined = buf.joinToString("\n")
+            val isFullStatusCard = precededByStatusCmd ||
+                joined.contains("limit:") ||
+                joined.contains("Server:") ||
+                joined.contains("Account:")
+            val hasLaterConversation = (i until lines.size).any {
+                val t = lines[it].trim()
+                t.startsWith("› ") || t.startsWith("• ")
+            }
+            if (isFullStatusCard || !hasLaterConversation) {
+                addCode(joined, kindLabel = "Codex 状态")
+            }
         }
 
-        private fun consumeCodexWorkedFor(line: String) {
-            val dur = codexWorkedForRegex.find(line)?.groupValues?.get(1)?.trim().orEmpty()
+        private fun consumeCodexWorkedFor() {
+            val firstLine = lines[i]
+            val dur = CodexTranscriptSpec.finalSeparatorRegex.find(firstLine)?.groupValues?.get(1)?.trim().orEmpty()
+            i++
+            // Consume any wrapped runtime metrics continuation lines (`separators.rs:1712`)
+            while (i < lines.size && lines[i].isNotBlank() &&
+                (CodexTranscriptSpec.finalSeparatorMetricsContRegex.matches(lines[i]) ||
+                    (indentOf(lines[i]) == 2 && !isPromptLine(lines[i]) && !isToolHead(lines[i]) &&
+                        !CodexTranscriptSpec.threadRecapHeadRegex.matches(lines[i]) &&
+                        !isCodexStructuredAlertStart(lines[i])))
+            ) {
+                i++
+            }
             if (dur.isEmpty()) return
             val lastPromptIdx = blocks.indexOfLast { it is TerminalSemanticBlock.UserPromptBlock }
             for (idx in blocks.lastIndex downTo (lastPromptIdx + 1).coerceAtLeast(0)) {
                 val blk = blocks[idx]
-                if (blk is TerminalSemanticBlock.ToolGroupBlock && !blk.summaryLabel.contains("耗时")) {
+                if (blk is TerminalSemanticBlock.ToolGroupBlock &&
+                    !blk.summaryLabel.startsWith("任务计划") &&
+                    !blk.summaryLabel.startsWith("问答确认") &&
+                    !blk.summaryLabel.contains("耗时")
+                ) {
                     val baseLabel = blk.summaryLabel.replace(" · 进行中", "")
                     blocks[idx] = blk.copy(summaryLabel = "$baseLabel · 耗时 $dur")
                     break
+                }
+            }
+        }
+
+        private fun consumeCodexUserImageBadge() {
+            val badges = ArrayList<String>()
+            while (i < lines.size) {
+                val l = lines[i]
+                if (l.isBlank()) {
+                    val next = nextNonBlank(i + 1)
+                    if (next != null && CodexTranscriptSpec.userImageBadgeRegex.matches(lines[next])) {
+                        i = next
+                        continue
+                    }
+                    break
+                }
+                if (CodexTranscriptSpec.userImageBadgeRegex.matches(l)) {
+                    badges.add(l.trim())
+                    i++
+                } else {
+                    break
+                }
+            }
+            val badgePrefix = badges.joinToString(" ")
+            val next = nextNonBlank(i)
+            if (next != null && codexPromptRegex.matches(lines[next]) &&
+                !CodexTranscriptSpec.composerPlaceholderRegex.matches(lines[next].trim())
+            ) {
+                i = next
+                consumePrompt(leadingPrefix = badgePrefix)
+            } else if (badgePrefix.isNotEmpty()) {
+                blocks.add(TerminalSemanticBlock.UserPromptBlock(badgePrefix))
+            }
+        }
+
+        private fun consumeCodexUserShell() {
+            val cmd = CodexTranscriptSpec.userShellHeadRegex.find(lines[i].trim())?.groupValues?.get(1)?.trim().orEmpty()
+            if (cmd.isNotEmpty()) {
+                blocks.add(TerminalSemanticBlock.UserPromptBlock("! $cmd"))
+            }
+            i++
+            val outLines = ArrayList<String>()
+            while (i < lines.size) {
+                val l = lines[i]
+                val t = l.trim()
+                if (t.isEmpty()) {
+                    val next = nextNonBlank(i + 1)
+                    if (next != null && indentOf(lines[next]) >= 4 && !CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(lines[next].trim())) {
+                        outLines.add("")
+                        i = next
+                        continue
+                    }
+                    break
+                }
+                if (CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(t)) {
+                    i++
+                    continue
+                }
+                if (toolChildRegex.matches(l)) {
+                    outLines.add(t.replace(Regex("^(?:[└├][─\\s]*|⎿|↳)\\s*"), ""))
+                    i++
+                } else if (indentOf(l) >= 4) {
+                    outLines.add(l.removePrefix("    "))
+                    i++
+                } else {
+                    break
+                }
+            }
+            if (outLines.isNotEmpty()) {
+                addCode(outLines.joinToString("\n"), kindLabel = "终端输出")
+            }
+        }
+
+        private fun consumeCodexPlanUpdate() {
+            val m = CodexTranscriptSpec.planUpdateHeadRegex.find(lines[i].trim())
+            val progress = m?.groupValues?.get(1)?.takeIf { it.isNotEmpty() }
+            val steps = ArrayList<String>()
+            i++
+            while (i < lines.size) {
+                val l = lines[i]
+                val t = l.trim()
+                if (t.isEmpty()) break
+                if (CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(t)) {
+                    i++
+                    continue
+                }
+                if (toolChildRegex.matches(l) || indentOf(l) >= 2 && (t.startsWith("✔") || t.startsWith("✓") || t.startsWith("□") || t.startsWith("☐") || t.startsWith("☑") || indentOf(l) >= 4)) {
+                    val clean = t.replace(Regex("^(?:[└├][─\\s]*|⎿|↳)\\s*"), "")
+                    if (clean.isNotEmpty() && steps.size < MAX_GROUP_STEPS) steps.add(clean)
+                    i++
+                } else {
+                    break
+                }
+            }
+            val label = if (progress != null) "任务计划 ($progress)" else "任务计划 Updated Plan"
+            blocks.add(TerminalSemanticBlock.ToolGroupBlock(label, steps, hasError = false))
+        }
+
+        private fun consumeCodexQuestionsResult() {
+            val ratio = CodexTranscriptSpec.questionsResultHeadRegex.find(lines[i].trim())?.groupValues?.get(1).orEmpty()
+            val steps = ArrayList<String>()
+            i++
+            while (i < lines.size) {
+                val l = lines[i]
+                val t = l.trim()
+                if (t.isEmpty()) break
+                if (indentOf(l) >= 2) {
+                    val clean = t.removePrefix("• ").trim()
+                    if (clean.isNotEmpty() && steps.size < MAX_GROUP_STEPS) {
+                        steps.add(if (indentOf(l) >= 4) "  $clean" else clean)
+                    }
+                    i++
+                } else {
+                    break
+                }
+            }
+            blocks.add(
+                TerminalSemanticBlock.ToolGroupBlock(
+                    summaryLabel = if (ratio.isNotEmpty()) "问答确认 ($ratio)" else "问答确认",
+                    steps = steps,
+                    hasError = false
+                )
+            )
+        }
+
+        private fun consumeCodexThreadRecap() {
+            val first = CodexTranscriptSpec.threadRecapHeadRegex.find(lines[i])?.groupValues?.get(1)?.trim().orEmpty()
+            var combined = first
+            var lastWidth = displayWidth(lines[i])
+            i++
+            while (i < lines.size && lines[i].isNotBlank() && indentOf(lines[i]) >= 2 &&
+                !isPromptLine(lines[i]) && !isToolHead(lines[i]) && !isCodexStructuredAlertStart(lines[i])
+            ) {
+                val cont = lines[i].trim()
+                combined = if (cont.startsWith("Next:")) "$combined · $cont" else joinWrapped(combined, cont, lastWidth >= wrapThreshold)
+                lastWidth = displayWidth(lines[i])
+                i++
+            }
+            if (combined.isNotEmpty()) {
+                blocks.add(TerminalSemanticBlock.AgentProseBlock("会话摘要：${cleanInline(combined, dialect)}"))
+            }
+        }
+
+        private fun isCodexStructuredAlertStart(line: String): Boolean =
+            CodexTranscriptSpec.errorSquareRegex.matches(line) ||
+                CodexTranscriptSpec.safetyBlockRegex.matches(line) ||
+                CodexTranscriptSpec.warningCellRegex.matches(line) ||
+                CodexTranscriptSpec.approvalOverlayTitleRegex.matches(line) ||
+                CodexTranscriptSpec.requestUserInputOverlayRegex.matches(line)
+
+        private fun consumeCodexStructuredAlert() {
+            val firstLine = lines[i]
+            when {
+                CodexTranscriptSpec.errorSquareRegex.matches(firstLine) -> {
+                    var detail = CodexTranscriptSpec.errorSquareRegex.find(firstLine)!!.groupValues[1].trim()
+                    var lastWidth = displayWidth(firstLine)
+                    i++
+                    while (i < lines.size && lines[i].isNotBlank() &&
+                        !isPromptLine(lines[i]) && !isToolHead(lines[i]) && !isCodexStructuredAlertStart(lines[i]) &&
+                        !CodexTranscriptSpec.finalSeparatorRegex.matches(lines[i])
+                    ) {
+                        detail = joinWrapped(detail, lines[i].trim(), lastWidth >= wrapThreshold)
+                        lastWidth = displayWidth(lines[i])
+                        i++
+                    }
+                    blocks.add(TerminalSemanticBlock.UrgentAlertBlock("Error", detail, isError = true))
+                }
+
+                CodexTranscriptSpec.safetyBlockRegex.matches(firstLine) -> {
+                    val title = CodexTranscriptSpec.safetyBlockRegex.find(firstLine)!!.groupValues[1].trim()
+                    val detailLines = ArrayList<String>()
+                    i++
+                    while (i < lines.size && lines[i].isNotBlank() && indentOf(lines[i]) >= 2) {
+                        detailLines.add(lines[i].trim())
+                        i++
+                    }
+                    blocks.add(
+                        TerminalSemanticBlock.UrgentAlertBlock(
+                            title = title,
+                            detail = detailLines.joinToString("\n"),
+                            isError = true
+                        )
+                    )
+                }
+
+                CodexTranscriptSpec.warningCellRegex.matches(firstLine) -> {
+                    var detail = CodexTranscriptSpec.warningCellRegex.find(firstLine)!!.groupValues[1].trim()
+                    var lastWidth = displayWidth(firstLine)
+                    i++
+                    while (i < lines.size && lines[i].isNotBlank() && indentOf(lines[i]) >= 2 &&
+                        !isCodexStructuredAlertStart(lines[i])
+                    ) {
+                        detail = joinWrapped(detail, lines[i].trim(), lastWidth >= wrapThreshold)
+                        lastWidth = displayWidth(lines[i])
+                        i++
+                    }
+                    val isErr = Regex("(?i)(error|failed|unauthenticated|denied)").containsMatchIn(detail)
+                    blocks.add(
+                        TerminalSemanticBlock.UrgentAlertBlock(
+                            title = if (isErr) "运行异常" else "提示",
+                            detail = detail,
+                            isError = isErr
+                        )
+                    )
+                }
+
+                else -> {
+                    // `ApprovalOverlay` (`approval_overlay.rs`) or `RequestUserInputOverlay` (`request_user_input/render.rs`)
+                    val isQuestionOverlay = CodexTranscriptSpec.requestUserInputOverlayRegex.matches(firstLine)
+                    val titleLabel = if (isQuestionOverlay) "等待你的回答" else "需要你的授权"
+                    val detailLines = ArrayList<String>()
+                    detailLines.add(firstLine.trim())
+                    i++
+                    var blankCount = 0
+                    while (i < lines.size) {
+                        val l = lines[i]
+                        val t = l.trim()
+                        if (t.isEmpty()) {
+                            blankCount++
+                            val next = nextNonBlank(i + 1)
+                            if (next == null || blankCount > 2) break
+                            val nl = lines[next]
+                            val nt = nl.trim()
+                            val continuesOverlay = menuOptionRegex.matches(nl) ||
+                                promptMenuOptionRegex.matches(nl) ||
+                                nt.startsWith("$ ") ||
+                                nt.startsWith("Reason:") ||
+                                nt.startsWith("Grant ") ||
+                                indentOf(nl) >= 2 && !CodexTranscriptSpec.finalSeparatorRegex.matches(nl) &&
+                                !isToolHead(nl) && !isPromptLine(nl)
+                            if (continuesOverlay) {
+                                i = next
+                                continue
+                            }
+                            break
+                        }
+                        if (isPromptLine(l) || isToolHead(l) || CodexTranscriptSpec.finalSeparatorRegex.matches(l)) break
+                        val cleanedRow = if (promptMenuOptionRegex.matches(l)) {
+                            l.replaceFirst(Regex("[>❯›]"), " ").trim()
+                        } else {
+                            t
+                        }
+                        detailLines.add(cleanedRow)
+                        i++
+                    }
+                    blocks.add(
+                        TerminalSemanticBlock.UrgentAlertBlock(
+                            title = titleLabel,
+                            detail = detailLines.joinToString("\n"),
+                            isError = false
+                        )
+                    )
                 }
             }
         }
@@ -1012,11 +1382,18 @@ object StructuredTerminalReader {
                 when {
                     trimmed.isEmpty() -> {
                         val next = nextNonBlank(i + 1)
-                        if (next != null && (
-                                isToolHead(lines[next]) ||
-                                    toolChildRegex.matches(lines[next]) ||
-                                    codexFoldNoiseRegex.matches(lines[next].trim()) ||
-                                    (headCount > 0 && indentOf(lines[next]) >= 4 && isFollowedByCodexToolMarker(next))
+                        val nextLine = next?.let { lines[it] }
+                        val nextTrim = nextLine?.trim().orEmpty()
+                        if (next != null && nextLine != null && (
+                                isToolHead(nextLine) ||
+                                    (toolChildRegex.matches(nextLine) && !CodexTranscriptSpec.threadRecapHeadRegex.matches(nextLine)) ||
+                                    CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(nextTrim) ||
+                                    // In `codex-rs/tui`, every top-level cell starts at indent 0 or 2;
+                                    // 4+ space indented lines after an activity header (e.g. multi-hunk single-file diffs
+                                    // or multi-paragraph stdout) always belong to that activity cell.
+                                    (headCount > 0 && indentOf(nextLine) >= 4 &&
+                                        !isPromptLine(nextLine) && !isCodexStructuredAlertStart(nextLine) &&
+                                        !CodexTranscriptSpec.finalSeparatorRegex.matches(nextLine))
                                 )
                         ) {
                             i = next
@@ -1030,21 +1407,23 @@ object StructuredTerminalReader {
                         childPreviewLines = 0
                         val clean = cleanStepText(cleanToolHead(trimmed))
                         running = spinnerRegex.matches(line) ||
-                            Regex("^(?:Running|Thinking|Generating|Loading|Waiting|Working)\\b").containsMatchIn(clean)
+                            CodexTranscriptSpec.liveStatusIndicatorRegex.matches(line) ||
+                            Regex("^(?:Running|Thinking|Generating|Loading|Waiting|Working|Calling|Searching|Browsing|Opening|Resuming|Exploring)\\b")
+                                .containsMatchIn(clean)
                         if (stepErrorRegex.containsMatchIn(clean) && !zeroFailures(clean)) hasError = true
                         if (steps.size < MAX_GROUP_STEPS) steps.add(clean)
                         i++
                     }
 
-                    codexFoldNoiseRegex.matches(trimmed) -> {
+                    CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(trimmed) -> {
                         i++
                     }
 
-                    toolChildRegex.matches(line) -> {
+                    toolChildRegex.matches(line) && !CodexTranscriptSpec.threadRecapHeadRegex.matches(line) -> {
                         if (headCount == 0) headCount = 1
                         childPreviewLines = 0
                         val clean = cleanStepText(trimmed.replace(Regex("^(?:[└├][─\\s]*|⎿|↳)\\s*"), ""))
-                        if (clean.isNotEmpty() && !codexFoldNoiseRegex.matches(clean)) {
+                        if (clean.isNotEmpty() && !CodexTranscriptSpec.disclosureOrEllipsisRegex.matches(clean)) {
                             if (stepErrorRegex.containsMatchIn(clean) && !zeroFailures(clean)) hasError = true
                             if (steps.size < MAX_GROUP_STEPS) steps.add("  $clean")
                         }
@@ -1325,10 +1704,10 @@ object StructuredTerminalReader {
         private fun isCodexSpacedTableStart(idx: Int): Boolean {
             if (dialect != TerminalDialect.CODEX && dialect != TerminalDialect.GENERIC) return false
             val cur = lines[idx]
-            if (codexTableRuleRegex.matches(cur)) return true
+            if (CodexTranscriptSpec.gridTableRuleRegex.matches(cur)) return true
             if (idx + 1 < lines.size && cur.isNotBlank() &&
                 !isPromptLine(cur) && !isToolHead(cur) &&
-                codexTableRuleRegex.matches(lines[idx + 1])
+                CodexTranscriptSpec.gridTableRuleRegex.matches(lines[idx + 1])
             ) {
                 return true
             }
@@ -1517,22 +1896,39 @@ object StructuredTerminalReader {
 
         // ---- prose ----
 
+        private fun bulletIndentLevel(indent: Int): Int = when (dialect) {
+            // `markdown_render.rs:5341` + `messages.rs:1378`: depth 1 = indent 2, depth 2 = indent 6, depth 3 = indent 10
+            TerminalDialect.CODEX -> ((indent - 2).coerceAtLeast(0) / 4).coerceAtMost(2)
+            else -> if (indent >= baseIndent + 3) 1 else 0
+        }
+
         private fun appendProse(rawLine: String) {
             // `❯ 1. Yes` (menu cursor) -> `  1. Yes`
-            val line = if (promptMenuOptionRegex.matches(rawLine)) {
+            var line = if (promptMenuOptionRegex.matches(rawLine)) {
                 rawLine.replaceFirst(Regex("[>❯›]"), " ")
             } else {
                 rawLine
             }
-            val indent = indentOf(line)
+            var indent = indentOf(line)
             val width = displayWidth(line)
 
-            // Codex lead response paragraph starts at column 0 with `• <prose>` (NOT a bullet list item!).
+            // `messages.rs:1374`: Codex prepends `• ` at col 0 to line 0 of `AgentMarkdownCell`
+            // (replacing the 2-space `"  "` gutter used on subsequent lines).
             if (dialect == TerminalDialect.CODEX && indent == 0 && codexLeadProseRegex.matches(line)) {
-                flushParagraph()
                 val body = codexLeadProseRegex.find(line)!!.groupValues[1].trim()
-                startParagraph(body, bullet = false, indent = 2, indentLevel = 0, width = width)
-                return
+                val isStructuralLead = headingRegex.matches(body) ||
+                    boldHeadingRegex.matches(body) ||
+                    blockquoteLineRegex.matches(body) ||
+                    CodexTranscriptSpec.taskListBulletRegex.matches(body) ||
+                    orderedBulletRegex.matches(body)
+                if (isStructuralLead) {
+                    line = "  $body"
+                    indent = 2
+                } else {
+                    flushParagraph()
+                    startParagraph(body, bullet = false, indent = 2, indentLevel = 0, width = width)
+                    return
+                }
             }
 
             headingRegex.find(line)?.let {
@@ -1545,16 +1941,41 @@ object StructuredTerminalReader {
                 blocks.add(TerminalSemanticBlock.AgentProseBlock(cleanInline(it.groupValues[1], dialect), isHeading = true))
                 return
             }
+            blockquoteLineRegex.find(line)?.let {
+                val quoteBody = it.groupValues[2].trim()
+                if (quoteBody.isEmpty()) {
+                    flushParagraph()
+                    return
+                }
+                val current = paraText
+                if (current != null && current.startsWith("▎ ")) {
+                    val joined = joinWrapped(current.toString(), quoteBody, paraLastWidth >= wrapThreshold)
+                    current.setLength(0)
+                    current.append(joined)
+                    paraLastWidth = width
+                    return
+                }
+                flushParagraph()
+                startParagraph("▎ $quoteBody", bullet = false, indent = indent, indentLevel = 0, width = width)
+                return
+            }
+            CodexTranscriptSpec.taskListBulletRegex.find(line)?.let {
+                flushParagraph()
+                val box = it.groupValues[2]
+                val level = bulletIndentLevel(indent)
+                startParagraph("$box ${it.groupValues[3].trim()}", bullet = true, indent = indent, indentLevel = level, width = width)
+                return
+            }
             orderedBulletRegex.find(line)?.let {
                 flushParagraph()
                 val marker = it.groupValues[2].trim()
-                val level = if (indent >= baseIndent + 3) 1 else 0
+                val level = bulletIndentLevel(indent)
                 startParagraph("$marker ${it.groupValues[3].trim()}", bullet = true, indent = indent, indentLevel = level, width = width)
                 return
             }
             unorderedBulletRegex.find(line)?.let {
                 flushParagraph()
-                val level = if (indent >= baseIndent + 3) 1 else 0
+                val level = bulletIndentLevel(indent)
                 startParagraph(it.groupValues[2].trim(), bullet = true, indent = indent, indentLevel = level, width = width)
                 return
             }
@@ -1613,7 +2034,11 @@ object StructuredTerminalReader {
 
         private fun isToolHead(line: String): Boolean = when (dialect) {
             TerminalDialect.CODEX ->
-                codexToolHeadRegex.matches(line) || thoughtRegex.matches(line) || spinnerRegex.matches(line)
+                CodexTranscriptSpec.activityHeadRegex.matches(line) ||
+                    CodexTranscriptSpec.approvalAuditRegex.matches(line) ||
+                    CodexTranscriptSpec.liveStatusIndicatorRegex.matches(line) ||
+                    thoughtRegex.matches(line) ||
+                    spinnerRegex.matches(line)
             TerminalDialect.ANTIGRAVITY ->
                 thoughtRegex.matches(line) || agyToolVerbRegex.matches(line) ||
                     toolCallParenRegex.matches(line) || moreActionsRegex.matches(line) || spinnerRegex.matches(line)
@@ -1625,7 +2050,8 @@ object StructuredTerminalReader {
                 thoughtRegex.matches(line) || toolCallParenRegex.matches(line) ||
                     agyToolVerbRegex.matches(line) || spinnerRegex.matches(line)
             else ->
-                thoughtRegex.matches(line) || agyToolVerbRegex.matches(line) || codexToolHeadRegex.matches(line) ||
+                thoughtRegex.matches(line) || agyToolVerbRegex.matches(line) ||
+                    CodexTranscriptSpec.activityHeadRegex.matches(line) ||
                     toolCallParenRegex.matches(line) || bareToolSummaryRegex.matches(line) ||
                     moreActionsRegex.matches(line) || spinnerRegex.matches(line)
         }
@@ -1641,13 +2067,18 @@ object StructuredTerminalReader {
             return null
         }
 
+        private fun isDedicatedSummaryGroup(block: TerminalSemanticBlock.ToolGroupBlock): Boolean =
+            block.summaryLabel.startsWith("任务清单") ||
+                block.summaryLabel.startsWith("任务计划") ||
+                block.summaryLabel.startsWith("问答确认")
+
         private fun mergeAdjacentToolGroups(input: List<TerminalSemanticBlock>): List<TerminalSemanticBlock> {
             if (input.size < 2) return input
             val out = ArrayList<TerminalSemanticBlock>(input.size)
             for (b in input) {
                 val prev = out.lastOrNull()
                 if (prev is TerminalSemanticBlock.ToolGroupBlock && b is TerminalSemanticBlock.ToolGroupBlock &&
-                    !prev.summaryLabel.startsWith("任务清单") && !b.summaryLabel.startsWith("任务清单")
+                    !isDedicatedSummaryGroup(prev) && !isDedicatedSummaryGroup(b)
                 ) {
                     val steps = (prev.steps + b.steps).take(MAX_GROUP_STEPS)
                     val prevCount = Regex("已执行 (\\d+) 项").find(prev.summaryLabel)?.groupValues?.get(1)?.toIntOrNull() ?: 1
