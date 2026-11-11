@@ -107,7 +107,8 @@ class HcFramedClient(
         val result = request("terminal.read", terminalParams(address).put("lines", lines))
         // A full-screen program can refuse active stitching and return only its screen,
         // even when history was requested. Keep that distinction for the session cache.
-        return HcTerminalRead(result.optString("text"), lines == 0 || result.optString("how") == "screen")
+        val how = result.optString("how")
+        return HcTerminalRead(result.optString("text"), lines == 0 || how == "screen", how)
     }
 
     suspend fun sendTerminal(address: String, text: String, force: Boolean = false) {
@@ -257,7 +258,7 @@ class HcFramedClient(
     }
 }
 
-internal data class HcTerminalRead(val text: String, val screenOnly: Boolean)
+internal data class HcTerminalRead(val text: String, val screenOnly: Boolean, val how: String = "")
 
 /** A bounded, single-consumer channel. Credits go back when DATA is consumed, not on socket receipt. */
 class HcIncomingStream internal constructor(

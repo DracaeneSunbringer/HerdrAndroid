@@ -19,24 +19,32 @@ import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.service.HerdrKeepAliveCoordinator
+import dev.herdr.android.ui.terminal.QuickReplyAction
+import dev.herdr.android.ui.terminal.StructuredTerminalReader
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
 import dev.herdr.android.ui.theme.HerdrThemeTriad
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 enum class WorkspaceTab(val title: String, val badgeCode: String) {
     CONNECTION("连接", "CONN"),
@@ -69,6 +77,11 @@ data class DispatchedReceipt(
     val text: String,
     val sentAtTurn: Int,
     val timestampMs: Long = android.os.SystemClock.elapsedRealtime()
+)
+
+data class FleetCardDigest(
+    val headline: String,
+    val urgentActions: List<QuickReplyAction> = emptyList()
 )
 
 class HerdrMainViewModel(
@@ -171,6 +184,43 @@ class HerdrMainViewModel(
     private val _terminalPreviews = MutableStateFlow<Map<String, String>>(emptyMap())
     val terminalPreviews: StateFlow<Map<String, String>> = _terminalPreviews.asStateFlow()
 
+    private data class DigestCacheEntry(
+        val cacheKey: String,
+        val digest: FleetCardDigest
+    )
+    private val digestCache = ConcurrentHashMap<String, DigestCacheEntry>()
+
+    val fleetDigests: StateFlow<Map<String, FleetCardDigest>> = combine(
+        controller.terminals,
+        _terminalPreviews
+    ) { list, previews ->
+        val live = list.filter { it.state == "live" }
+        val liveAddrs = live.mapTo(HashSet(live.size)) { it.address }
+        digestCache.keys.retainAll(liveAddrs)
+        buildMap(live.size) {
+            for (t in live) {
+                val rawPrev = previews[t.address]
+                val key = "${t.turn}|${t.agentStatus.wireName}|${t.agentMessage.orEmpty()}|${rawPrev?.hashCode() ?: 0}"
+                val cached = digestCache[t.address]
+                val digest = if (cached != null && cached.cacheKey == key) {
+                    cached.digest
+                } else {
+                    val headline = StructuredTerminalReader.extractLatestHeadline(rawPrev, t)
+                    val isUrgent = t.agentStatus == AgentStateWord.BLOCKED || t.agentStatus == AgentStateWord.ERROR
+                    val actions = if (isUrgent) {
+                        StructuredTerminalReader.extractQuickActions(rawPrev, t).take(2)
+                    } else {
+                        emptyList()
+                    }
+                    FleetCardDigest(headline = headline, urgentActions = actions).also {
+                        digestCache[t.address] = DigestCacheEntry(key, it)
+                    }
+                }
+                put(t.address, digest)
+            }
+        }
+    }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
     private val _requestInputFocusSignal = MutableStateFlow(0L)
     val requestInputFocusSignal: StateFlow<Long> = _requestInputFocusSignal.asStateFlow()
 
@@ -209,23 +259,33 @@ class HerdrMainViewModel(
                 }
 
                 val nowMs = System.currentTimeMillis()
-                for (t in live) {
+                val targetsToFetch = live.filter { t ->
                     val needsScreen = t.agentMessage.isNullOrBlank() ||
                         t.agentStatus == AgentStateWord.BLOCKED ||
                         t.agentStatus == AgentStateWord.ERROR
-                    if (!needsScreen) continue
+                    if (!needsScreen) return@filter false
 
                     val key = "${t.turn}:${t.agentStatus.wireName}"
                     val lastMs = previewLastFetchMs[t.address] ?: 0L
                     val shouldRefreshWorking = t.agentStatus == AgentStateWord.WORKING && (nowMs - lastMs >= 8_000L)
-                    if (previewCacheKeys[t.address] == key && !shouldRefreshWorking) continue
+                    if (previewCacheKeys[t.address] == key && !shouldRefreshWorking) return@filter false
 
                     previewCacheKeys[t.address] = key
                     previewLastFetchMs[t.address] = nowMs
-                    controller.readTerminalPreview(t.address).onSuccess { snap ->
-                        if (snap.isNotBlank()) {
-                            _terminalPreviews.value = _terminalPreviews.value + (t.address to snap)
-                        }
+                    true
+                }
+                if (targetsToFetch.isNotEmpty()) {
+                    val fetchedPairs = withContext(Dispatchers.IO) {
+                        targetsToFetch.map { t ->
+                            async {
+                                controller.readTerminalPreview(t.address).getOrNull()
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?.let { t.address to it }
+                            }
+                        }.awaitAll().filterNotNull()
+                    }
+                    if (fetchedPairs.isNotEmpty()) {
+                        _terminalPreviews.value = _terminalPreviews.value + fetchedPairs
                     }
                 }
             }
@@ -239,6 +299,7 @@ class HerdrMainViewModel(
     private var keepAliveWatchJob: Job? = null
     private var ztStateJob: Job? = null
     private var updateJob: Job? = null
+    private var settingsSaveJob: Job? = null
     private var lastDesiredAttachMode: AttachMode = AttachMode.OBSERVE
     private var modeBeforePtyResize: AttachMode? = null
     private var lastInterruptTapMs: Long = 0L
@@ -497,19 +558,24 @@ class HerdrMainViewModel(
         ) {
             updateProfile { it.copy(host = updated.defaultZeroTierHost) }
         }
-        prefs?.edit()?.apply {
-            putString("theme_preset", updated.themePreset.id)
-            putString("theme_canvas_hex", updated.themeTriad.canvasHex)
-            putString("theme_accent_hex", updated.themeTriad.accentHex)
-            putString("theme_secondary_hex", updated.themeTriad.secondaryHex)
-            putString("default_lan_host", updated.defaultLanHost)
-            putString("default_zt_host", updated.defaultZeroTierHost)
-            putInt("default_desktop_fallback_cols", updated.defaultDesktopFallbackCols)
-            putString("default_attach_mode", updated.defaultAttachMode.name)
-            putBoolean("auto_hide_terminal_topbar", updated.autoHideTerminalTopBar)
-            putBoolean("auto_hide_observe_keystrip", updated.autoHideObserveKeyStrip)
-            putBoolean("keep_alive_in_background", updated.keepAliveInBackground)
-            apply()
+        settingsSaveJob?.cancel()
+        settingsSaveJob = viewModelScope.launch {
+            delay(250)
+            val latest = _appSettings.value
+            prefs?.edit()?.apply {
+                putString("theme_preset", latest.themePreset.id)
+                putString("theme_canvas_hex", latest.themeTriad.canvasHex)
+                putString("theme_accent_hex", latest.themeTriad.accentHex)
+                putString("theme_secondary_hex", latest.themeTriad.secondaryHex)
+                putString("default_lan_host", latest.defaultLanHost)
+                putString("default_zt_host", latest.defaultZeroTierHost)
+                putInt("default_desktop_fallback_cols", latest.defaultDesktopFallbackCols)
+                putString("default_attach_mode", latest.defaultAttachMode.name)
+                putBoolean("auto_hide_terminal_topbar", latest.autoHideTerminalTopBar)
+                putBoolean("auto_hide_observe_keystrip", latest.autoHideObserveKeyStrip)
+                putBoolean("keep_alive_in_background", latest.keepAliveInBackground)
+                apply()
+            }
         }
         if (updated.keepAliveInBackground != previous.keepAliveInBackground) {
             syncKeepAliveNotification()
@@ -1155,7 +1221,10 @@ class HerdrMainViewModel(
         syncKeepAliveNotification()
     }
 
+    fun getDraftForTerminal(address: String): String = _draftsByAddress.value[address].orEmpty()
+
     fun updateDraftForTerminal(address: String, draft: String) {
+        if (_draftsByAddress.value[address].orEmpty() == draft) return
         val updated = _draftsByAddress.value.toMutableMap()
         if (draft.isEmpty()) {
             updated.remove(address)

@@ -68,10 +68,43 @@ internal object AntigravityTranscriptSpec {
     )
 
     /** Custom statusline (`examples/statusline/statusline.sh`): wide 1-line, medium `╭─`/`╰─` 2-line, and narrow 2-line layouts. */
-    val customStatusLineRegex = Regex(
-        "(?i)(?:^(?:[╭╰]─\\s*|[●◆⚙🔧⏳]\\s+)(?:[●◆⚙🔧⏳]\\s*)?(?:READY|THINKING|WORKING|TOOL|REVIEWING|INITIALIZING)\\b(?:\\s*╱\\s*.+|.*\\bctx\\b.*)?$|" +
-            "(?:^[╭╰]─\\s*)?.*\\bctx\\s+[█▓▒░·\\s]+\\d+(?:\\.\\d+)?%.*(?:\\bsandbox\\s+(?:on|off)\\b|\\btasks\\s+\\d+\\b).*)"
+    private val customStatusHeadRegex = Regex(
+        "(?i)^(?:[╭╰]─\\s*|[●◆⚙🔧⏳]\\s+)(?:[●◆⚙🔧⏳]\\s*)?(?:READY|THINKING|WORKING|TOOL|REVIEWING|INITIALIZING)\\b"
     )
+    private val customStatusCtxRegex = Regex(
+        "(?i)\\bctx\\s+[█▓▒░·\\s]+\\d+(?:\\.\\d+)?%"
+    )
+
+    fun isCustomStatusLine(trimmed: String): Boolean {
+        if (trimmed.isEmpty()) return false
+        val c0 = trimmed[0]
+        if (c0 == '╭' || c0 == '╰' || c0 == '●' || c0 == '◆' || c0 == '⚙' || c0 == '⏳' || c0.isSurrogate()) {
+            if (customStatusHeadRegex.containsMatchIn(trimmed)) return true
+        }
+        if ("ctx " !in trimmed && "CTX " !in trimmed) return false
+        if ("sandbox " !in trimmed && "tasks " !in trimmed) return false
+        return customStatusCtxRegex.containsMatchIn(trimmed)
+    }
+
+    fun isModelStatusFooter(trimmed: String): Boolean {
+        if (trimmed.indexOf('·') < 0) return false
+        if ("Gemini" !in trimmed && "Claude" !in trimmed && "GPT-" !in trimmed &&
+            "gemini" !in trimmed && "claude" !in trimmed && "gpt-" !in trimmed
+        ) {
+            return false
+        }
+        return modelStatusFooterRegex.containsMatchIn(trimmed)
+    }
+
+    fun isKeyHintFooter(trimmed: String): Boolean {
+        if ("Navigate" !in trimmed && "Amend" !in trimmed &&
+            "edit command" !in trimmed && "again to exit" !in trimmed &&
+            "/artifact" !in trimmed
+        ) {
+            return false
+        }
+        return keyHintFooterRegex.containsMatchIn(trimmed)
+    }
 
     /** Background task / timer / cron row in bottom tray: `  ● [10:43:53] ... running|scheduled|completed|failed`. */
     val trayTaskRowRegex = Regex(
@@ -124,11 +157,72 @@ internal object AntigravityTranscriptSpec {
         RegexOption.IGNORE_CASE
     )
 
+    private val actionVerbs: HashSet<String> = hashSetOf(
+        "Thought", "Thinking", "Ran", "Run", "Running", "Edited", "Editing", "Explored", "Exploring",
+        "Read", "Reading", "Wrote", "Writing", "Searched", "Searching", "Updated", "Updating",
+        "Created", "Creating", "Deleted", "Deleting", "Listed", "Listing", "Called", "Calling",
+        "Executed", "Executing", "Viewed", "Viewing", "Analyzed", "Analyzing", "Fetched", "Fetching",
+        "Applied", "Applying", "Scheduled", "Scheduling", "Checked", "Checking", "Killed", "Killing",
+        "Cancelled", "Canceled", "Sent", "Sending", "Messaged", "Messaging", "Spawned", "Spawning",
+        "Invoked", "Invoking", "Defined", "Defining", "Asked", "Asking", "Answered", "Worked",
+        "Waited", "Waiting", "Grepped", "Globbed", "Patched", "Inspected", "Generated", "Generating",
+        "Browsed", "Browsing", "Opened", "Opening", "Clicked", "Typed", "Navigated"
+    )
+
+    private fun isStepBulletChar(c: Char): Boolean = when (c) {
+        '●', '⏺', '○', '◦', '▸', '▾', '▼', '✓', '✔', '✗', '✘' -> true
+        else -> false
+    }
+
+    /** O(1) hash-dispatched check replacing the 70-branch NFA regex scan on every line. */
+    fun isActionRow(line: String, indent: Int = line.indexOfFirst { it != ' ' }): Boolean {
+        if (indent < 0 || indent + 2 >= line.length) return false
+        if (!isStepBulletChar(line[indent])) return false
+        var pos = indent + 1
+        if (line[pos] != ' ') return false
+        while (pos < line.length && line[pos] == ' ') pos++
+        val wordStart = pos
+        while (pos < line.length) {
+            val ch = line[pos]
+            if (!ch.isLetter()) break
+            pos++
+        }
+        if (pos == wordStart) return false
+        if (pos < line.length && line[pos].isLetterOrDigit()) return false
+        return line.substring(wordStart, pos) in actionVerbs
+    }
+
+    /** O(1) character scan for `● ToolName(...)` without invoking Regex engine. */
+    fun isExpandedToolCallHead(line: String, indent: Int = line.indexOfFirst { it != ' ' }): Boolean {
+        if (indent < 0 || indent + 3 >= line.length) return false
+        val bullet = line[indent]
+        if (bullet != '●' && bullet != '⏺') return false
+        var pos = indent + 1
+        if (line[pos] != ' ') return false
+        while (pos < line.length && line[pos] == ' ') pos++
+        if (pos >= line.length || line[pos] !in 'A'..'Z') return false
+        pos++
+        while (pos < line.length) {
+            val ch = line[pos]
+            if (ch == '(') return true
+            if (!(ch.isLetterOrDigit() || ch == '_' || ch == '.' || ch == ':' || ch == '-')) return false
+            pos++
+        }
+        return false
+    }
+
+    /** O(1) prefix check for `[○◦▸▾▼●] Thought for ...`. */
+    fun isThoughtRow(line: String, indent: Int = line.indexOfFirst { it != ' ' }): Boolean {
+        if (indent < 0 || indent + 12 > line.length) return false
+        val c0 = line[indent]
+        if (c0 != '○' && c0 != '◦' && c0 != '▸' && c0 != '▾' && c0 != '▼' && c0 != '●') return false
+        var pos = indent + 1
+        while (pos < line.length && line[pos] == ' ') pos++
+        return line.regionMatches(pos, "Thought for ", 0, 12, ignoreCase = true)
+    }
+
     /**
-     * Authoritative `agy` tool/action summary rows (`●` completed, `○` active, `▸`/`▾` expandable):
-     * Covers single tools, multi-command batches (`● Ran 6 commands, checked 1 task, killed 1 task`),
-     * subagent orchestration (`● Spawned 2 subagents`, `● Messaged 1 subagent`), timers (`● Scheduled 1 timer`),
-     * browser tools, file exploration/editing, and MCP calls.
+     * Authoritative `agy` tool/action summary rows (`●` completed, `○` active, `▸`/`▾` expandable).
      */
     val actionRowRegex = Regex(
         "^\\s*[●⏺○◦▸▾▼✓✔✗✘]\\s+(?:" +
@@ -169,18 +263,34 @@ internal object AntigravityTranscriptSpec {
         RegexOption.IGNORE_CASE
     )
 
+    /**
+     * Individual expanded tool-call row rendered in `Ctrl+O` trajectory view
+     * (`● Bash(...)`, `● Edit(...)`, `● Read(...)`, `● Write(...)`, `● Schedule(...)`, etc.),
+     * which may wrap long arguments across multiple lines before the closing `)`.
+     */
+    val expandedToolCallHeadRegex = Regex("^\\s*[●⏺]\\s+[A-Z][A-Za-z0-9_.:-]*\\(.*$")
+
+    /** Numbered diff/context row inside expanded `● Edit(...)` / `● Edited` output (`      305    }` or `       28 +  import ...`). */
+    val editDiffRowRegex = Regex("^\\s{3,}\\d+(?:\\s+[+-](?:\\s.*)?|\\s{2,}.*|\\s*)$")
+
+    /** Truncation trailer inside expanded `● Edit(...)` / tool output (`             … and 3 more lines`). */
+    val moreLinesRowRegex = Regex("^\\s*(?:…|\\.{2,3})\\s+and\\s+\\d+\\s+more\\s+lines\\b.*$", RegexOption.IGNORE_CASE)
+
     /** `agy changelog:65`: Fold divider row (`↕ ···`) inside expanded diffs. */
     val diffFoldDividerRegex = Regex("^\\s*↕\\s*···.*$")
 
     /**
-     * Common English internal-monologue starters in `agy` expanded `▾ Thought` blocks,
-     * used as a fallback boundary signal when ANSI SGR codes have already been stripped.
+     * Common English & Chinese internal-monologue starters in `agy` expanded `▾ Thought` blocks,
+     * used as a fallback boundary signal when ANSI SGR codes have already been stripped by `terminal.read`.
      */
     val englishMonologueStartRegex = Regex(
-        "^(?:I(?:'m| am| need| should| will| can| have|'ve|'ll)\\b|Let's\\b|Wait[,:\\s]|" +
-            "First[,\\s]|Second[,\\s]|Next[,\\s]|Looking at\\b|The user\\b|Considering\\b|" +
-            "We (?:need|should|can|have)\\b|Now (?:I|let's|we)\\b|Checking\\b|Inspecting\\b|" +
-            "To (?:fix|solve|handle|address)\\b|This (?:means|suggests|indicates)\\b).*"
+        "^(?:I(?:'m| am| need| should| will| can| have|'ve|'ll|'d)\\b|Let's\\b|Let me\\b|Wait[,:\\s]|" +
+            "First[,\\s]|Second[,\\s]|Third[,\\s]|Next[,\\s]|Looking at\\b|The (?:user|issue|problem|fix|build)\\b|" +
+            "Considering\\b|We (?:need|should|can|have)\\b|Now (?:I|let's|we|that|checking)\\b|" +
+            "Checking\\b|Inspecting\\b|To (?:fix|solve|handle|address|verify)\\b|" +
+            "This (?:means|suggests|indicates|is just)\\b|" +
+            "(?:我(?:需要|先|应该|还得|再来|来看)|先(?:看|检查|核对|确认|排查)|看看|用户(?:刚才|提到|要求|反馈)))" +
+            ".*"
     )
 
     /**
@@ -200,17 +310,37 @@ internal object AntigravityTranscriptSpec {
         return if (sum > 0) sum else 1
     }
 
+    private val leadingCrossFailureRegex = Regex("^[✗✘]\\s")
+    private val explicitStepFailureRegex = Regex(
+        "(?i)(?:\\)\\s*failed\\b|:\\s*failed\\b|\\b[1-9]\\d*\\s+failed\\b|exited\\s+with\\s+code\\s+[1-9]\\d*\\b)"
+    )
+    private val outsideParenFailureWordRegex = Regex("(?i)\\b(?:failed|failure|error|denied)\\b")
+
     /**
-     * Distinguishes real `agy` step failure markers (`) failed`, `: failed`, `N failed`, `✗`)
+     * Distinguishes real `agy` step failure markers (`) failed`, `: failed`, `N failed`, `✗`, `exited with code 1`)
      * from benign occurrences of the word `"failed"` inside a quoted shell command argument!
      */
     fun hasRealStepFailure(cleanedStep: String): Boolean {
-        if (Regex("^[✗✘]\\s").containsMatchIn(cleanedStep)) return true
-        if (Regex("(?i)(?:\\)\\s*failed\\b|:\\s*failed\\b|\\b[1-9]\\d*\\s+failed\\b)").containsMatchIn(cleanedStep)) {
-            return true
+        if (cleanedStep.isEmpty()) return false
+        val c0 = cleanedStep[0]
+        if (c0 == '✗' || c0 == '✘') {
+            if (leadingCrossFailureRegex.containsMatchIn(cleanedStep)) return true
         }
-        val outsideParens = cleanedStep.substringBefore('(') + " " + cleanedStep.substringAfterLast(')', "")
-        return Regex("(?i)\\b(?:failed|failure|error|denied)\\b").containsMatchIn(outsideParens)
+        // Fast SIMD substring reject before running failure regexes or allocating substrings
+        if ("fail" !in cleanedStep && "Fail" !in cleanedStep && "FAIL" !in cleanedStep &&
+            "error" !in cleanedStep && "Error" !in cleanedStep && "ERROR" !in cleanedStep &&
+            "denied" !in cleanedStep && "Denied" !in cleanedStep &&
+            "exited with code" !in cleanedStep
+        ) {
+            return false
+        }
+        if (explicitStepFailureRegex.containsMatchIn(cleanedStep)) return true
+        val outsideParens = if ('(' in cleanedStep) {
+            cleanedStep.substringBefore('(') + " " + cleanedStep.substringAfterLast(')', "")
+        } else {
+            cleanedStep
+        }
+        return outsideParenFailureWordRegex.containsMatchIn(outsideParens)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -237,14 +367,26 @@ internal object AntigravityTranscriptSpec {
     val warningBannerRegex = Regex("^\\s*⚠\\s+(.+)$")
 
     /** Subagent question alert (`<agent> has a question` or `Blocked · AskQuestion`). */
-    val subagentQuestionRegex = Regex(
-        "^(?:\\s*[●⚠]?\\s*([A-Za-z0-9_.-]+)\\s+has a question\\b.*|.*\\bBlocked\\s*·\\s*AskQuestion\\b.*)$",
-        RegexOption.IGNORE_CASE
-    )
+    private val subagentHasQuestionHeadRegex = Regex("^\\s*[●⚠]?\\s*([A-Za-z0-9_.-]+)\\s+has a question\\b.*$", RegexOption.IGNORE_CASE)
+    private val blockedAskQuestionRegex = Regex("\\bBlocked\\s*·\\s*AskQuestion\\b", RegexOption.IGNORE_CASE)
+
+    fun isSubagentQuestion(line: String): Boolean {
+        if ("has a question" !in line && "AskQuestion" !in line) {
+            return false
+        }
+        return subagentHasQuestionHeadRegex.matches(line) || blockedAskQuestionRegex.containsMatchIn(line)
+    }
 
     /** Tool / URL / file permission confirmation header (`Allow calling this tool?`, `Allow access to this URL?`, etc.). */
     val permissionTitleRegex = Regex(
         "(?i)^\\s*(?:Allow\\s+(?:calling|running|reading|writing|editing|access|this)\\b.*\\?|" +
             "Do you want to\\s+(?:allow|run|proceed|edit|write|read|create|delete)\\b.*\\?)\\s*$"
     )
+
+    fun isPermissionTitle(trimmed: String): Boolean {
+        if (trimmed.isEmpty() || trimmed.last() != '?') return false
+        val c0 = trimmed[0]
+        if (c0 != 'A' && c0 != 'a' && c0 != 'D' && c0 != 'd') return false
+        return permissionTitleRegex.matches(trimmed)
+    }
 }

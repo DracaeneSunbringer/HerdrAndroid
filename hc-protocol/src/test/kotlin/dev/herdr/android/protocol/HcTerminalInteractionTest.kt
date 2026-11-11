@@ -256,6 +256,69 @@ class HcTerminalInteractionTest {
         }
     }
 
+    @Test fun ctrlTAndCtrlOSendRawControlBytesOverStreamWithoutCallingTerminalKeys() = runBlocking {
+        interactivePeer().use { peer ->
+            peer.client.start()
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            assertTrue(session.sendSpecialKey("ctrl+t").isSuccess)
+            assertTrue(session.sendSpecialKey("ctrl+o").isSuccess)
+            awaitUntil { rawInput(peer).size == 2 }
+            val writes = rawInput(peer)
+            assertArrayEquals(byteArrayOf(0x14), writes[0].payload)
+            assertArrayEquals(byteArrayOf(0x0F), writes[1].payload)
+            assertTrue(writes.all { it.channel == 41L })
+            val calls = rpcRequests(peer)
+            assertFalse(calls.any { it.optString("method") == "terminal.keys" })
+            session.detach()
+        }
+    }
+
+    @Test fun idleStitchedSessionReusesCachedHistoryUntilKeyInputBumpsEpoch() = runBlocking {
+        val frame = AtomicReference(HistoryFrame(status = "idle", historyPrefix = "stitched hist", screenPrefix = "stitched scr"))
+        val requestedLines = CopyOnWriteArrayList<Int>()
+        ProtocolPeer().also { peer ->
+            peer.handler = { request ->
+                val current = frame.get()
+                val terminal = ProtocolPeer.terminal().put("cols", current.cols).put("rows", current.rows)
+                    .put("status", JSONObject().put("state", current.status))
+                when (request.getString("method")) {
+                    "terminal.get" -> peer.reply(request, terminal)
+                    "terminal.attach" -> peer.reply(
+                        request,
+                        JSONObject().put("channel", 41).put("terminal", terminal).put("resize_notifications", false)
+                    )
+                    "terminal.read" -> {
+                        val lines = request.getJSONObject("params").getInt("lines")
+                        requestedLines += lines
+                        val history = if (lines > 0) current.history().takeLast(lines) else emptyList()
+                        val text = (history + current.screen()).joinToString("\n")
+                        peer.reply(request, JSONObject().put("text", text).put("how", if (lines == 0) "screen" else "stitched"))
+                    }
+                    else -> peer.reply(request)
+                }
+            }
+        }.use { peer ->
+            peer.client.start()
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            val initial = withTimeout(2500) { session.screenSnapshot.first { it.endsWith("stitched scr 43") } }
+            assertEquals(304, initial.lines().size)
+            assertEquals(260, requestedLines.first())
+
+            // Wait for at least one periodic poll while idle with zero stream output: must use lines = 0!
+            awaitUntil { requestedLines.size >= 2 }
+            assertEquals(0, requestedLines[1])
+            assertEquals(304, session.screenSnapshot.value.lines().size)
+
+            // Sending Ctrl+T bumps outputEpoch and triggers a fresh full read (lines = 260)
+            frame.set(HistoryFrame(status = "idle", historyPrefix = "transcript hist", screenPrefix = "transcript scr"))
+            assertTrue(session.sendSpecialKey("ctrl+t").isSuccess)
+            val updated = withTimeout(2500) { session.screenSnapshot.first { it.endsWith("transcript scr 43") } }
+            assertTrue(updated.startsWith("transcript hist 0"))
+            assertTrue(requestedLines.drop(1).any { it == 260 })
+            session.detach()
+        }
+    }
+
     private fun interactivePeer(blocked: Boolean = false) = ProtocolPeer().also { peer ->
         peer.handler = { request ->
             val terminal = ProtocolPeer.terminal().put("status", JSONObject().put("state", if (blocked) "blocked" else "idle"))

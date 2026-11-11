@@ -71,14 +71,19 @@ object AnsiTerminalParser {
     private val treeBranchItemRegex = Regex("^(\\s*[├└]─?\\s*)([✓✗◦•○●]?)(.*)$")
     private val toolSubOutputHeaderRegex = Regex("^(\\s*⎿\\s*)(.+)$")
     private val spinnerLineRegex = Regex("^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷⠿]\\s+.*$")
-    private val footerLineRegex = Regex(
-        "^\\s*(esc to cancel|\\? for shortcuts|← for agents|Thinking blocks:|Tool output:|\\[hc] incomplete:|.*(?:tok/s|TTFT:|Cline upstream:|MCP:\\s*\\d+)).*$"
-    )
-    private val diffAddLineRegex = Regex("^\\s*\\d+\\s+\\+\\s+.*$")
-    private val diffDelLineRegex = Regex("^\\s*\\d+\\s+-\\s+.*$")
-    private val lonePromptLineRegex = Regex("^\\s*[›❯]\\s*$")
-    private val errorLineRegex = Regex("^\\s*(?:Error|ERROR|error|Fatal|FATAL|fatal|panic)(?:\\[[^\\]]*])?\\s*[:：].*$")
-    private val warningLineRegex = Regex("^\\s*(?:Warning|WARNING|warning|WARN|Warn)(?:\\[[^\\]]*])?\\s*[:：].*$")
+    private fun isFooterLine(trimmed: String): Boolean {
+        if (trimmed.isEmpty()) return false
+        return trimmed.startsWith("esc to cancel", ignoreCase = true) ||
+            trimmed.startsWith("? for shortcuts", ignoreCase = true) ||
+            trimmed.startsWith("← for agents") ||
+            trimmed.startsWith("Thinking blocks:") ||
+            trimmed.startsWith("Tool output:") ||
+            trimmed.startsWith("[hc] incomplete:") ||
+            trimmed.contains("tok/s") ||
+            trimmed.contains("TTFT:") ||
+            trimmed.contains("Cline upstream:") ||
+            trimmed.contains("MCP:")
+    }
 
     /** Minimum contrast ratio enforced for remote 256-color / truecolor foregrounds on light themes. */
     private const val MIN_LIGHT_FG_CONTRAST = 3.0
@@ -87,8 +92,8 @@ object AnsiTerminalParser {
         rawText: String,
         mobileReflow: Boolean = false
     ): AnnotatedString {
-        val cleanedOsc = oscRegex.replace(rawText, "")
-        val hasAnsiSgr = csiRegex.containsMatchIn(cleanedOsc)
+        val cleanedOsc = if (rawText.indexOf("\u001B]") >= 0) oscRegex.replace(rawText, "") else rawText
+        val hasAnsiSgr = cleanedOsc.indexOf("\u001B[") >= 0
         val normalized = normalizeRawLines(cleanedOsc)
 
         if (hasAnsiSgr) {
@@ -133,123 +138,157 @@ object AnsiTerminalParser {
         return outLines.joinToString("\n")
     }
 
+    private val diffAddLineRegex = Regex("^\\s*\\d+\\s+\\+\\s+.*$")
+    private val diffDelLineRegex = Regex("^\\s*\\d+\\s+-\\s+.*$")
+    private val lonePromptLineRegex = Regex("^\\s*[›❯]\\s*$")
+    private val errorLineRegex = Regex("^\\s*(?:Error|ERROR|error|Fatal|FATAL|fatal|panic)(?:\\[[^\\]]*])?\\s*[:：].*$")
+    private val warningLineRegex = Regex("^\\s*(?:Warning|WARNING|warning|WARN|Warn)(?:\\[[^\\]]*])?\\s*[:：].*$")
+
     private fun parseSemanticTuiString(text: String): AnnotatedString = buildAnnotatedString {
         val lines = text.split('\n')
         lines.forEachIndexed { index, line ->
-            val trimmed = line.trim()
-            when {
-                labeledRuleRegex.matches(line) -> {
-                    val match = labeledRuleRegex.find(line)!!
-                    appendStyledSegment(match.groupValues[1], HerdrColors.Border, Color.Unspecified, false)
-                    appendStyledSegment(match.groupValues[2], HerdrColors.Working, Color.Unspecified, true)
-                    appendStyledSegment(match.groupValues[3], HerdrColors.Border, Color.Unspecified, false)
-                }
+            val firstIdx = line.indexOfFirst { it != ' ' }
+            if (firstIdx >= 0) {
+                val c0 = line[firstIdx]
+                val trimmed = if (firstIdx == 0) line else line.substring(firstIdx)
+                var handled = false
 
-                fullLineRuleRegex.matches(trimmed) || boxTableBorderRegex.matches(trimmed) -> {
-                    appendStyledSegment(line, HerdrColors.Border, Color.Unspecified, false)
-                }
-
-                userPromptLineRegex.matches(line) && !trimmed.startsWith("> ") -> {
-                    val match = userPromptLineRegex.find(line)!!
-                    appendStyledSegment(match.groupValues[1], HerdrColors.Accent, Color.Unspecified, true)
-                    appendStyledSegment(match.groupValues[2], HerdrColors.Foreground, Color.Unspecified, true)
-                }
-
-                lonePromptLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Accent, Color.Unspecified, true)
-                }
-
-                errorLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Blocked, Color.Unspecified, false)
-                }
-
-                warningLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Working, Color.Unspecified, false)
-                }
-
-                thoughtLineRegex.matches(trimmed) -> {
-                    val isExpanded = trimmed.startsWith("▾") || trimmed.startsWith("▼")
-                    appendStyledSegment(
-                        line,
-                        if (isExpanded) HerdrColors.Muted else HerdrColors.Dim,
-                        Color.Unspecified,
-                        isExpanded
-                    )
-                }
-
-                toolSubOutputHeaderRegex.matches(line) -> {
-                    val match = toolSubOutputHeaderRegex.find(line)!!
-                    val prefix = match.groupValues[1]
-                    val body = match.groupValues[2]
-                    val isErr = "code 1" in body.lowercase() || "failed" in body.lowercase() || "error" in body.lowercase()
-                    appendStyledSegment(prefix, HerdrColors.Border, Color.Unspecified, true)
-                    appendStyledSegment(
-                        body,
-                        if (isErr) HerdrColors.Blocked else HerdrColors.Muted,
-                        Color.Unspecified,
-                        isErr
-                    )
-                }
-
-                treeBranchItemRegex.matches(line) -> {
-                    val match = treeBranchItemRegex.find(line)!!
-                    val branch = match.groupValues[1]
-                    val statusSym = match.groupValues[2]
-                    val rest = match.groupValues[3]
-                    appendStyledSegment(branch, HerdrColors.Border, Color.Unspecified, false)
-                    if (statusSym.isNotEmpty()) {
-                        val symColor = when (statusSym) {
-                            "✓", "•", "●" -> HerdrColors.Done
-                            "✗" -> HerdrColors.Blocked
-                            else -> HerdrColors.Accent
+                when (c0) {
+                    '─', '━', '═', '-', '_', '┌', '┬', '┐', '├', '┼', '┤', '└', '┴', '┘', '╭', '╮', '╯', '╰', '|', '+' -> {
+                        if (c0 == '├' || c0 == '└') {
+                            val match = if (!boxTableBorderRegex.matches(trimmed)) treeBranchItemRegex.find(line) else null
+                            if (match != null) {
+                                val branch = match.groupValues[1]
+                                val statusSym = match.groupValues[2]
+                                val rest = match.groupValues[3]
+                                appendStyledSegment(branch, HerdrColors.Border, Color.Unspecified, false)
+                                if (statusSym.isNotEmpty()) {
+                                    val symColor = when (statusSym) {
+                                        "✓", "•", "●" -> HerdrColors.Done
+                                        "✗" -> HerdrColors.Blocked
+                                        else -> HerdrColors.Accent
+                                    }
+                                    appendStyledSegment(statusSym, symColor, Color.Unspecified, true)
+                                }
+                                appendStyledSegment(rest, HerdrColors.Foreground, Color.Unspecified, false)
+                                handled = true
+                            }
                         }
-                        appendStyledSegment(statusSym, symColor, Color.Unspecified, true)
+                        if (!handled) {
+                            val labeled = labeledRuleRegex.find(line)
+                            if (labeled != null) {
+                                appendStyledSegment(labeled.groupValues[1], HerdrColors.Border, Color.Unspecified, false)
+                                appendStyledSegment(labeled.groupValues[2], HerdrColors.Working, Color.Unspecified, true)
+                                appendStyledSegment(labeled.groupValues[3], HerdrColors.Border, Color.Unspecified, false)
+                                handled = true
+                            } else if (fullLineRuleRegex.matches(trimmed) || boxTableBorderRegex.matches(trimmed)) {
+                                appendStyledSegment(line, HerdrColors.Border, Color.Unspecified, false)
+                                handled = true
+                            }
+                        }
                     }
-                    appendStyledSegment(rest, HerdrColors.Foreground, Color.Unspecified, false)
-                }
 
-                toolStepLineRegex.matches(line) -> {
-                    val match = toolStepLineRegex.find(line)!!
-                    val bullet = match.groupValues[1]
-                    val head = match.groupValues[2]
-                    val tail = match.groupValues[3]
-                    val fullRest = "$head$tail"
-                    val isError = "failed" in fullRest.lowercase() || "error" in fullRest.lowercase()
-                    val isRunning = head.trimStart().startsWith("Running") || head.trimStart().startsWith("Scheduling")
-                    val bulletColor = when {
-                        isError -> HerdrColors.Blocked
-                        isRunning -> HerdrColors.Working
-                        else -> HerdrColors.Done
+                    '>', '›', '❯' -> {
+                        if (lonePromptLineRegex.matches(line)) {
+                            appendStyledSegment(line, HerdrColors.Accent, Color.Unspecified, true)
+                            handled = true
+                        } else if (!trimmed.startsWith("> ")) {
+                            val match = userPromptLineRegex.find(line)
+                            if (match != null) {
+                                appendStyledSegment(match.groupValues[1], HerdrColors.Accent, Color.Unspecified, true)
+                                appendStyledSegment(match.groupValues[2], HerdrColors.Foreground, Color.Unspecified, true)
+                                handled = true
+                            }
+                        }
                     }
-                    appendStyledSegment(bullet, bulletColor, Color.Unspecified, true)
-                    appendStyledSegment(head, HerdrColors.Muted, Color.Unspecified, true)
-                    if (tail.isNotEmpty()) {
-                        appendStyledSegment(tail, HerdrColors.Dim, Color.Unspecified, false)
+
+                    '⎿' -> {
+                        val match = toolSubOutputHeaderRegex.find(line)
+                        if (match != null) {
+                            val prefix = match.groupValues[1]
+                            val body = match.groupValues[2]
+                            val isErr = body.contains("code 1", ignoreCase = true) ||
+                                body.contains("failed", ignoreCase = true) ||
+                                body.contains("error", ignoreCase = true)
+                            appendStyledSegment(prefix, HerdrColors.Border, Color.Unspecified, true)
+                            appendStyledSegment(body, if (isErr) HerdrColors.Blocked else HerdrColors.Muted, Color.Unspecified, isErr)
+                            handled = true
+                        }
+                    }
+
+                    '●', '•', '○', '◦', '▸', '▾', '▼' -> {
+                        if (thoughtLineRegex.matches(trimmed)) {
+                            val isExpanded = c0 == '▾' || c0 == '▼'
+                            appendStyledSegment(line, if (isExpanded) HerdrColors.Muted else HerdrColors.Dim, Color.Unspecified, isExpanded)
+                            handled = true
+                        } else {
+                            val match = toolStepLineRegex.find(line)
+                            if (match != null) {
+                                val bullet = match.groupValues[1]
+                                val head = match.groupValues[2]
+                                val tail = match.groupValues[3]
+                                val fullRest = "$head$tail"
+                                val isError = fullRest.contains("failed", ignoreCase = true) || fullRest.contains("error", ignoreCase = true)
+                                val headTrim = head.trimStart()
+                                val isRunning = headTrim.startsWith("Running") || headTrim.startsWith("Scheduling")
+                                val bulletColor = when {
+                                    isError -> HerdrColors.Blocked
+                                    isRunning -> HerdrColors.Working
+                                    else -> HerdrColors.Done
+                                }
+                                appendStyledSegment(bullet, bulletColor, Color.Unspecified, true)
+                                appendStyledSegment(head, HerdrColors.Muted, Color.Unspecified, true)
+                                if (tail.isNotEmpty()) {
+                                    appendStyledSegment(tail, HerdrColors.Dim, Color.Unspecified, false)
+                                }
+                                handled = true
+                            }
+                        }
+                    }
+
+                    'T' -> {
+                        if (thoughtLineRegex.matches(trimmed)) {
+                            appendStyledSegment(line, HerdrColors.Dim, Color.Unspecified, false)
+                            handled = true
+                        }
+                    }
+
+                    'E', 'e', 'F', 'f', 'p' -> {
+                        if (errorLineRegex.matches(line)) {
+                            appendStyledSegment(line, HerdrColors.Blocked, Color.Unspecified, false)
+                            handled = true
+                        }
+                    }
+
+                    'W', 'w' -> {
+                        if (warningLineRegex.matches(line)) {
+                            appendStyledSegment(line, HerdrColors.Working, Color.Unspecified, false)
+                            handled = true
+                        }
+                    }
+
+                    in '0'..'9' -> {
+                        if (diffAddLineRegex.matches(line)) {
+                            appendStyledSegment(line, HerdrColors.Done, Color.Unspecified, false)
+                            handled = true
+                        } else if (diffDelLineRegex.matches(line)) {
+                            appendStyledSegment(line, HerdrColors.Blocked, Color.Unspecified, false)
+                            handled = true
+                        }
                     }
                 }
 
-                '│' in line -> {
-                    appendLineWithBoxPipes(line)
-                }
-
-                spinnerLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Working, Color.Unspecified, true)
-                }
-
-                diffAddLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Done, Color.Unspecified, false)
-                }
-
-                diffDelLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Blocked, Color.Unspecified, false)
-                }
-
-                footerLineRegex.matches(line) -> {
-                    appendStyledSegment(line, HerdrColors.Dim, Color.Unspecified, false)
-                }
-
-                else -> {
-                    appendStyledSegment(line, HerdrColors.Foreground, Color.Unspecified, false)
+                if (!handled) {
+                    when {
+                        c0.code in 0x2800..0x28FF && spinnerLineRegex.matches(line) ->
+                            appendStyledSegment(line, HerdrColors.Working, Color.Unspecified, true)
+                        line.indexOf('│') >= 0 ->
+                            appendLineWithBoxPipes(line)
+                        isFooterLine(trimmed) ->
+                            appendStyledSegment(line, HerdrColors.Dim, Color.Unspecified, false)
+                        else ->
+                            appendStyledSegment(line, HerdrColors.Foreground, Color.Unspecified, false)
+                    }
                 }
             }
             if (index < lines.lastIndex) {

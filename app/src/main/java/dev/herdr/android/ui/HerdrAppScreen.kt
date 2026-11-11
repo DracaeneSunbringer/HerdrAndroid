@@ -147,10 +147,11 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val appUpdateState by viewModel.appUpdateState.collectAsState()
     val toastBanner by viewModel.toastBanner.collectAsState()
     val acknowledgedDoneTurns by viewModel.acknowledgedDoneTurns.collectAsState()
-    val draftsByAddress by viewModel.draftsByAddress.collectAsState()
     val dispatchedReceipts by viewModel.dispatchedReceipts.collectAsState()
     val terminalPreviews by viewModel.terminalPreviews.collectAsState()
+    val fleetDigests by viewModel.fleetDigests.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
+    val liveTerminals = remember(allTerminals) { allTerminals.filter { it.state == "live" } }
     val context = LocalContext.current
 
     val notificationPermLauncher = rememberLauncherForActivityResult(
@@ -239,6 +240,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         acknowledgedDoneTurns = acknowledgedDoneTurns,
                         dispatchedReceipts = dispatchedReceipts,
                         terminalPreviews = terminalPreviews,
+                        fleetDigests = fleetDigests,
                         onSelectFilter = viewModel::setStatusFilter,
                         onRefresh = viewModel::refreshTerminals,
                         onOpenSettings = { viewModel.selectTab(WorkspaceTab.SETTINGS) },
@@ -257,9 +259,11 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                     WorkspaceTab.TERMINAL -> AgentWorkbenchPane(
                         session = activeSession,
                         summary = activeSummary,
-                        allLiveTerminals = allTerminals.filter { it.state == "live" },
+                        allLiveTerminals = liveTerminals,
                         acknowledgedDoneTurns = acknowledgedDoneTurns,
-                        draftText = activeSession?.address?.let { draftsByAddress[it] }.orEmpty(),
+                        draftText = remember(activeSession?.address) {
+                            activeSession?.address?.let { viewModel.getDraftForTerminal(it) }.orEmpty()
+                        },
                         dispatchedReceipt = activeSession?.address?.let { dispatchedReceipts[it] },
                         requestInputFocusSignal = requestInputFocusSignal,
                         appSettings = appSettings,

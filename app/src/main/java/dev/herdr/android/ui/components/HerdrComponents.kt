@@ -29,11 +29,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.TextStyle
@@ -85,24 +84,23 @@ fun agentAppLabel(raw: String?): String = when (raw?.lowercase()?.trim()) {
 
 @Composable
 fun StatusDot(color: Color, size: Dp = 8.dp, pulsing: Boolean = false) {
-    val alpha = if (pulsing) {
+    val pulseState = if (pulsing) {
         val transition = rememberInfiniteTransition(label = "status-pulse")
-        val a by transition.animateFloat(
+        transition.animateFloat(
             initialValue = 1f,
             targetValue = 0.35f,
             animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
             label = "status-pulse-alpha"
         )
-        a
     } else {
-        1f
+        null
     }
     Box(
         modifier = Modifier
             .size(size)
-            .alpha(alpha)
-            .clip(CircleShape)
-            .background(color)
+            .drawBehind {
+                drawCircle(color = color, alpha = pulseState?.value ?: 1f)
+            }
     )
 }
 

@@ -784,4 +784,219 @@ class StructuredTerminalReaderTest {
         assertTrue(actions.none { it.label == "收起详情 Ctrl+O" })
         assertTrue(actions.none { it.label == "继续推进" })
     }
+
+    @Test
+    fun antigravityCtrlORealPlainTextSnapshot_deduplicatesSummaryVsDetailAndPreservesInterimProseAndLongOutput() {
+        val realPlainCtrlO = """
+                 62 +     val accentHex: String = "",
+                 63 +     val secondaryHex: String = ""
+                 … and 3 more lines
+
+            > 再次审查一下展开后的文本结构解析和识别有没有按预期运行
+              ▾ 📎 uploaded_media_1794314898086.jpg (ctrl+o to collapse)
+                ⎿  [Image #1]
+
+              ▾ Thought for 3s (ctrl+o to collapse)
+                Let's inspect the actual ConPTY plain-text snapshot when Ctrl+O is active on Windows so we verify every
+            wrapped line at column 0.
+              ● Bash(adb shell dumpsys gfxinfo dev.herdr.android)
+                ⎿
+                   Command output:
+                   Applications Graphics Acceleration Info:
+                   Uptime: 10482912 Realtime: 20491823
+                   ** Graphics info for pid 18421 [dev.herdr.android] **
+                   Stats since: 10400000ns
+                   Total frames rendered: 412
+                   Janky frames: 4 (0.97%)
+                   50th percentile: 4.95ms
+                   90th percentile: 7.20ms
+                   95th percentile: 8.50ms
+                   99th percentile: 11.40ms
+                   Number Missed Vsync: 0
+                   Number High input latency: 0
+                   Number Slow UI thread: 1
+
+              Switches render correctly, now verifying the reader parser blocks.
+
+              ● Ran (gradle :app:testDebugUnitTest)
+              ● Explored 2 files (StructuredTerminalReader.kt, AgentWorkbenchPane.kt) (ctrl+o to collapse)
+              ● Bash(D:\luoyu\Documents\Pi\android-apk-build-kit\gradle\gradle-8.14.3\bin\gradle.bat
+            :app:testDebugUnitTest)
+                ⎿
+                   Command output:
+                   > Task :hc-protocol:checkKotlinGradlePluginConfigurationErrors SKIPPED
+                   > Task :app:checkDebugUnitTestBuild
+                   > Task :app:testDebugUnitTest
+                   BUILD SUCCESSFUL in 3s
+              ● Read(app/src/main/java/dev/herdr/android/ui/terminal/StructuredTerminalReader.kt)
+                ⎿  Read 800 lines (ctrl+o to collapse)
+              ● Read(app/src/main/java/dev/herdr/android/ui/workbench/AgentWorkbenchPane.kt)
+                ⎿  Read 836 lines (ctrl+o to collapse)
+
+              全部审查与修复验证完毕，展开态输出与正式回复边界均准确识别。
+
+            ────────────────────────────────────────────────────────────────────────────────
+            >
+            ────────────────────────────────────────────────────────────────────────────────
+              Gemini 3.1 Pro (High) · 58k tokens · ? for help
+        """.trimIndent()
+
+        assertFalse(realPlainCtrlO.contains('\u001B'))
+        val blocks = StructuredTerminalReader.parseBlocks(realPlainCtrlO, agentApp = "antigravity")
+
+        // 1. Orphan top-of-scrollback diff rows + "… and 3 more lines" are folded into a collapsed orphan ToolGroupBlock
+        val firstBlock = blocks.first()
+        assertTrue("Expected orphan diff rows to form ToolGroupBlock, got $firstBlock", firstBlock is TerminalSemanticBlock.ToolGroupBlock)
+        assertFalse((firstBlock as TerminalSemanticBlock.ToolGroupBlock).defaultExpanded)
+
+        // 2. Prompt block merges "[📎 ...]" badge and does NOT contain expanded attachment child row "⎿  [Image #1]"
+        val prompts = blocks.filterIsInstance<TerminalSemanticBlock.UserPromptBlock>()
+        assertEquals(1, prompts.size)
+        assertEquals(
+            "再次审查一下展开后的文本结构解析和识别有没有按预期运行\n[📎 uploaded_media_1794314898086.jpg]",
+            prompts.single().text
+        )
+
+        // 3. Interim 2-space assistant message AND final assistant response are both preserved as AgentProseBlocks!
+        val proseTexts = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>().map { it.text }
+        assertEquals(
+            listOf(
+                "Switches render correctly, now verifying the reader parser blocks.",
+                "全部审查与修复验证完毕，展开态输出与正式回复边界均准确识别。"
+            ),
+            proseTexts
+        )
+
+        // 4. Latest turn has 2 tool groups (before & after interim prose), both auto-expanded (defaultExpanded = true),
+        //    first group preserves all >10 lines of gfxinfo output, second group deduplicates 2 summary lines vs 3 detail calls -> 3 steps!
+        val turnToolGroups = blocks.drop(2).filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(2, turnToolGroups.size)
+        assertTrue(turnToolGroups[0].defaultExpanded)
+        assertTrue(turnToolGroups[0].steps.any { it.contains("99th percentile: 11.40ms") })
+        assertTrue(turnToolGroups[0].steps.any { it.contains("Number Slow UI thread: 1") })
+
+        assertTrue(turnToolGroups[1].defaultExpanded)
+        assertTrue("Expected deduplicated count of 3 rather than 5, got: ${turnToolGroups[1].summaryLabel}", turnToolGroups[1].summaryLabel.contains("3"))
+        assertTrue(turnToolGroups[1].steps.any { it.contains("gradle.bat :app:testDebugUnitTest)") })
+        assertTrue(turnToolGroups[1].steps.any { it.contains("BUILD SUCCESSFUL in 3s") })
+    }
+
+    @Test
+    fun codexCompactMode_boldBulletHeadingIsNeverSwallowedAsReasoningCell() {
+        val compactCodexScreen = """
+            › 总结一下修复重点
+
+            • Explored 2 files, ran 1 command
+
+            • **核心修复结论**
+
+              1. 修复了 ConPTY 下 Ctrl+T 控制字节透传。
+              2. 修复了阅读视图长列表重组卡顿。
+
+            › Summarize recent commits                                        gpt-5.4 xhigh · 88% left
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(compactCodexScreen, agentApp = "codex")
+        val tools = blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(1, tools.size)
+        assertTrue(tools.single().steps.none { it.contains("核心修复结论") })
+
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertTrue(prose.any { it.isHeading && it.text.contains("核心修复结论") })
+        assertTrue(prose.any { it.isBullet && it.text.contains("修复了 ConPTY") })
+    }
+
+    @Test
+    fun largeExpandedSnapshot_parsesViaLexicalDispatchTreeInSingleDigitMilliseconds() {
+        val sb = StringBuilder(180_000)
+        repeat(35) { turn ->
+            sb.appendLine("> 第 ${turn + 1} 轮：请检查文本解析检索树性能并输出完整展开工具结果与表格说明")
+            sb.appendLine("  ▾ Thought for 8s (ctrl+o to collapse)")
+            sb.appendLine("  I need to inspect the lexical dispatch tree and verify that long prose lines do not trigger regex backtracking across the 1500-line scrollback buffer.")
+            sb.appendLine("  Let me run the benchmark command and edit the hot path.")
+            sb.appendLine()
+            sb.appendLine("  ● Ran 1 command, edited 1 file (ctrl+o to collapse)")
+            sb.appendLine("  ● Bash(gradle :app:testDebugUnitTest --info --rerun-tasks)")
+            sb.appendLine("    ⎿")
+            sb.appendLine()
+            sb.appendLine("       Command output:")
+            repeat(18) { lineNo ->
+                sb.appendLine("       [worker-$lineNo] Executing lexical dispatch verification pass #$lineNo with long path D:/luoyu/Documents/Code/HerdrAndroid/app/src/main/java/dev/herdr/android/ui/terminal/StructuredTerminalReader.kt:$lineNo")
+            }
+            sb.appendLine("  ● Edit(app/src/main/java/dev/herdr/android/ui/terminal/StructuredTerminalReader.kt)")
+            sb.appendLine("    ⎿  Modified 4 lines")
+            sb.appendLine("      1024    val c0 = firstChars[i]")
+            sb.appendLine("      1025 -  if (slowRegex.containsMatchIn(line)) return true")
+            sb.appendLine("      1025 +  if (c0 == '●' && AntigravityTranscriptSpec.isActionRow(line, ind)) return true")
+            sb.appendLine("             … and 6 more lines")
+            sb.appendLine()
+            sb.appendLine("  ### 第 ${turn + 1} 轮验证结论")
+            sb.appendLine("  已完成首字符词法分派树（Lexical Dispatch Tree）与动词哈希表重构，消除了每行 50+ 次线性正则回溯扫描。")
+            sb.appendLine("  1. 普通中英文正文行实现零正则引擎调用，直接进入段落折行拼接。")
+            sb.appendLine("  2. 表格与 Diff 通过预分词元数据（boxPipeCount / hasBoxCorner / firstChar）O(1) 判定。")
+            sb.appendLine()
+            sb.appendLine("  阶段 │ 复杂度 │ 说明")
+            sb.appendLine("  ─────┼────────┼────────────────────")
+            sb.appendLine("  旧版 │ O(N*L²)│ 含 .* 回溯正则级联")
+            sb.appendLine("  新版 │ O(N)   │ 首字符分派 + HashSet")
+            sb.appendLine()
+        }
+        sb.appendLine("────────────────────────────────────────────────────────────────────────────────")
+        sb.appendLine("> ")
+        sb.appendLine("────────────────────────────────────────────────────────────────────────────────")
+        sb.appendLine("  Gemini 3.1 Pro (High) · 84k tokens · ? for help")
+
+        val largeScreen = sb.toString()
+        val lineCount = largeScreen.count { it == '\n' }
+        assertTrue("Expected >= 1400 lines, got $lineCount", lineCount >= 1400)
+
+        val summary = TerminalSummary(
+            address = "t1q",
+            name = "HerdrAndroid",
+            state = "live",
+            cols = 120,
+            rows = 40,
+            turn = 152,
+            agentStatus = AgentStateWord.DONE,
+            agentApp = "antigravity",
+            agentMessage = "已完成首字符词法分派树重构"
+        )
+
+        // Warmup JIT
+        repeat(8) {
+            StructuredTerminalReader.analyzeWorkbench(largeScreen, summary)
+        }
+
+        val iterations = 20
+        val startNs = System.nanoTime()
+        var snapshot: WorkbenchSnapshot? = null
+        repeat(iterations) {
+            snapshot = StructuredTerminalReader.analyzeWorkbench(largeScreen, summary)
+        }
+        val avgMs = (System.nanoTime() - startNs) / 1_000_000.0 / iterations
+
+        val result = snapshot!!
+        assertTrue(result.isExpandedMode)
+        assertEquals(35, result.blocks.count { it is TerminalSemanticBlock.UserPromptBlock })
+        assertEquals(35, result.blocks.count { it is TerminalSemanticBlock.ToolGroupBlock })
+        assertEquals(35, result.blocks.count { it is TerminalSemanticBlock.CodeOrTableBlock && it.kindLabel == "表格" })
+        val lastTool = result.blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>().last()
+        assertTrue(lastTool.defaultExpanded)
+        assertTrue(
+            "Expected 1400+ line snapshot to parse in < 25ms avg on JVM, actual avg=${"%.2f".format(avgMs)}ms",
+            avgMs < 25.0
+        )
+
+        // Fast-path headline check when hc provides agentMessage and state is DONE
+        val hlStartNs = System.nanoTime()
+        repeat(100) {
+            StructuredTerminalReader.extractLatestHeadline(largeScreen, summary)
+        }
+        val hlAvgUs = (System.nanoTime() - hlStartNs) / 1_000.0 / 100
+        println("[PERF] lines=$lineCount analyzeWorkbenchAvgMs=${"%.2f".format(avgMs)}ms headlineFastPathAvgUs=${"%.2f".format(hlAvgUs)}us")
+        assertTrue(
+            "Expected non-urgent extractLatestHeadline fast-path < 100us, actual=${"%.2f".format(hlAvgUs)}us",
+            hlAvgUs < 100.0
+        )
+    }
 }

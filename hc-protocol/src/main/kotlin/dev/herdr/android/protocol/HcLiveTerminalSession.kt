@@ -32,7 +32,11 @@ internal class HcLiveTerminalSession(
     private val operation = Mutex()
     private val snapshotOperation = Mutex()
     private val gridRevision = AtomicLong()
+    private val outputEpoch = AtomicLong(1L)
     private var historyPrefix: List<String> = emptyList() // protected by snapshotOperation
+    private var lastReadWasStitched: Boolean = false // protected by snapshotOperation
+    private var lastStitchedEpoch: Long = -1L // protected by snapshotOperation
+    private var quickRefreshJob: Job? = null
     private var stream = initialStream
     private var pump: Job? = null
     private var streamEpoch = 0L
@@ -77,9 +81,13 @@ internal class HcLiveTerminalSession(
                     val frame = current.receive() ?: break
                     if (epoch != streamEpoch) return@launch
                     when (frame.kind) {
-                        HcFrameKind.DATA -> _outputFrames.emit(frame.payload.copyOf())
+                        HcFrameKind.DATA -> {
+                            outputEpoch.incrementAndGet()
+                            _outputFrames.emit(frame.payload.copyOf())
+                        }
                         HcFrameKind.RESIZE -> {
                             gridRevision.incrementAndGet()
+                            outputEpoch.incrementAndGet()
                             _dimensions.value = HcFrameCodec.dimensions(frame)
                         }
                         HcFrameKind.CLOSE -> break
@@ -100,10 +108,18 @@ internal class HcLiveTerminalSession(
 
     private suspend fun refreshSnapshot() = snapshotOperation.withLock {
         val revision = gridRevision.get()
+        val seenEpoch = outputEpoch.get()
         // Check the current status on every refresh, including Observe and post-resize reads.
         // History reads may actively scroll a full-screen app, so a blocked dialog gets lines=0.
+        // Likewise, when a full-screen TUI (how="stitched", e.g. Codex) is idle/done with zero new
+        // stream bytes since the last stitched read, reuse cached historyPrefix + screenOnly (lines=0)
+        // to avoid active scroll-stitching every second.
         val terminal = client.getTerminal(address)
-        val lines = if (terminal.agentStatus == AgentStateWord.BLOCKED) 0 else HISTORY_LINES
+        val isQuietIdleStitched = lastReadWasStitched &&
+            historyPrefix.isNotEmpty() &&
+            seenEpoch == lastStitchedEpoch &&
+            (terminal.agentStatus == AgentStateWord.IDLE || terminal.agentStatus == AgentStateWord.DONE)
+        val lines = if (terminal.agentStatus == AgentStateWord.BLOCKED || isQuietIdleStitched) 0 else HISTORY_LINES
         val read = client.readTerminalSnapshot(address, lines)
         if (gridRevision.get() != revision || !_isAttached.value) return@withLock
         _dimensions.value = terminal.cols to terminal.rows
@@ -115,7 +131,20 @@ internal class HcLiveTerminalSession(
             // blocked must not retain an old screen or repeatedly append duplicate history.
             val rows = if (read.text.isEmpty()) emptyList() else read.text.trimEnd('\n').split('\n')
             historyPrefix = rows.dropLast(minOf(terminal.rows, rows.size)).takeLast(HISTORY_LINES)
+            lastReadWasStitched = read.how == "stitched"
+            if (lastReadWasStitched) {
+                lastStitchedEpoch = seenEpoch
+            }
             _screenSnapshot.value = read.text
+        }
+    }
+
+    private fun scheduleQuickRefresh() {
+        outputEpoch.incrementAndGet()
+        quickRefreshJob?.cancel()
+        quickRefreshJob = scope.launch {
+            delay(180)
+            readOrNull { refreshSnapshot() }
         }
     }
 
@@ -139,6 +168,7 @@ internal class HcLiveTerminalSession(
 
     override suspend fun sendRawInput(bytes: ByteArray): Result<Unit> = inputOperation {
         stream.sendRaw(bytes)
+        scheduleQuickRefresh()
     }
 
     override suspend fun sendLine(text: String): Result<Unit> = inputOperation {
@@ -154,10 +184,24 @@ internal class HcLiveTerminalSession(
             // Never force an unseen/new dialog or retry after an ambiguous input result.
             client.sendTerminal(address, text, force = false)
         }
+        scheduleQuickRefresh()
     }
 
     override suspend fun sendSpecialKey(keyName: String): Result<Unit> = inputOperation {
-        client.pressKeys(address, listOf(keyName))
+        // Send standard control & navigation keys directly as raw PTY stream DATA bytes rather than
+        // `terminal.keys` RPC:
+        // 1. On Windows ConPTY + Crossterm (e.g. Codex TUI), `terminal.keys` Kitty CSI-u sequences
+        //    such as `\x1b[116;5u` (`ctrl+t`) get mangled into literal `'t'` in the input composer,
+        //    whereas raw control byte `0x14` (`^T`) / `0x0F` (`^O`) works identically across ConPTY & Unix PTY.
+        // 2. Stream DATA bypasses `terminal.keys`'s RPC quiet gate so `Ctrl+O` / `Ctrl+T` / `Ctrl+C` / `ESC`
+        //    take effect immediately even while an agent is actively streaming output.
+        val rawBytes = encodeRawSpecialKey(keyName)
+        if (rawBytes != null) {
+            stream.sendRaw(rawBytes)
+        } else {
+            client.pressKeys(address, listOf(keyName))
+        }
+        scheduleQuickRefresh()
     }
 
     override suspend fun interrupt(): Result<Unit> = inputOperation { client.interrupt(address) }
@@ -218,5 +262,31 @@ internal class HcLiveTerminalSession(
         }
     }
 
-    private companion object { const val HISTORY_LINES = 260 }
+    private companion object {
+        const val HISTORY_LINES = 260
+
+        fun encodeRawSpecialKey(keyName: String): ByteArray? {
+            val normalized = keyName.trim().lowercase()
+            require(normalized.isNotEmpty()) { "Key name must not be empty" }
+            if (normalized.startsWith("ctrl+") && normalized.length == 6) {
+                val ch = normalized[5]
+                if (ch in 'a'..'z') {
+                    return byteArrayOf((ch - 'a' + 1).toByte())
+                }
+            }
+            return when (normalized) {
+                "enter", "return" -> byteArrayOf(13)
+                "esc", "escape" -> byteArrayOf(27)
+                "tab" -> byteArrayOf(9)
+                "shift+tab", "backtab" -> "\u001B[Z".toByteArray(Charsets.US_ASCII)
+                "backspace" -> byteArrayOf(127)
+                "space" -> byteArrayOf(32)
+                "up" -> "\u001B[A".toByteArray(Charsets.US_ASCII)
+                "down" -> "\u001B[B".toByteArray(Charsets.US_ASCII)
+                "right" -> "\u001B[C".toByteArray(Charsets.US_ASCII)
+                "left" -> "\u001B[D".toByteArray(Charsets.US_ASCII)
+                else -> null
+            }
+        }
+    }
 }

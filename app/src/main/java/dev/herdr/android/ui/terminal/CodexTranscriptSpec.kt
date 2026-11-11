@@ -92,7 +92,7 @@ internal object CodexTranscriptSpec {
         "^(?:" +
             "•\\s+(?:" +
             "Exited\\s*\\(status\\s+\\d+\\)|" +
-            "Explored(?:\\s*·\\s*\\d+\\s+nonzero\\s+exits?)?$|Exploring$|" +
+            "Explored\\b|Exploring\\b|" +
             "Background output\\s+|" +
             "Interacted with\\s+`|" +
             "Waited for\\s+(?:`|background terminal\\b)|" +
@@ -180,15 +180,62 @@ internal object CodexTranscriptSpec {
     /** `pager_overlay.rs:108`: Empty viewport row marker (`~` at column 0 below transcript end). */
     val transcriptOverlayTildeRowRegex = Regex("^~\\s*$")
 
+    private val singleWordActivityVerbs: HashSet<String> = hashSetOf(
+        "Ran", "Run", "Running", "Edited", "Editing", "Added", "Adding", "Deleted", "Deleting",
+        "Moved", "Moving", "Renamed", "Renaming", "Read", "Reading", "Wrote", "Writing",
+        "Created", "Creating", "Patched", "Patching", "Applied", "Applying", "Called", "Calling",
+        "Executed", "Executing", "Fetched", "Fetching", "Thinking", "Thought", "Inspected",
+        "Explored", "Exploring"
+    )
+
+    fun isActivityHead(line: String): Boolean {
+        if (line.length < 3) return false
+        return when (line[0]) {
+            '•' -> {
+                if (line[1] != ' ') return false
+                var pos = 2
+                while (pos < line.length && line[pos] == ' ') pos++
+                val wordStart = pos
+                while (pos < line.length && line[pos].isLetter()) pos++
+                if (pos == wordStart) return false
+                val firstWord = line.substring(wordStart, pos)
+                if ((pos == line.length || !line[pos].isLetterOrDigit()) && firstWord in singleWordActivityVerbs) {
+                    return true
+                }
+                activityHeadRegex.matches(line)
+            }
+            '✘', '✗', '↳' -> activityHeadRegex.matches(line)
+            else -> false
+        }
+    }
+
     /** `pager_overlay/transcript.rs:110-135`: Bottom pager status / key-hint rows in `Ctrl+T` overlay. */
     val transcriptOverlayFooterRegex = Regex(
         "(?i)^\\s*(?:" +
-            ".*(?:\\bq\\s+or\\s+esc\\b|\\besc\\s+close\\b|\\bctrl\\+t\\s+(?:to\\s+)?(?:close|back)\\b|" +
-            "\\bpgup/pgdn\\b|\\bhome/end\\b|\\b/\\s+find\\b|\\bn/N\\s+next\\b).*|" +
             "Line\\s+\\d+(?:[–-]\\d+)?\\s+of\\s+\\d+.*|" +
             "Viewing\\s+transcript\\b.*" +
             ")$"
     )
+
+    fun isTranscriptOverlayFooter(trimmed: String): Boolean {
+        if (trimmed.isEmpty()) return false
+        val c0 = trimmed[0]
+        if ((c0 == 'L' || c0 == 'l' || c0 == 'V' || c0 == 'v') && transcriptOverlayFooterRegex.matches(trimmed)) {
+            return true
+        }
+        if ("q or Esc" in trimmed || "q or esc" in trimmed ||
+            "Esc close" in trimmed || "esc close" in trimmed ||
+            "ctrl+t close" in trimmed || "Ctrl+T close" in trimmed ||
+            "ctrl+t to close" in trimmed || "Ctrl+T to close" in trimmed ||
+            "ctrl+t back" in trimmed || "Ctrl+T back" in trimmed ||
+            "PgUp/PgDn" in trimmed || "pgup/pgdn" in trimmed ||
+            "Home/End" in trimmed || "home/end" in trimmed ||
+            ("/ find" in trimmed && "next" in trimmed)
+        ) {
+            return true
+        }
+        return false
+    }
 
     /**
      * `exec_cell/render.rs:383`: `EXEC_DISPLAY_LAYOUT` prefixes wrapped/multi-line commands
@@ -286,6 +333,8 @@ internal object CodexTranscriptSpec {
     )
     private val proseSentenceEndRegex = Regex("(?:[a-z]{2,}[.!?]|[\u4E00-\u9FFF][。！？])\\s*$")
     private val alignedMetricLineRegex = Regex("^[A-Za-z_][A-Za-z0-9_.-]{1,24}\\s{2,}\\S+.*$")
+    private val proseStructPrefixRegex = Regex("^(?:#{1,6}\\s|[•\\-*·◦▪‣☐☑⚠■ⓘ✔✗✘↳└├]\\s|\\d{1,2}[.)、]\\s|>\\s*)")
+    private val approxMetricRowRegex = Regex("^[A-Za-z_][A-Za-z0-9_.-]{1,20}\\s+[≈~]?\\d+.*$")
 
     /**
      * `markdown_render.rs:4927, 5378`:
@@ -298,10 +347,17 @@ internal object CodexTranscriptSpec {
     fun detectUnfencedCodeBlockEnd(lines: List<String>, startIdx: Int, wrapThreshold: Int): Int? {
         if (startIdx > 0 && lines[startIdx - 1].isNotBlank()) return null
         val first = lines[startIdx]
-        val firstTrim = first.trim()
-        if (firstTrim.isEmpty()) return null
-        if (first.startsWith("• ") || first.startsWith("› ")) return null
+        val firstNonSpace = first.indexOfFirst { it != ' ' }
+        if (firstNonSpace < 2) return null
+        val c0 = first[firstNonSpace]
+        // Fast O(1) rejection for CJK prose, bullets, headings, quotes, alerts, rules, and pipe callouts
+        if (c0.code in 0x2E80..0x9FFF || c0.code in 0xFF00..0xFFEF ||
+            c0 in "#*>-•◦▪‣☐☑⚠■ⓘ✔✗✘↳└├│━─（(" || c0 in '0'..'9'
+        ) {
+            return null
+        }
 
+        val firstTrim = first.substring(firstNonSpace).trimEnd()
         var j = startIdx
         var codeLikeCount = 0
         var cliLikeCount = 0
@@ -317,7 +373,7 @@ internal object CodexTranscriptSpec {
             val ind = l.takeWhile { it == ' ' }.length
             if (ind < 2) break
             // Prose bullets, headings, blockquotes, alerts, separators, or table rules are not unfenced code blocks
-            if (Regex("^(?:#{1,6}\\s|[•\\-*·◦▪‣☐☑⚠■ⓘ✔✗✘↳└├]\\s|\\d{1,2}[.)、]\\s|>\\s*)").containsMatchIn(t)) return null
+            if (proseStructPrefixRegex.containsMatchIn(t)) return null
             if (gridTableRuleRegex.matches(l) || finalSeparatorRegex.matches(l) || markdownEmDashRuleRegex.matches(l)) return null
             if (approvalOverlayTitleRegex.matches(l) || requestUserInputOverlayRegex.matches(l)) return null
 
@@ -335,7 +391,7 @@ internal object CodexTranscriptSpec {
             if (cliCommandLineRegex.matches(t) && !proseSentenceEndRegex.containsMatchIn(t)) {
                 cliLikeCount++
             }
-            if (alignedMetricLineRegex.matches(t) || (totalNonBlank >= 2 && Regex("^[A-Za-z_][A-Za-z0-9_.-]{1,20}\\s+[≈~]?\\d+.*$").matches(t))) {
+            if (alignedMetricLineRegex.matches(t) || (totalNonBlank >= 2 && approxMetricRowRegex.matches(t))) {
                 metricLikeCount++
             }
             j++

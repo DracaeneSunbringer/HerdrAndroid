@@ -1,13 +1,17 @@
 package dev.herdr.android.ui.workbench
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -19,6 +23,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -37,14 +45,17 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -58,6 +69,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -83,12 +96,27 @@ import dev.herdr.android.ui.terminal.AnsiTerminalParser
 import dev.herdr.android.ui.terminal.QuickReplyAction
 import dev.herdr.android.ui.terminal.StructuredTerminalReader
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
+import dev.herdr.android.ui.terminal.WorkbenchSnapshot
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrType
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val hcWrapperRegex = Regex("^<hc\\b[^>]*?(?:from=\"([^\"]*)\")?[^>]*>([\\s\\S]*?)(?:</hc>)?\\s*$")
+private val whitespaceRegex = Regex("\\s+")
+private val orderedBulletPrefixRegex = Regex("^(\\d{1,2}[.)、]|[（(]\\d{1,2}[)）])\\s*")
+
+private fun LazyListState.distanceFromBottomPx(): Int {
+    val info = layoutInfo
+    val total = info.totalItemsCount
+    if (total == 0) return 0
+    val lastVisible = info.visibleItemsInfo.lastOrNull() ?: return 0
+    if (lastVisible.index < total - 1) return 1_000
+    val viewportEnd = info.viewportEndOffset - info.afterContentPadding
+    return (lastVisible.offset + lastVisible.size - viewportEnd).coerceAtLeast(0)
+}
 
 /** Splits `<hc from="t1q">body</hc>` into ("t1q", "body"); plain prompts return (null, text). */
 private fun splitHcPrompt(text: String): Pair<String?, String> {
@@ -162,19 +190,36 @@ fun AgentWorkbenchPane(
     val isMobilePtyLocked = curCols in 1..88
     val desktopOrigDims = savedDesktopDims[summary.address]
 
-    val blocks = remember(rawScreen, summary.agentApp) {
-        StructuredTerminalReader.parseBlocks(rawScreen, summary.agentApp)
+    var snapshot by remember(session.address) {
+        mutableStateOf(
+            WorkbenchSnapshot(
+                blocks = emptyList(),
+                quickActions = emptyList(),
+                liveStatus = summary.agentStatus,
+                isExpandedMode = false
+            )
+        )
     }
-    val quickActions = remember(rawScreen, summary) { StructuredTerminalReader.extractQuickActions(rawScreen, summary) }
+    var hasInitialSnapshot by remember(session.address) { mutableStateOf(false) }
+    LaunchedEffect(session.address, rawScreen, summary) {
+        val computed = withContext(Dispatchers.Default) {
+            StructuredTerminalReader.analyzeWorkbench(rawScreen, summary)
+        }
+        snapshot = computed
+        hasInitialSnapshot = true
+    }
+
+    val blocks = snapshot.blocks
+    val quickActions = snapshot.quickActions
 
     val shouldShowPendingReceipt = remember(dispatchedReceipt, blocks, summary.turn) {
         val receipt = dispatchedReceipt ?: return@remember false
         if (summary.turn > receipt.sentAtTurn) return@remember false
-        val normReceipt = receipt.text.trim().replace(Regex("\\s+"), "")
+        val normReceipt = receipt.text.trim().replace(whitespaceRegex, "")
         if (normReceipt.isEmpty()) return@remember false
         val alreadyEchoedInBlocks = blocks.takeLast(8).any { b ->
             if (b is TerminalSemanticBlock.UserPromptBlock) {
-                val body = splitHcPrompt(b.text).second.trim().replace(Regex("\\s+"), "")
+                val body = splitHcPrompt(b.text).second.trim().replace(whitespaceRegex, "")
                 body == normReceipt ||
                     (normReceipt.length >= 4 && (body.contains(normReceipt) || normReceipt.contains(body)))
             } else {
@@ -186,12 +231,12 @@ fun AgentWorkbenchPane(
         !alreadyEchoedInBlocks && !tailRunningGroup
     }
 
-    val effectiveStatus = remember(rawScreen, summary, blocks, shouldShowPendingReceipt) {
-        if (shouldShowPendingReceipt) {
-            AgentStateWord.WORKING
-        } else {
-            StructuredTerminalReader.resolveLiveStatus(rawScreen, summary, blocks)
-        }
+    val effectiveStatus = if (shouldShowPendingReceipt) {
+        AgentStateWord.WORKING
+    } else if (hasInitialSnapshot) {
+        snapshot.liveStatus
+    } else {
+        summary.agentStatus
     }
 
     val switchList = remember(allLiveTerminals, acknowledgedDoneTurns, summary.address) {
@@ -214,20 +259,40 @@ fun AgentWorkbenchPane(
     }
 
     val activePreset = HerdrColors.currentPalette.preset
-    val styledScreen = remember(rawScreen, activePreset, readerMode) {
-        if (readerMode) AnnotatedString("") else AnsiTerminalParser.parseToAnnotatedString(rawScreen, mobileReflow = false)
+    var styledScreen by remember(session.address) { mutableStateOf(AnnotatedString("")) }
+    LaunchedEffect(session.address, rawScreen, activePreset, readerMode) {
+        if (!readerMode) {
+            styledScreen = withContext(Dispatchers.Default) {
+                AnsiTerminalParser.parseToAnnotatedString(rawScreen, mobileReflow = false)
+            }
+        }
     }
 
-    val readerScroll = rememberScrollState()
+    val readerListState = rememberLazyListState()
     val rawVScroll = rememberScrollState()
     val rawHScroll = rememberScrollState()
     var followBottom by remember(session.address) { mutableStateOf(true) }
     var isProgrammaticScroll by remember(session.address) { mutableStateOf(false) }
     var lastProgrammaticTarget by remember(session.address) { mutableIntStateOf(0) }
-    val activeVScroll = if (readerMode) readerScroll else rawVScroll
 
-    LaunchedEffect(activeVScroll) {
-        snapshotFlow { Triple(activeVScroll.value, activeVScroll.maxValue, activeVScroll.isScrollInProgress) }
+    val hasCwdHeader = summary.cwd.isNotBlank()
+    val hasPendingReceiptItem = shouldShowPendingReceipt && dispatchedReceipt != null
+    val readerAnchorIndex = (if (hasCwdHeader) 1 else 0) +
+        (if (blocks.isEmpty()) 1 else blocks.size) +
+        (if (hasPendingReceiptItem) 1 else 0)
+
+    LaunchedEffect(readerListState) {
+        snapshotFlow { Pair(readerListState.distanceFromBottomPx(), readerListState.isScrollInProgress) }
+            .collect { (distPx, inProgress) ->
+                if (isProgrammaticScroll) return@collect
+                if (inProgress) {
+                    followBottom = distPx <= 28
+                }
+            }
+    }
+
+    LaunchedEffect(rawVScroll) {
+        snapshotFlow { Triple(rawVScroll.value, rawVScroll.maxValue, rawVScroll.isScrollInProgress) }
             .collect { (value, maxValue, inProgress) ->
                 if (maxValue <= 0 || isProgrammaticScroll) return@collect
                 val distFromBottom = (maxValue - value).coerceAtLeast(0)
@@ -240,20 +305,50 @@ fun AgentWorkbenchPane(
             }
     }
 
-    LaunchedEffect(rawScreen, readerMode, activeVScroll.maxValue, dispatchedReceipt?.timestampMs) {
-        val max = activeVScroll.maxValue
-        if (max <= 0) return@LaunchedEffect
-        if (followBottom && !activeVScroll.isScrollInProgress) {
+    LaunchedEffect(snapshot, hasInitialSnapshot, readerMode, readerAnchorIndex, dispatchedReceipt?.timestampMs) {
+        if (!readerMode || !hasInitialSnapshot || readerAnchorIndex < 0) return@LaunchedEffect
+        if (followBottom && !readerListState.isScrollInProgress) {
             isProgrammaticScroll = true
             try {
-                activeVScroll.scrollTo(max)
-                lastProgrammaticTarget = activeVScroll.value
+                readerListState.scrollToItem(readerAnchorIndex)
             } finally {
                 isProgrammaticScroll = false
             }
         }
     }
-    val isScrolledUp = !followBottom && activeVScroll.maxValue > 32 && (activeVScroll.maxValue - activeVScroll.value) > 32
+
+    LaunchedEffect(styledScreen, readerMode, rawVScroll.maxValue, dispatchedReceipt?.timestampMs) {
+        if (readerMode) return@LaunchedEffect
+        val max = rawVScroll.maxValue
+        if (max <= 0) return@LaunchedEffect
+        if (followBottom && !rawVScroll.isScrollInProgress) {
+            isProgrammaticScroll = true
+            try {
+                rawVScroll.scrollTo(max)
+                lastProgrammaticTarget = rawVScroll.value
+            } finally {
+                isProgrammaticScroll = false
+            }
+        }
+    }
+
+    val isScrolledUp by remember(readerMode) {
+        derivedStateOf {
+            if (followBottom) {
+                false
+            } else if (readerMode) {
+                readerListState.distanceFromBottomPx() > 32
+            } else {
+                rawVScroll.maxValue > 32 && (rawVScroll.maxValue - rawVScroll.value) > 32
+            }
+        }
+    }
+    val canRawScrollHorizontally by remember {
+        derivedStateOf { rawHScroll.maxValue > 4 }
+    }
+    val showRightHint by remember {
+        derivedStateOf { rawHScroll.maxValue > 28 && (rawHScroll.maxValue - rawHScroll.value) > 20 }
+    }
 
     fun dispatch(action: QuickReplyAction) {
         followBottom = true
@@ -261,17 +356,6 @@ fun AgentWorkbenchPane(
             if (action.payload == "ctrl+c") onInterrupt() else onSendSpecialKey(action.payload)
         } else {
             onSendLine(action.payload, false)
-        }
-    }
-
-    fun submitDraft() {
-        followBottom = true
-        if (draftText.isNotBlank()) {
-            val toSend = draftText
-            onUpdateDraft("")
-            onSendLine(toSend, false)
-        } else {
-            onSendSpecialKey("enter")
         }
     }
 
@@ -400,35 +484,45 @@ fun AgentWorkbenchPane(
         // ---------------- Content ----------------
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             if (readerMode) {
-                SelectionContainer {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(readerScroll)
-                            .padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        if (summary.cwd.isNotBlank()) {
+                LazyColumn(
+                    state = readerListState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    if (hasCwdHeader) {
+                        item(key = "cwd", contentType = "cwd") {
                             OneLine(summary.cwd, HerdrType.Caption.copy(fontFamily = FontFamily.Monospace), HerdrColors.Dim)
                         }
-                        if (blocks.isEmpty()) {
+                    }
+                    if (blocks.isEmpty()) {
+                        item(key = "empty", contentType = "empty") {
                             Text(
                                 summary.agentMessage?.takeIf { it.isNotBlank() } ?: "正在同步画面…",
                                 style = HerdrType.Body,
                                 color = HerdrColors.Muted
                             )
-                        } else {
-                            blocks.forEachIndexed { idx, block ->
-                                ReaderBlock(
-                                    block = block,
-                                    stateKey = "${session.address}#$idx",
-                                    onCopy = { clipboard.setText(AnnotatedString(it)) }
-                                )
-                            }
                         }
-                        if (shouldShowPendingReceipt && dispatchedReceipt != null) {
+                    } else {
+                        itemsIndexed(
+                            items = blocks,
+                            key = { idx, _ -> "${session.address}#$idx" },
+                            contentType = { _, block -> block::class }
+                        ) { idx, block ->
+                            ReaderBlock(
+                                block = block,
+                                stateKey = "${session.address}#$idx",
+                                onCopy = { clipboard.setText(AnnotatedString(it)) }
+                            )
+                        }
+                    }
+                    if (hasPendingReceiptItem && dispatchedReceipt != null) {
+                        item(key = "pending_receipt", contentType = "receipt") {
                             SentBubble(dispatchedReceipt.text)
                         }
+                    }
+                    item(key = "bottom_anchor", contentType = "anchor") {
+                        Spacer(Modifier.height(1.dp))
                     }
                 }
             } else {
@@ -440,7 +534,7 @@ fun AgentWorkbenchPane(
                         Modifier.fillMaxSize().verticalScroll(rawVScroll).padding(horizontal = 12.dp, vertical = 10.dp)
                     } else {
                         Modifier.fillMaxSize().verticalScroll(rawVScroll)
-                            .horizontalScroll(rawHScroll, enabled = rawHScroll.maxValue > 4)
+                            .horizontalScroll(rawHScroll, enabled = canRawScrollHorizontally)
                             .padding(horizontal = 12.dp, vertical = 10.dp)
                     }
                     Box(modifier = scrollMod) {
@@ -455,7 +549,7 @@ fun AgentWorkbenchPane(
                         }
                     }
                 }
-                if (!softWrapLines && rawHScroll.maxValue > 28 && (rawHScroll.maxValue - rawHScroll.value) > 20) {
+                if (!softWrapLines && showRightHint) {
                     Row(
                         modifier = Modifier
                             .align(Alignment.TopEnd)
@@ -486,8 +580,17 @@ fun AgentWorkbenchPane(
                             scope.launch {
                                 isProgrammaticScroll = true
                                 try {
-                                    activeVScroll.animateScrollTo(activeVScroll.maxValue)
-                                    lastProgrammaticTarget = activeVScroll.value
+                                    if (readerMode) {
+                                        val firstVisible = readerListState.firstVisibleItemIndex
+                                        if (readerAnchorIndex - firstVisible > 18) {
+                                            readerListState.scrollToItem(readerAnchorIndex)
+                                        } else {
+                                            readerListState.animateScrollToItem(readerAnchorIndex)
+                                        }
+                                    } else {
+                                        rawVScroll.animateScrollTo(rawVScroll.maxValue)
+                                        lastProgrammaticTarget = rawVScroll.value
+                                    }
                                 } finally {
                                     isProgrammaticScroll = false
                                 }
@@ -569,47 +672,99 @@ fun AgentWorkbenchPane(
                 }
             }
 
-            Row(verticalAlignment = Alignment.Bottom) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 46.dp)
-                        .clip(RoundedCornerShape(23.dp))
-                        .background(HerdrColors.Raised)
-                        .padding(horizontal = 18.dp, vertical = 12.dp),
-                    contentAlignment = Alignment.CenterStart
-                ) {
-                    if (draftText.isEmpty()) {
-                        val target = summary.address.substringAfterLast('/')
-                        OneLine("给 $target 下达指令", HerdrType.Body.copy(lineHeight = 20.sp), HerdrColors.Dim)
-                    }
-                    BasicTextField(
-                        value = draftText,
-                        onValueChange = onUpdateDraft,
-                        singleLine = true,
-                        textStyle = HerdrType.Body.copy(color = HerdrColors.Foreground, lineHeight = 20.sp),
-                        cursorBrush = SolidColor(HerdrColors.Accent),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(onSend = { submitDraft() }),
-                        modifier = Modifier.fillMaxWidth().focusRequester(inputFocusRequester)
-                    )
+            WorkbenchComposer(
+                sessionAddress = session.address,
+                targetLabel = summary.address.substringAfterLast('/'),
+                initialDraft = draftText,
+                focusRequester = inputFocusRequester,
+                onUpdateDraft = onUpdateDraft,
+                onSubmitLine = { text ->
+                    followBottom = true
+                    onSendLine(text, false)
+                },
+                onSubmitEmpty = {
+                    followBottom = true
+                    onSendSpecialKey("enter")
                 }
-                Spacer(Modifier.width(8.dp))
-                val hasText = draftText.isNotBlank()
-                Box(
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(CircleShape)
-                        .background(if (hasText) HerdrColors.Accent else HerdrColors.Raised)
-                        .clickable { submitDraft() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (hasText) {
-                        Icon(Icons.AutoMirrored.Filled.Send, "发送", tint = HerdrColors.OnAccent, modifier = Modifier.size(20.dp))
-                    } else {
-                        Text("⏎", color = HerdrColors.Muted, fontSize = 18.sp)
-                    }
-                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun WorkbenchComposer(
+    sessionAddress: String,
+    targetLabel: String,
+    initialDraft: String,
+    focusRequester: FocusRequester,
+    onUpdateDraft: (String) -> Unit,
+    onSubmitLine: (String) -> Unit,
+    onSubmitEmpty: () -> Unit
+) {
+    var localDraft by remember(sessionAddress) { mutableStateOf(initialDraft) }
+    val latestDraft by rememberUpdatedState(localDraft)
+    val latestOnUpdateDraft by rememberUpdatedState(onUpdateDraft)
+
+    LaunchedEffect(sessionAddress, localDraft) {
+        delay(250)
+        latestOnUpdateDraft(localDraft)
+    }
+
+    DisposableEffect(sessionAddress) {
+        onDispose {
+            latestOnUpdateDraft(latestDraft)
+        }
+    }
+
+    fun submit() {
+        val trimmedCheck = localDraft
+        if (trimmedCheck.isNotBlank()) {
+            localDraft = ""
+            onUpdateDraft("")
+            onSubmitLine(trimmedCheck)
+        } else {
+            onSubmitEmpty()
+        }
+    }
+
+    Row(verticalAlignment = Alignment.Bottom) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 46.dp)
+                .clip(RoundedCornerShape(23.dp))
+                .background(HerdrColors.Raised)
+                .padding(horizontal = 18.dp, vertical = 12.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            if (localDraft.isEmpty()) {
+                OneLine("给 $targetLabel 下达指令", HerdrType.Body.copy(lineHeight = 20.sp), HerdrColors.Dim)
+            }
+            BasicTextField(
+                value = localDraft,
+                onValueChange = { localDraft = it },
+                singleLine = true,
+                textStyle = HerdrType.Body.copy(color = HerdrColors.Foreground, lineHeight = 20.sp),
+                cursorBrush = SolidColor(HerdrColors.Accent),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { submit() }),
+                modifier = Modifier.fillMaxWidth().focusRequester(focusRequester)
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        val hasText = localDraft.isNotBlank()
+        Box(
+            modifier = Modifier
+                .size(46.dp)
+                .clip(CircleShape)
+                .background(if (hasText) HerdrColors.Accent else HerdrColors.Raised)
+                .clickable { submit() },
+            contentAlignment = Alignment.Center
+        ) {
+            if (hasText) {
+                Icon(Icons.AutoMirrored.Filled.Send, "发送", tint = HerdrColors.OnAccent, modifier = Modifier.size(20.dp))
+            } else {
+                Text("⏎", color = HerdrColors.Muted, fontSize = 18.sp)
             }
         }
     }
@@ -684,6 +839,7 @@ private fun SentBubble(text: String) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: (String) -> Unit) {
     when (block) {
@@ -695,6 +851,12 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
                     modifier = Modifier
                         .clip(RoundedCornerShape(18.dp, 18.dp, 6.dp, 18.dp))
                         .background(HerdrColors.AccentSubtle)
+                        .combinedClickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = {},
+                            onLongClick = { onCopy(body) }
+                        )
                         .padding(horizontal = 14.dp, vertical = 10.dp)
                 ) {
                     if (from != null) {
@@ -706,34 +868,48 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
             }
         }
 
-        is TerminalSemanticBlock.AgentProseBlock -> when {
-            block.isHeading -> Text(
-                block.text,
-                style = HerdrType.Heading,
-                color = HerdrColors.Foreground,
-                modifier = Modifier.padding(top = 6.dp)
+        is TerminalSemanticBlock.AgentProseBlock -> {
+            val copyMod = Modifier.combinedClickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {},
+                onLongClick = { onCopy(block.text) }
             )
-            block.isBullet -> {
-                val ordered = Regex("^(\\d{1,2}[.)、]|[（(]\\d{1,2}[)）])\\s*").find(block.text)
-                val marker = ordered?.value?.trim() ?: "•"
-                val body = if (ordered != null) block.text.substring(ordered.value.length) else block.text
-                Row(modifier = Modifier.fillMaxWidth().padding(start = (block.indentLevel * 16).dp)) {
-                    Box(modifier = Modifier.widthIn(min = 18.dp).padding(end = 6.dp)) {
-                        Text(marker, style = HerdrType.Body, color = HerdrColors.Dim)
+            when {
+                block.isHeading -> Text(
+                    block.text,
+                    style = HerdrType.Heading,
+                    color = HerdrColors.Foreground,
+                    modifier = copyMod.padding(top = 6.dp)
+                )
+                block.isBullet -> {
+                    val (marker, body) = remember(block.text) {
+                        val ordered = orderedBulletPrefixRegex.find(block.text)
+                        val mk = ordered?.value?.trim() ?: "•"
+                        val bd = if (ordered != null) block.text.substring(ordered.value.length) else block.text
+                        mk to bd
                     }
-                    Text(body, style = HerdrType.Body, color = HerdrColors.Foreground, modifier = Modifier.weight(1f))
+                    Row(modifier = copyMod.fillMaxWidth().padding(start = (block.indentLevel * 16).dp)) {
+                        Box(modifier = Modifier.widthIn(min = 18.dp).padding(end = 6.dp)) {
+                            Text(marker, style = HerdrType.Body, color = HerdrColors.Dim)
+                        }
+                        Text(body, style = HerdrType.Body, color = HerdrColors.Foreground, modifier = Modifier.weight(1f))
+                    }
                 }
+                else -> Text(block.text, style = HerdrType.Body, color = HerdrColors.Foreground, modifier = copyMod)
             }
-            else -> Text(block.text, style = HerdrType.Body, color = HerdrColors.Foreground)
         }
 
         is TerminalSemanticBlock.ToolGroupBlock -> {
-            var expanded by remember(stateKey) { mutableStateOf(false) }
+            var expanded by remember(stateKey, block.defaultExpanded) { mutableStateOf(block.defaultExpanded) }
             Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
                     modifier = Modifier
                         .clip(HerdrShapes.Small)
-                        .clickable { expanded = !expanded }
+                        .combinedClickable(
+                            onClick = { expanded = !expanded },
+                            onLongClick = { onCopy(block.steps.joinToString("\n")) }
+                        )
                         .padding(vertical = 4.dp, horizontal = 2.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -755,7 +931,23 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
                 }
                 AnimatedVisibility(visible = expanded) {
                     val railColor = HerdrColors.Border
-                    Column(
+                    val dimColor = HerdrColors.Dim
+                    val mutedColor = HerdrColors.Muted
+                    val joinedSteps = remember(block.steps, dimColor, mutedColor) {
+                        buildAnnotatedString {
+                            block.steps.forEachIndexed { i, line ->
+                                if (i > 0) append('\n')
+                                val start = length
+                                append(line)
+                                addStyle(
+                                    SpanStyle(color = if (line.startsWith(" ")) dimColor else mutedColor),
+                                    start,
+                                    length
+                                )
+                            }
+                        }
+                    }
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(start = 9.dp, top = 6.dp)
@@ -763,17 +955,19 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
                                 drawRect(color = railColor, size = Size(2.dp.toPx(), size.height))
                             }
                             .padding(start = 14.dp)
-                            .horizontalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
-                        block.steps.forEach { line ->
-                            Text(
-                                line,
-                                style = HerdrType.Mono.copy(fontSize = 12.sp),
-                                color = if (line.startsWith(" ")) HerdrColors.Dim else HerdrColors.Muted,
-                                softWrap = false
+                            .horizontalScroll(rememberScrollState())
+                            .combinedClickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                onClick = {},
+                                onLongClick = { onCopy(block.steps.joinToString("\n")) }
                             )
-                        }
+                    ) {
+                        Text(
+                            text = joinedSteps,
+                            style = HerdrType.Mono.copy(fontSize = 12.sp, lineHeight = 18.sp),
+                            softWrap = false
+                        )
                     }
                 }
             }
@@ -823,6 +1017,12 @@ private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: 
                     .fillMaxWidth()
                     .clip(HerdrShapes.Block)
                     .background(tint)
+                    .combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {},
+                        onLongClick = { onCopy(if (block.detail.isNotBlank()) "${block.title}\n${block.detail}" else block.title) }
+                    )
                     .padding(horizontal = 14.dp, vertical = 12.dp)
             ) {
                 Text(block.title, style = HerdrType.Label, color = color, fontWeight = FontWeight.SemiBold)
