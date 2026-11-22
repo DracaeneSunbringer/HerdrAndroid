@@ -12,9 +12,9 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ic_herdr_launcher"
+        android:icon="@mipmap/ic_herdr_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@drawable/ic_herdr_launcher"
+        android:roundIcon="@mipmap/ic_herdr_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.HerdrAndroid"
         android:usesCleartextTraffic="false">

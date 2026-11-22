@@ -299,7 +299,7 @@ class HerdrKeepAliveService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_herdr_launcher)
+            .setSmallIcon(R.drawable.ic_stat_herdr)
             .setContentTitle(status.title)
             .setContentText(status.subtitle)
             .setOngoing(true)

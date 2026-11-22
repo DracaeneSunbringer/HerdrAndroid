@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Obsidian metallic slate base -->
+    <path android:pathData="M0,0H108V108H0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="12"
+                android:startY="8"
+                android:endX="98"
+                android:endY="102">
+                <item android:offset="0.0" android:color="#FF181F29" />
+                <item android:offset="0.48" android:color="#FF0D1117" />
+                <item android:offset="1.0" android:color="#FF05070B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Emerald-teal atmospheric studio backlight focused behind the prompt & horn -->
+    <path android:pathData="M0,0H108V108H0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="42"
+                android:centerY="41"
+                android:gradientRadius="46">
+                <item android:offset="0.0" android:color="#382DD4BF" />
+                <item android:offset="0.46" android:color="#1638BDF8" />
+                <item android:offset="1.0" android:color="#000D1117" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Cool titanium top-left bevel sheen -->
+    <path android:pathData="M0,0H108V108H0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="16"
+                android:startY="12"
+                android:endX="68"
+                android:endY="64">
+                <item android:offset="0.0" android:color="#16F1F5F9" />
+                <item android:offset="0.55" android:color="#0494A3B8" />
+                <item android:offset="1.0" android:color="#000D1117" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Subtle outer perimeter vignette for depth across launcher masks -->
+    <path android:pathData="M0,0H108V108H0Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54"
+                android:centerY="54"
+                android:gradientRadius="56">
+                <item android:offset="0.58" android:color="#0005070B" />
+                <item android:offset="1.0" android:color="#50020306" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Architectural command-deck micro-grid -->
+    <path
+        android:pathData="M24,0L24,108M0,24L108,24M36,0L36,108M0,36L108,36M48,0L48,108M0,48L108,48M60,0L60,108M0,60L108,60M72,0L72,108M0,72L108,72M84,0L84,108M0,84L108,84"
+        android:strokeWidth="0.32"
+        android:strokeColor="#1194A3B8" />
+</vector>
