@@ -150,6 +150,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val dispatchedReceipts by viewModel.dispatchedReceipts.collectAsState()
     val terminalPreviews by viewModel.terminalPreviews.collectAsState()
     val fleetDigests by viewModel.fleetDigests.collectAsState()
+    val stagedAttachmentsByAddress by viewModel.stagedAttachmentsByAddress.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
     val liveTerminals = remember(allTerminals) { allTerminals.filter { it.state == "live" } }
     val context = LocalContext.current
@@ -265,6 +266,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                             activeSession?.address?.let { viewModel.getDraftForTerminal(it) }.orEmpty()
                         },
                         dispatchedReceipt = activeSession?.address?.let { dispatchedReceipts[it] },
+                        stagedAttachments = activeSession?.address?.let { stagedAttachmentsByAddress[it] }.orEmpty(),
                         requestInputFocusSignal = requestInputFocusSignal,
                         appSettings = appSettings,
                         savedDesktopDims = savedDesktopDims,
@@ -274,6 +276,11 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         onUpdateDraft = { text ->
                             activeSession?.address?.let { addr -> viewModel.updateDraftForTerminal(addr, text) }
                         },
+                        onUploadImages = { uris -> viewModel.uploadImagesToActiveTerminal(context, uris) },
+                        onRemoveAttachment = { attachmentId ->
+                            activeSession?.address?.let { addr -> viewModel.removeStagedAttachment(addr, attachmentId) }
+                        },
+                        onSendSubmission = viewModel::sendTerminalSubmission,
                         onTakeoverPtyWidth = viewModel::takeoverPtyWidth,
                         onReleasePtyWidth = viewModel::releasePtyWidth,
                         onSendLine = viewModel::sendTerminalLine,

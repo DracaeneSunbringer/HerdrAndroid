@@ -115,6 +115,19 @@ class HcFramedClient(
         request("terminal.send", terminalParams(address).put("text", text).put("force", force).put("wait", false), 65_000)
     }
 
+    suspend fun putTerminalFile(address: String, fileName: String, data: ByteArray): HcPutResult {
+        val cleanName = fileName.trim().substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[\\u0000-\\u001F<>:\"|?*]"), "_")
+            .ifBlank { "image.png" }
+        require(data.isNotEmpty()) { "File bytes must not be empty" }
+        require(data.size <= MAX_PUT_RAW_BYTES) { "图片大小超过 HC 单文件 8 MB 上限 (${data.size} bytes)" }
+        val encoded = java.util.Base64.getEncoder().encodeToString(data)
+        val params = terminalParams(address)
+            .put("name", cleanName)
+            .put("data", encoded)
+        return HcJson.putResult(request("terminal.put", params, timeoutMs = 60_000))
+    }
+
     suspend fun pressKeys(address: String, keys: List<String>) {
         require(keys.isNotEmpty() && keys.all { it.isNotBlank() }) { "Key names must not be empty" }
         request("terminal.keys", terminalParams(address).put("keys", JSONArray(keys)), 65_000)
@@ -233,6 +246,7 @@ class HcFramedClient(
 
     companion object {
         private const val MAX_HELLO_BYTES = 1024 * 1024
+        const val MAX_PUT_RAW_BYTES: Int = 8 * 1024 * 1024
 
         internal fun readHelloLine(input: InputStream): String {
             val bytes = ByteArrayOutputStream()

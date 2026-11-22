@@ -3,6 +3,7 @@ package dev.herdr.android.connection
 import dev.herdr.android.protocol.AgentStateWord
 import dev.herdr.android.protocol.AttachMode
 import dev.herdr.android.protocol.HcHelloInfo
+import dev.herdr.android.protocol.HcPutResult
 import dev.herdr.android.protocol.HcServerStatus
 import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
@@ -400,6 +401,47 @@ private class PreviewTerminalSession(
         val appended = "\n› $text\n• [hc send ${summary.address}] 已投递到远端终端 (turn ${summary.turn + 1})\n"
         _screenSnapshot.value = _screenSnapshot.value + appended
         _outputFrames.emit(appended.encodeToByteArray())
+        return Result.success(Unit)
+    }
+
+    override suspend fun putFile(fileName: String, bytes: ByteArray): Result<HcPutResult> {
+        if (_mode.value == AttachMode.OBSERVE) {
+            return Result.failure(IllegalStateException("Observe 模式不允许上传文件，请先切换到 Takeover 模式。"))
+        }
+        val cleanName = fileName.trim().substringAfterLast('/').substringAfterLast('\\').ifBlank { "image.png" }
+        val landingPath = "C:\\Users\\herdr\\AppData\\Local\\Temp\\herdr-drops\\${summary.address}\\$cleanName"
+        return Result.success(HcPutResult(path = landingPath, bytes = bytes.size.toLong()))
+    }
+
+    override suspend fun sendSubmission(
+        text: String,
+        attachmentPaths: List<String>,
+        isAgentTui: Boolean,
+        submitWithEnter: Boolean
+    ): Result<Unit> {
+        if (_mode.value == AttachMode.OBSERVE) {
+            return Result.failure(IllegalStateException("当前处于 Observe 只读观看模式，请先切换到 Takeover 接管模式再发送指令。"))
+        }
+        if (attachmentPaths.isEmpty() && submitWithEnter) {
+            return sendLine(text)
+        }
+        val badgeLines = attachmentPaths.joinToString("\n") { p ->
+            val name = p.substringAfterLast('\\').substringAfterLast('/')
+            "  ▸ 📎 $name"
+        }
+        val body = buildString {
+            append("\n> ")
+            append(text.ifBlank { "[图片输入]" })
+            if (badgeLines.isNotEmpty()) {
+                append('\n').append(badgeLines)
+            }
+            append('\n')
+            if (submitWithEnter) {
+                append("• [hc put + send ${summary.address}] 已提交\n")
+            }
+        }
+        _screenSnapshot.value = _screenSnapshot.value + body
+        _outputFrames.emit(body.encodeToByteArray())
         return Result.success(Unit)
     }
 

@@ -187,6 +187,52 @@ internal class HcLiveTerminalSession(
         scheduleQuickRefresh()
     }
 
+    override suspend fun putFile(fileName: String, bytes: ByteArray): Result<HcPutResult> = inputOperationResult {
+        client.putTerminalFile(address, fileName, bytes)
+    }
+
+    override suspend fun sendSubmission(
+        text: String,
+        attachmentPaths: List<String>,
+        isAgentTui: Boolean,
+        submitWithEnter: Boolean
+    ): Result<Unit> {
+        if (attachmentPaths.isEmpty() && submitWithEnter) {
+            return sendLine(text)
+        }
+        return inputOperation {
+            if (isAgentTui) {
+                for (remotePath in attachmentPaths) {
+                    stream.sendRaw("\u001B[200~$remotePath\u001B[201~".toByteArray(Charsets.UTF_8))
+                    delay(180)
+                }
+                if (text.isNotBlank()) {
+                    stream.sendRaw("\u001B[200~$text\u001B[201~".toByteArray(Charsets.UTF_8))
+                    delay(180)
+                }
+                if (submitWithEnter) {
+                    stream.sendRaw(byteArrayOf(13))
+                }
+            } else {
+                val formattedPaths = attachmentPaths.map { p ->
+                    if (p.any { it.isWhitespace() }) "\"$p\"" else p
+                }
+                val combined = buildList {
+                    addAll(formattedPaths)
+                    if (text.isNotBlank()) add(text.trim())
+                }.joinToString(" ")
+                if (combined.isNotEmpty()) {
+                    stream.sendRaw(combined.toByteArray(Charsets.UTF_8))
+                }
+                if (submitWithEnter) {
+                    if (combined.isNotEmpty()) delay(120)
+                    stream.sendRaw(byteArrayOf(13))
+                }
+            }
+            scheduleQuickRefresh()
+        }
+    }
+
     override suspend fun sendSpecialKey(keyName: String): Result<Unit> = inputOperation {
         // Send standard control & navigation keys directly as raw PTY stream DATA bytes rather than
         // `terminal.keys` RPC:
@@ -235,14 +281,15 @@ internal class HcLiveTerminalSession(
         null
     }
 
-    private suspend fun inputOperation(block: suspend () -> Unit): Result<Unit> = operation.withLock {
+    private suspend fun inputOperation(block: suspend () -> Unit): Result<Unit> = inputOperationResult(block)
+
+    private suspend fun <T> inputOperationResult(block: suspend () -> T): Result<T> = operation.withLock {
         if (!_isAttached.value) return@withLock Result.failure(IllegalStateException("Terminal is detached"))
         if (_mode.value != AttachMode.TAKEOVER) return@withLock Result.failure(
             IllegalStateException("Observe 模式不允许输入、中断或调整远端尺寸，请先切换到 Takeover。")
         )
         try {
-            block()
-            Result.success(Unit)
+            Result.success(block())
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {

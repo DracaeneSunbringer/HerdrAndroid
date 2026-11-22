@@ -24,6 +24,7 @@ import dev.herdr.android.ui.terminal.StructuredTerminalReader
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
 import dev.herdr.android.ui.theme.HerdrThemeTriad
+import dev.herdr.android.ui.workbench.ImageUploadPreparer
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
@@ -82,6 +83,15 @@ data class DispatchedReceipt(
 data class FleetCardDigest(
     val headline: String,
     val urgentActions: List<QuickReplyAction> = emptyList()
+)
+
+data class StagedImageAttachment(
+    val id: String,
+    val displayName: String,
+    val sizeBytes: Long = 0L,
+    val remotePath: String? = null,
+    val uploading: Boolean = false,
+    val error: String? = null
 )
 
 class HerdrMainViewModel(
@@ -184,6 +194,9 @@ class HerdrMainViewModel(
     private val _terminalPreviews = MutableStateFlow<Map<String, String>>(emptyMap())
     val terminalPreviews: StateFlow<Map<String, String>> = _terminalPreviews.asStateFlow()
 
+    private val _stagedAttachmentsByAddress = MutableStateFlow<Map<String, List<StagedImageAttachment>>>(emptyMap())
+    val stagedAttachmentsByAddress: StateFlow<Map<String, List<StagedImageAttachment>>> = _stagedAttachmentsByAddress.asStateFlow()
+
     private data class DigestCacheEntry(
         val cacheKey: String,
         val digest: FleetCardDigest
@@ -243,6 +256,9 @@ class HerdrMainViewModel(
                 previewLastFetchMs.keys.retainAll(liveAddrs)
                 if (_terminalPreviews.value.keys.any { it !in liveAddrs }) {
                     _terminalPreviews.value = _terminalPreviews.value.filterKeys { it in liveAddrs }
+                }
+                if (_stagedAttachmentsByAddress.value.keys.any { it !in liveAddrs }) {
+                    _stagedAttachmentsByAddress.value = _stagedAttachmentsByAddress.value.filterKeys { it in liveAddrs }
                 }
                 if (_dispatchedReceipts.value.isNotEmpty()) {
                     val byAddr = live.associateBy { it.address }
@@ -1296,6 +1312,164 @@ class HerdrMainViewModel(
                 }
             }.onFailure { err ->
                 _toastBanner.value = "无法连接 ${summary.address}：${err.message}"
+            }
+        }
+    }
+
+    fun uploadImagesToActiveTerminal(context: Context, uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        val session = _activeSession.value
+        val curSummary = _activeTerminalSummary.value
+        if (session == null || curSummary == null) {
+            _toastBanner.value = "请先打开一个终端再上传图片"
+            return
+        }
+        val targetAddress = session.address
+        val appCtx = context.applicationContext
+        markTerminalDoneAcknowledged(curSummary)
+
+        viewModelScope.launch {
+            if (session.mode.value == AttachMode.OBSERVE) {
+                runCatching { session.setMode(AttachMode.TAKEOVER) }
+            }
+            for ((idx, uri) in uris.withIndex()) {
+                val attachmentId = java.util.UUID.randomUUID().toString()
+                val placeholder = StagedImageAttachment(
+                    id = attachmentId,
+                    displayName = "图片 ${idx + 1}",
+                    uploading = true
+                )
+                updateAttachmentsForAddress(targetAddress) { it + placeholder }
+
+                val preparedRes = ImageUploadPreparer.prepare(appCtx, uri)
+                if (preparedRes.isFailure) {
+                    val errMsg = preparedRes.exceptionOrNull()?.message ?: "读取失败"
+                    updateAttachmentsForAddress(targetAddress) { list ->
+                        list.map {
+                            if (it.id == attachmentId) it.copy(uploading = false, error = errMsg) else it
+                        }
+                    }
+                    _toastBanner.value = "图片处理失败：$errMsg"
+                    continue
+                }
+
+                val prepared = preparedRes.getOrThrow()
+                updateAttachmentsForAddress(targetAddress) { list ->
+                    list.map {
+                        if (it.id == attachmentId) {
+                            it.copy(displayName = prepared.fileName, sizeBytes = prepared.bytes.size.toLong())
+                        } else {
+                            it
+                        }
+                    }
+                }
+
+                val putRes = session.putFile(prepared.fileName, prepared.bytes)
+                putRes.onSuccess { landed ->
+                    updateAttachmentsForAddress(targetAddress) { list ->
+                        list.map {
+                            if (it.id == attachmentId) {
+                                it.copy(
+                                    sizeBytes = landed.bytes,
+                                    remotePath = landed.path,
+                                    uploading = false,
+                                    error = null
+                                )
+                            } else {
+                                it
+                            }
+                        }
+                    }
+                }.onFailure { err ->
+                    val errMsg = err.message ?: "上传失败"
+                    updateAttachmentsForAddress(targetAddress) { list ->
+                        list.map {
+                            if (it.id == attachmentId) it.copy(uploading = false, error = errMsg) else it
+                        }
+                    }
+                    _toastBanner.value = "图片上传失败：$errMsg"
+                }
+            }
+        }
+    }
+
+    fun removeStagedAttachment(address: String, attachmentId: String) {
+        updateAttachmentsForAddress(address) { list -> list.filterNot { it.id == attachmentId } }
+    }
+
+    private fun updateAttachmentsForAddress(
+        address: String,
+        transform: (List<StagedImageAttachment>) -> List<StagedImageAttachment>
+    ) {
+        val currentMap = _stagedAttachmentsByAddress.value.toMutableMap()
+        val updated = transform(currentMap[address].orEmpty())
+        if (updated.isEmpty()) {
+            currentMap.remove(address)
+        } else {
+            currentMap[address] = updated
+        }
+        _stagedAttachmentsByAddress.value = currentMap
+    }
+
+    fun sendTerminalSubmission(text: String, isAgentTui: Boolean, submitWithEnter: Boolean = true) {
+        val session = _activeSession.value ?: return
+        val curSummary = _activeTerminalSummary.value
+        val attachments = _stagedAttachmentsByAddress.value[session.address].orEmpty()
+        if (attachments.any { it.uploading }) {
+            _toastBanner.value = "图片正在上传中，请稍候…"
+            return
+        }
+        val ready = attachments.filter { !it.remotePath.isNullOrBlank() }
+        if (ready.isEmpty() && submitWithEnter) {
+            sendTerminalLine(text)
+            return
+        }
+        if (ready.isEmpty() && text.isBlank()) return
+
+        updateAttachmentsForAddress(session.address) { emptyList() }
+        val targetPaths = ready.mapNotNull { it.remotePath }
+
+        if (submitWithEnter) {
+            if (curSummary != null) {
+                markTerminalDoneAcknowledged(curSummary)
+                val receiptLabel = listOf(
+                    text.trim(),
+                    ready.joinToString(" ") { "[📎 ${it.displayName}]" }
+                ).filter { it.isNotEmpty() }.joinToString(" ")
+                _dispatchedReceipts.value = _dispatchedReceipts.value + (
+                    session.address to DispatchedReceipt(
+                        address = session.address,
+                        text = receiptLabel,
+                        sentAtTurn = curSummary.turn
+                    )
+                    )
+            }
+            updateDraftForTerminal(session.address, "")
+        }
+
+        viewModelScope.launch {
+            if (session.mode.value == AttachMode.OBSERVE) {
+                runCatching { session.setMode(AttachMode.TAKEOVER) }
+            }
+            session.sendSubmission(
+                text = text,
+                attachmentPaths = targetPaths,
+                isAgentTui = isAgentTui,
+                submitWithEnter = submitWithEnter
+            ).onSuccess {
+                _toastBanner.value = if (submitWithEnter) {
+                    "✓ 已发送 ${targetPaths.size} 张图片与指令给 ${session.address}"
+                } else {
+                    "✓ 已将 ${targetPaths.size} 张图片路径填入 ${session.address} 输入框"
+                }
+                if (submitWithEnter) {
+                    delay(400)
+                    controller.refreshTerminals()
+                    delay(1400)
+                    controller.refreshTerminals()
+                }
+            }.onFailure { err ->
+                _toastBanner.value = err.message ?: "发送失败"
             }
         }
     }

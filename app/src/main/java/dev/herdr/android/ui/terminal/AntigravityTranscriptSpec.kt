@@ -51,21 +51,52 @@ internal object AntigravityTranscriptSpec {
     // 1. Bottom Dock, Subagent/Task Tray, Status Line & Exit Chrome
     // ---------------------------------------------------------------------------------------------
 
-    /** Default model + optional effort + optional task count in `agy` status line. */
+    /** Default model + optional mode/orchestrator + effort + optional task count in `agy` status line. */
     val modelStatusFooterRegex = Regex(
-        "(?i)(?:Claude\\s+(?:Opus|Sonnet|Haiku)[\\w.\\s-]*|Gemini\\s+[\\w.-]+(?:\\s+[\\w().-]+){0,3}|GPT-[\\w.-]+)" +
+        "(?i)(?:(?:auto|plan|accept-edits|best-of-n)\\s*·\\s*)?(?:Orchestrator\\s*·\\s*)?" +
+            "(?:Claude\\s+(?:Opus|Sonnet|Haiku)[\\w.\\s()-]*|" +
+            "Gemini\\s+[\\w.-]+(?:\\s+[\\w().-]+){0,3}|" +
+            "GPT-[\\w.-]+|" +
+            "Orchestrator)" +
             "(?:\\s*·\\s*(?:low|medium|high|xhigh|max))?" +
-            "(?:\\s*·\\s*\\d+\\s+tasks?\\(s\\)|\\s*·\\s*/tasks)+" +
-            "|(?:Claude\\s+(?:Opus|Sonnet|Haiku)[\\w.\\s-]*|Gemini\\s+[\\w.-]+(?:\\s+[\\w().-]+){0,2}|GPT-[\\w.-]+)" +
+            "(?:\\s*·\\s*\\d+\\s+tasks?\\(s\\)|\\s*·\\s*/tasks|\\s*·\\s*\\d+[kKmM]?\\s+tokens)+" +
+            "|(?:(?:auto|plan|accept-edits|best-of-n)\\s*·\\s*)?(?:Orchestrator\\s*·\\s*)?" +
+            "(?:Claude\\s+(?:Opus|Sonnet|Haiku)[\\w.\\s()-]*|" +
+            "Gemini\\s+[\\w.-]+(?:\\s+[\\w().-]+){0,3}|" +
+            "GPT-[\\w.-]+|" +
+            "Orchestrator)" +
             "\\s*·\\s*(?:low|medium|high|xhigh|max)\\b"
     )
 
     /** Permission / panel navigation hints in `agy` bottom status line. */
     val keyHintFooterRegex = Regex(
-        "(?i)(?:↑/↓\\s*Navigate|\\btab\\s+Amend\\b|\\be\\s+edit command\\b|" +
+        "(?i)(?:↑/↓(?:/j/k|\\s*Navigate|\\s+to\\s+scroll)|" +
+            "←/→\\s*(?:to\\s+navigate|switch\\s+view|Change)|" +
+            "\\btab\\s+Amend\\b|\\be\\s+edit command\\b|" +
+            "shift\\+tab\\s+to\\s+(?:cycle|switch)|" +
             "Press\\s+ctrl\\+[cd]\\s+again\\s+to\\s+exit|" +
             "\\d+\\s+artifacts?\\s*·\\s*/artifact\\s+to\\s+review)"
     )
+
+    /** Interactive composer mode placeholder rendered between top/bottom `───` rules in `agy` 1.5+. */
+    val composerPlaceholderRegex = Regex(
+        "(?i)^(?:>\\s*)?(?:Auto mode:\\s*edits\\s*&\\s*safe commands auto-approved|" +
+            "Plan mode:\\s*research\\s*&\\s*plan only|" +
+            "Accept-edits mode:\\s*file edits auto-approved|" +
+            "Best-of-N mode:\\s*fork into parallel arms and pick a winner)" +
+            "(?:\\s*\\(shift\\+tab to cycle\\))?\\s*$"
+    )
+
+    fun isComposerModePlaceholder(trimmed: String): Boolean {
+        if (" mode:" !in trimmed && "Mode:" !in trimmed) return false
+        return composerPlaceholderRegex.matches(trimmed)
+    }
+
+    fun isHeavyPipeCardRow(firstChar: Char, trimmed: String): Boolean =
+        firstChar == '┃' && (trimmed == "┃" || trimmed.startsWith("┃ "))
+
+    fun isNuxDismissRow(firstChar: Char, trimmed: String): Boolean =
+        firstChar == '┃' && ("esc to dismiss" in trimmed || "Esc to dismiss" in trimmed)
 
     /** Custom statusline (`examples/statusline/statusline.sh`): wide 1-line, medium `╭─`/`╰─` 2-line, and narrow 2-line layouts. */
     private val customStatusHeadRegex = Regex(
@@ -89,7 +120,9 @@ internal object AntigravityTranscriptSpec {
     fun isModelStatusFooter(trimmed: String): Boolean {
         if (trimmed.indexOf('·') < 0) return false
         if ("Gemini" !in trimmed && "Claude" !in trimmed && "GPT-" !in trimmed &&
-            "gemini" !in trimmed && "claude" !in trimmed && "gpt-" !in trimmed
+            "Orchestrator" !in trimmed &&
+            "gemini" !in trimmed && "claude" !in trimmed && "gpt-" !in trimmed &&
+            "orchestrator" !in trimmed
         ) {
             return false
         }
@@ -97,14 +130,19 @@ internal object AntigravityTranscriptSpec {
     }
 
     fun isKeyHintFooter(trimmed: String): Boolean {
-        if ("Navigate" !in trimmed && "Amend" !in trimmed &&
-            "edit command" !in trimmed && "again to exit" !in trimmed &&
-            "/artifact" !in trimmed
+        if ("Navigate" !in trimmed && "navigate" !in trimmed &&
+            "Amend" !in trimmed && "edit command" !in trimmed &&
+            "again to exit" !in trimmed && "/artifact" !in trimmed &&
+            "switch view" !in trimmed && "Change" !in trimmed &&
+            "shift+tab to" !in trimmed && "↑/↓" !in trimmed && "←/→" !in trimmed
         ) {
             return false
         }
         return keyHintFooterRegex.containsMatchIn(trimmed)
     }
+
+    fun hasInteractiveNavigationHint(line: String): Boolean =
+        "←/→" in line || "↑/↓" in line || "Navigate" in line || "switch view" in line
 
     /** Background task / timer / cron row in bottom tray: `  ● [10:43:53] ... running|scheduled|completed|failed`. */
     val trayTaskRowRegex = Regex(
@@ -133,7 +171,7 @@ internal object AntigravityTranscriptSpec {
     )
 
     /** Slash command invoked at `> /cmd`. */
-    val slashPromptRegex = Regex("^/(?:artifact|agents|tasks|model|effort|mode|config|settings|permissions|plugin|plugins|skills|mcp|diff|compact|clear|help|copy|btw|resume|conv|conv-switch|fork|rewind|quota|usage|credits|remote-control|hooks|keybindings|title|voice|login|logout|exit|quit)\\b.*$")
+    val slashPromptRegex = Regex("^/(?:artifact|agents|tasks|model|effort|mode|config|settings|permissions|plugin|plugins|skills|mcp|diff|compact|clear|help|copy|btw|resume|conv|conv-switch|fork|rewind|quota|usage|credits|remote-control|hooks|keybindings|title|voice|login|logout|exit|quit|statusline|codesearch|bug|feedback|variants|swarm|plan|goal|teamwork|boost|grill-me|learn|browser|rename|new|add-dir)\\b.*$")
 
     /** Inline slash-command outcome row (`  ⎿  Exited /artifact command`, `  ⎿  Review submitted`). */
     val slashOutcomeRowRegex = Regex("^\\s*⎿\\s+(.+)$")
@@ -166,7 +204,15 @@ internal object AntigravityTranscriptSpec {
         "Cancelled", "Canceled", "Sent", "Sending", "Messaged", "Messaging", "Spawned", "Spawning",
         "Invoked", "Invoking", "Defined", "Defining", "Asked", "Asking", "Answered", "Worked",
         "Waited", "Waiting", "Grepped", "Globbed", "Patched", "Inspected", "Generated", "Generating",
-        "Browsed", "Browsing", "Opened", "Opening", "Clicked", "Typed", "Navigated"
+        "Browsed", "Browsing", "Opened", "Opening", "Clicked", "Typed", "Navigated",
+        "Used", "Using", "Use", "Copied", "Copying", "Moved", "Moving", "Removed", "Removing",
+        "Renamed", "Renaming", "Skipped", "Skipping", "Triggered", "Triggering",
+        "Started", "Starting", "Stopped", "Stopping", "Restarted", "Restarting",
+        "Loaded", "Loading", "Installed", "Installing", "Uninstalled", "Validated", "Validating",
+        "Reviewed", "Reviewing", "Approved", "Rejected", "Submitted", "Submitting",
+        "Switched", "Switching", "Resumed", "Resuming", "Compacted", "Compacting",
+        "Forked", "Forking", "Rewound", "Recorded", "Transcribed",
+        "Uploaded", "Uploading", "Downloaded", "Downloading", "Workflow"
     )
 
     private fun isStepBulletChar(c: Char): Boolean = when (c) {
@@ -232,7 +278,12 @@ internal object AntigravityTranscriptSpec {
             "Applied|Applying|Scheduled|Scheduling|Checked|Checking|Killed|Killing|Cancelled|Canceled|" +
             "Sent|Sending|Messaged|Messaging|Spawned|Spawning|Invoked|Invoking|Defined|Defining|" +
             "Asked|Asking|Answered|Worked|Waited|Waiting|Grepped|Globbed|Patched|Inspected|" +
-            "Generated|Generating|Browsed|Browsing|Opened|Opening|Clicked|Typed|Navigated" +
+            "Generated|Generating|Browsed|Browsing|Opened|Opening|Clicked|Typed|Navigated|" +
+            "Used|Using|Use|Copied|Copying|Moved|Moving|Removed|Removing|Renamed|Renaming|Skipped|Skipping|" +
+            "Triggered|Triggering|Started|Starting|Stopped|Stopping|Restarted|Restarting|Loaded|Loading|" +
+            "Installed|Installing|Uninstalled|Validated|Validating|Reviewed|Reviewing|Approved|Rejected|" +
+            "Submitted|Submitting|Switched|Switching|Resumed|Resuming|Compacted|Compacting|Forked|Forking|" +
+            "Rewound|Recorded|Transcribed|Uploaded|Uploading|Downloaded|Downloading|Workflow" +
             ")\\b.*$"
     )
 
@@ -377,16 +428,18 @@ internal object AntigravityTranscriptSpec {
         return subagentHasQuestionHeadRegex.matches(line) || blockedAskQuestionRegex.containsMatchIn(line)
     }
 
-    /** Tool / URL / file permission confirmation header (`Allow calling this tool?`, `Allow access to this URL?`, etc.). */
+    /** Tool / URL / file / command permission confirmation header (`Run this command?`, `Accept this file edit?`, `Allow calling this tool?`, etc.). */
     val permissionTitleRegex = Regex(
         "(?i)^\\s*(?:Allow\\s+(?:calling|running|reading|writing|editing|access|this)\\b.*\\?|" +
-            "Do you want to\\s+(?:allow|run|proceed|edit|write|read|create|delete)\\b.*\\?)\\s*$"
+            "Do you want to\\s+(?:allow|run|proceed|edit|write|read|create|delete|apply|approve)\\b.*\\?|" +
+            "(?:Run|Execute)\\s+this\\s+command\\s*\\?|" +
+            "(?:Accept|Approve|Apply|Edit|Create|Delete|Overwrite)\\s+this\\s+(?:file\\s+edit|file|change|edit)\\s*\\?)\\s*$"
     )
 
     fun isPermissionTitle(trimmed: String): Boolean {
         if (trimmed.isEmpty() || trimmed.last() != '?') return false
         val c0 = trimmed[0]
-        if (c0 != 'A' && c0 != 'a' && c0 != 'D' && c0 != 'd') return false
+        if (c0 !in "AaDdRrEeCcOoMmWw") return false
         return permissionTitleRegex.matches(trimmed)
     }
 }

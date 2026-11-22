@@ -70,16 +70,24 @@ fun statusToneOf(word: AgentStateWord, acknowledged: Boolean = false): StatusTon
     AgentStateWord.NONE -> StatusTone(HerdrColors.Idle, HerdrColors.Raised, "未知", false)
 }
 
-/** Short, human app label instead of shouting the raw wire name. */
-fun agentAppLabel(raw: String?): String = when (raw?.lowercase()?.trim()) {
-    null, "" -> "Shell"
-    "antigravity", "agy" -> "Antigravity"
-    "codex" -> "Codex"
-    "claude", "claude-code", "claude_code" -> "Claude"
-    "pi" -> "Pi"
-    "gemini" -> "Gemini"
-    "shell", "bash", "pwsh", "powershell" -> "Shell"
-    else -> raw.replaceFirstChar { it.uppercase() }
+/** Short, human app label instead of shouting the raw wire name or Windows executable path. */
+fun agentAppLabel(raw: String?): String {
+    val norm = raw?.trim()
+        ?.substringAfterLast('\\')
+        ?.substringAfterLast('/')
+        ?.removeSuffix(".exe")
+        ?.removeSuffix(".EXE")
+        ?.lowercase()
+    return when (norm) {
+        null, "" -> "Shell"
+        "antigravity", "agy" -> "Antigravity"
+        "codex" -> "Codex"
+        "claude", "claude-code", "claude_code" -> "Claude"
+        "pi" -> "Pi"
+        "gemini" -> "Gemini"
+        "shell", "bash", "zsh", "fish", "sh", "pwsh", "powershell", "cmd", "nu" -> "Shell"
+        else -> norm.replaceFirstChar { it.uppercase() }
+    }
 }
 
 @Composable

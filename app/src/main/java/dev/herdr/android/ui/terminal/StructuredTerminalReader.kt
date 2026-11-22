@@ -81,7 +81,8 @@ data class WorkbenchSnapshot(
     val blocks: List<TerminalSemanticBlock>,
     val quickActions: List<QuickReplyAction>,
     val liveStatus: AgentStateWord,
-    val isExpandedMode: Boolean
+    val isExpandedMode: Boolean,
+    val dialect: TerminalDialect = TerminalDialect.GENERIC
 )
 
 object StructuredTerminalReader {
@@ -215,9 +216,16 @@ object StructuredTerminalReader {
     private val agyToolVerbRegex = Regex(
         "^\\s*[●⏺○◦▸▾▼✓✔✗✘]\\s+(?:Thought|Thinking|Ran|Run|Running|Edited|Editing|Explored|Exploring|" +
             "Read|Reading|Wrote|Writing|Searched|Searching|Updated|Updating|Created|Creating|Deleted|Deleting|" +
-            "Listed|Listing|Called|Calling|Executed|Executing|Viewed|Viewing|Analyzed|Fetched|Fetching|" +
+            "Listed|Listing|Called|Calling|Executed|Executing|Viewed|Viewing|Analyzed|Analyzing|Fetched|Fetching|" +
             "Applied|Applying|Scheduling|Scheduled|Checked|Checking|Killed|Killing|Cancelled|Canceled|" +
-            "Sent|Sending|Invoked|Invoking|Defined|Defining|Asked|Asking|Worked|Waited|Grepped|Globbed|Patched|Inspected)\\b.*$"
+            "Sent|Sending|Messaged|Messaging|Spawned|Spawning|Invoked|Invoking|Defined|Defining|" +
+            "Asked|Asking|Answered|Worked|Waited|Waiting|Grepped|Globbed|Patched|Inspected|" +
+            "Generated|Generating|Browsed|Browsing|Opened|Opening|Clicked|Typed|Navigated|" +
+            "Used|Using|Use|Copied|Copying|Moved|Moving|Removed|Removing|Renamed|Renaming|Skipped|Skipping|" +
+            "Triggered|Triggering|Started|Starting|Stopped|Stopping|Restarted|Restarting|Loaded|Loading|" +
+            "Installed|Installing|Uninstalled|Validated|Validating|Reviewed|Reviewing|Approved|Rejected|" +
+            "Submitted|Submitting|Switched|Switching|Resumed|Resuming|Compacted|Compacting|Forked|Forking|" +
+            "Rewound|Recorded|Transcribed|Uploaded|Uploading|Downloaded|Downloading|Workflow)\\b.*$"
     )
 
     private val codexLeadProseRegex = Regex("^•\\s+(.+)$")
@@ -243,7 +251,7 @@ object StructuredTerminalReader {
     private val permissionErrorRegex = Regex("(?i)(permission denied|access is denied|拒绝访问)")
     private val blockingPromptRegex = Regex(
         "(?i)(locked \\(permission\\)|permission required|requires? (?:your )?(?:approval|permission)|" +
-            "needs your approval\\.|" +
+            "needs your approval\\.|requested permission:|requesting permission for:|" +
             "would you like to (?:run|send input|grant|make)|do you want to (?:proceed|make this edit|run|create|allow|continue|apply|approve)|" +
             "allow (?:this|once|always)|waiting for (?:your )?(?:approval|confirmation|input)|" +
             "需要(?:你的)?(?:授权|确认|批准)|是否(?:允许|继续|执行))"
@@ -387,13 +395,15 @@ object StructuredTerminalReader {
         val cleanTail = cleaned.trimmedLines.asReversed().asSequence().filter { it.isNotEmpty() }.take(16).toList().asReversed()
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { ('/' in it) && yesNoRegex.containsMatchIn(it) }
+        val hasNavModal = cleaned.rawTail.takeLast(8).any { AntigravityTranscriptSpec.hasInteractiveNavigationHint(it) }
         val status = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, blocks)
-        val actions = buildQuickActionsForStatus(status, dialect, cleaned.isExpandedMode, menuOptions, hasYesNo)
+        val actions = buildQuickActionsForStatus(status, dialect, cleaned.isExpandedMode, menuOptions, hasYesNo, hasNavModal)
         return WorkbenchSnapshot(
             blocks = blocks,
             quickActions = actions,
             liveStatus = status,
-            isExpandedMode = cleaned.isExpandedMode
+            isExpandedMode = cleaned.isExpandedMode,
+            dialect = dialect
         )
     }
 
@@ -469,7 +479,8 @@ object StructuredTerminalReader {
         dialect: TerminalDialect,
         isExpanded: Boolean,
         menuOptions: List<Pair<String, String>>,
-        hasYesNo: Boolean
+        hasYesNo: Boolean,
+        hasNavModal: Boolean = false
     ): List<QuickReplyAction> {
         val expandKey = if (dialect == TerminalDialect.CODEX) "ctrl+t" else "ctrl+o"
         val expandLabel = when {
@@ -485,7 +496,7 @@ object StructuredTerminalReader {
         }
 
         val actions = when (status) {
-            AgentStateWord.BLOCKED -> blockedActions(menuOptions, hasYesNo)
+            AgentStateWord.BLOCKED -> return blockedActions(menuOptions, hasYesNo).take(9)
             AgentStateWord.ERROR -> listOf(
                 QuickReplyAction("重试/继续", "继续，重试刚才失败的步骤", isPrimary = true),
                 QuickReplyAction(errorExpandLabel, expandKey, isSpecialKey = true),
@@ -497,7 +508,17 @@ object StructuredTerminalReader {
                 QuickReplyAction("⏎ 回车", "enter", isSpecialKey = true),
                 QuickReplyAction("■ 中断 Ctrl+C", "ctrl+c", isSpecialKey = true, isDanger = true)
             )
-            AgentStateWord.DONE, AgentStateWord.IDLE, AgentStateWord.NONE -> if (isExpanded) {
+            AgentStateWord.DONE, AgentStateWord.IDLE, AgentStateWord.NONE -> if (hasNavModal) {
+                return listOf(
+                    QuickReplyAction("←", "left", isSpecialKey = true),
+                    QuickReplyAction("↑", "up", isSpecialKey = true),
+                    QuickReplyAction("↓", "down", isSpecialKey = true),
+                    QuickReplyAction("→", "right", isSpecialKey = true),
+                    QuickReplyAction("⏎ 确认", "enter", isSpecialKey = true, isPrimary = true),
+                    QuickReplyAction("Tab", "tab", isSpecialKey = true),
+                    QuickReplyAction("✕ 退出", "esc", isSpecialKey = true)
+                )
+            } else if (isExpanded) {
                 listOf(
                     QuickReplyAction(expandLabel, expandKey, isSpecialKey = true, isPrimary = true),
                     QuickReplyAction("继续推进", "继续"),
@@ -942,6 +963,8 @@ object StructuredTerminalReader {
             stripPiBanners(rawLines)
         } else if (dialect == TerminalDialect.CODEX) {
             stripCodexBanners(rawLines)
+        } else if (dialect == TerminalDialect.ANTIGRAVITY) {
+            stripAntigravityBanners(rawLines)
         }
 
         val cap = rawLines.size
@@ -1017,7 +1040,25 @@ object StructuredTerminalReader {
                 insideCodexStatusCard = true
             }
 
-            if (isNoise(trimmed, c0, hasBlockBar, dialect, insideCodexStatusCard)) continue
+            if (isNoise(trimmed, c0, hasBlockBar, dialect, insideCodexStatusCard)) {
+                if ((c0 == '─' || c0 == '━' || c0 == '═' || c0 == '—' || c0 == '-') &&
+                    !boxCorners &&
+                    boxPipes == 0 &&
+                    (fullRuleRegex.matches(trimmed) || CodexTranscriptSpec.markdownEmDashRuleRegex.matches(trimmed)) &&
+                    !lastBlank
+                ) {
+                    outLines.add("")
+                    outTrimmed.add("")
+                    outStyles.add(LineStyle())
+                    outIndents[count] = -1
+                    outFirstChars[count] = '\u0000'
+                    outBoxPipes[count] = 0
+                    outBoxCorners[count] = false
+                    count++
+                    lastBlank = true
+                }
+                continue
+            }
 
             outLines.add(line)
             outTrimmed.add(trimmed)
@@ -1069,7 +1110,40 @@ object StructuredTerminalReader {
                     val t = if (styled.indent < 0) "" else raw.substring(styled.indent).trimEnd()
                     when {
                         t.isEmpty() -> end--
+                        sawBottomRule && (t == ">" || (t.startsWith("> ") && !promptMenuOptionRegex.matches(raw))) &&
+                            !t.contains("<hc") -> {
+                            // Live composer prompt `> ...` (including `> Auto mode: ... (shift+tab to cycle)`)
+                            // is sandwiched between two `───` rules at the bottom.
+                            val aboveIdx = ((end - 1) downTo maxOf(floor, end - 5)).firstOrNull {
+                                longRuleRegex.matches(lines[it].text.trim())
+                            }
+                            if (aboveIdx != null) {
+                                end = aboveIdx - 1
+                            } else {
+                                end--
+                            }
+                            // Strip right-aligned `/artifact to review`, above-composer `┃ ... esc to dismiss` NUX cards,
+                            // and above-composer subagent/task tray rows.
+                            while (end >= floor) {
+                                val aboveStyled = lines[end]
+                                val at = if (aboveStyled.indent < 0) "" else aboveStyled.text.substring(aboveStyled.indent).trimEnd()
+                                val keepStrippingAbove = aboveStyled.indent < 0 ||
+                                    AntigravityTranscriptSpec.isKeyHintFooter(at) ||
+                                    AntigravityTranscriptSpec.isHeavyPipeCardRow(aboveStyled.firstChar, at) ||
+                                    ((aboveStyled.firstChar == '●' || aboveStyled.firstChar == '○') && (
+                                        AntigravityTranscriptSpec.trayTaskRowRegex.matches(aboveStyled.text) ||
+                                            AntigravityTranscriptSpec.traySubagentRowRegex.matches(aboveStyled.text)
+                                        ))
+                                if (keepStrippingAbove) {
+                                    end--
+                                } else {
+                                    break
+                                }
+                            }
+                            break
+                        }
                         containsCommonFooterMarker(t) ||
+                            AntigravityTranscriptSpec.isComposerModePlaceholder(t) ||
                             AntigravityTranscriptSpec.isModelStatusFooter(t) ||
                             AntigravityTranscriptSpec.isKeyHintFooter(t) ||
                             AntigravityTranscriptSpec.isCustomStatusLine(t) ||
@@ -1082,19 +1156,6 @@ object StructuredTerminalReader {
                         longRuleRegex.matches(t) -> {
                             sawBottomRule = true
                             end--
-                        }
-                        sawBottomRule && (t == ">" || (t.startsWith("> ") && !promptMenuOptionRegex.matches(raw))) &&
-                            !t.contains("<hc") -> {
-                            // Live composer prompt `> ...` is sandwiched between two `───` rules at the bottom.
-                            val aboveIdx = (end - 1 downTo floor).firstOrNull { lines[it].indent >= 0 }
-                            if (aboveIdx != null && longRuleRegex.matches(lines[aboveIdx].text.trim())) {
-                                end = aboveIdx - 1
-                            }
-                            // Also strip right-aligned `N artifact(s) · /artifact to review` immediately above the top rule.
-                            while (end >= floor && (lines[end].indent < 0 || AntigravityTranscriptSpec.isKeyHintFooter(lines[end].text))) {
-                                end--
-                            }
-                            break
                         }
                         else -> break
                     }
@@ -1199,6 +1260,33 @@ object StructuredTerminalReader {
             }
 
             TerminalDialect.SHELL -> Unit
+        }
+    }
+
+    /** Strips Antigravity's `┃ Introducing ... / ┃ ... / ┃ esc to dismiss` NUX cards. */
+    private fun stripAntigravityBanners(lines: MutableList<StyledLine>) {
+        var i = 0
+        while (i < lines.size) {
+            val styled = lines[i]
+            val t = if (styled.indent < 0) "" else styled.text.substring(styled.indent).trimEnd()
+            if (AntigravityTranscriptSpec.isHeavyPipeCardRow(styled.firstChar, t)) {
+                var j = i
+                var hasDismiss = false
+                while (j < lines.size) {
+                    val sj = lines[j]
+                    val tj = if (sj.indent < 0) "" else sj.text.substring(sj.indent).trimEnd()
+                    if (!AntigravityTranscriptSpec.isHeavyPipeCardRow(sj.firstChar, tj)) break
+                    if (AntigravityTranscriptSpec.isNuxDismissRow(sj.firstChar, tj)) hasDismiss = true
+                    j++
+                }
+                if (hasDismiss) {
+                    lines.subList(i, j).clear()
+                    continue
+                }
+                i = j
+            } else {
+                i++
+            }
         }
     }
 
@@ -1314,6 +1402,7 @@ object StructuredTerminalReader {
                     )) ||
                     ((firstChar == 'R' || firstChar == 'r') && AntigravityTranscriptSpec.exitResumeHeaderRegex.matches(trimmed)) ||
                     ((firstChar == 'a' || firstChar == 'A') && AntigravityTranscriptSpec.exitResumeCmdRegex.matches(trimmed)) ||
+                    AntigravityTranscriptSpec.isComposerModePlaceholder(trimmed) ||
                     AntigravityTranscriptSpec.isModelStatusFooter(trimmed) ||
                     AntigravityTranscriptSpec.isKeyHintFooter(trimmed) ||
                     AntigravityTranscriptSpec.isCustomStatusLine(trimmed)
@@ -3011,6 +3100,8 @@ object StructuredTerminalReader {
                 "approval" in trimmed || "Approval" in trimmed ||
                 "would you like" in trimmed || "Would you like" in trimmed ||
                 "do you want" in trimmed || "Do you want" in trimmed ||
+                "requested permission" in trimmed || "Requested Permission" in trimmed ||
+                "requesting permission" in trimmed || "Requesting permission" in trimmed ||
                 "allow " in trimmed || "Allow " in trimmed ||
                 "waiting for" in trimmed || "Waiting for" in trimmed ||
                 "需要" in trimmed || "是否" in trimmed
@@ -3795,6 +3886,12 @@ object StructuredTerminalReader {
 
     private fun blockedActions(options: List<Pair<String, String>>, hasYesNo: Boolean): List<QuickReplyAction> {
         val cancel = QuickReplyAction("✕ 取消 (ESC)", "esc", isSpecialKey = true)
+        val arrows = listOf(
+            QuickReplyAction("←", "left", isSpecialKey = true),
+            QuickReplyAction("↑", "up", isSpecialKey = true),
+            QuickReplyAction("↓", "down", isSpecialKey = true),
+            QuickReplyAction("→", "right", isSpecialKey = true)
+        )
         return when {
             options.isNotEmpty() -> {
                 val optionActions = options.take(3).mapIndexed { idx, (n, text) ->
@@ -3807,20 +3904,20 @@ object StructuredTerminalReader {
                         isDanger = false
                     )
                 }
-                optionActions + QuickReplyAction("⏎ 确认", "enter", isSpecialKey = true) + cancel
+                optionActions + QuickReplyAction("⏎ 确认", "enter", isSpecialKey = true) + cancel + arrows
             }
             hasYesNo -> listOf(
                 QuickReplyAction("✓ 批准 (y)", "y", isPrimary = true),
                 QuickReplyAction("✕ 拒绝 (n)", "n"),
                 QuickReplyAction("⏎ 确认", "enter", isSpecialKey = true),
                 cancel
-            )
+            ) + arrows
             else -> listOf(
                 QuickReplyAction("✓ 批准 (y)", "y", isPrimary = true),
                 QuickReplyAction("⏎ 确认", "enter", isSpecialKey = true),
                 QuickReplyAction("选项 1", "1"),
                 cancel
-            )
+            ) + arrows
         }
     }
 

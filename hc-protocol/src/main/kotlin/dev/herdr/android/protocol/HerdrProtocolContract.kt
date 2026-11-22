@@ -102,6 +102,11 @@ enum class AttachMode {
     TAKEOVER
 }
 
+data class HcPutResult(
+    val path: String,
+    val bytes: Long
+)
+
 /**
  * Active attached terminal stream over a framed `hc connect` channel.
  * Closing/detaching this session ONLY sends CLOSE on the attach channel and never kills the remote process.
@@ -117,6 +122,13 @@ interface TerminalSession {
     suspend fun setMode(newMode: AttachMode)
     suspend fun sendRawInput(bytes: ByteArray): Result<Unit>
     suspend fun sendLine(text: String): Result<Unit>
+    suspend fun putFile(fileName: String, bytes: ByteArray): Result<HcPutResult>
+    suspend fun sendSubmission(
+        text: String,
+        attachmentPaths: List<String> = emptyList(),
+        isAgentTui: Boolean = true,
+        submitWithEnter: Boolean = true
+    ): Result<Unit>
     suspend fun sendSpecialKey(keyName: String): Result<Unit>
     suspend fun interrupt(): Result<Unit>
     suspend fun requestResize(cols: Int, rows: Int): Result<Unit>

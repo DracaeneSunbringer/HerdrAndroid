@@ -88,6 +88,12 @@ object HcJson {
         }
     }
 
+    fun putResult(result: JSONObject): HcPutResult {
+        val path = result.optString("path")
+        if (path.isBlank()) throw HcProtocolException("HC terminal.put returned an empty path")
+        return HcPutResult(path = path, bytes = result.optLong("bytes", 0L))
+    }
+
     private fun strings(array: JSONArray?): List<String> =
         if (array == null) emptyList() else (0 until array.length()).mapNotNull { array.opt(it) as? String }
 }

@@ -82,7 +82,9 @@ object AnsiTerminalParser {
             trimmed.contains("tok/s") ||
             trimmed.contains("TTFT:") ||
             trimmed.contains("Cline upstream:") ||
-            trimmed.contains("MCP:")
+            trimmed.contains("MCP:") ||
+            AntigravityTranscriptSpec.isModelStatusFooter(trimmed) ||
+            AntigravityTranscriptSpec.isKeyHintFooter(trimmed)
     }
 
     /** Minimum contrast ratio enforced for remote 256-color / truecolor foregrounds on light themes. */
@@ -188,9 +190,19 @@ object AnsiTerminalParser {
                         }
                     }
 
+                    '┃' -> {
+                        if (AntigravityTranscriptSpec.isHeavyPipeCardRow(c0, trimmed)) {
+                            appendStyledSegment(line, HerdrColors.Dim, Color.Unspecified, false)
+                            handled = true
+                        }
+                    }
+
                     '>', '›', '❯' -> {
                         if (lonePromptLineRegex.matches(line)) {
                             appendStyledSegment(line, HerdrColors.Accent, Color.Unspecified, true)
+                            handled = true
+                        } else if (c0 == '>' && AntigravityTranscriptSpec.isComposerModePlaceholder(trimmed)) {
+                            appendStyledSegment(line, HerdrColors.Dim, Color.Unspecified, false)
                             handled = true
                         } else if (!trimmed.startsWith("> ")) {
                             val match = userPromptLineRegex.find(line)

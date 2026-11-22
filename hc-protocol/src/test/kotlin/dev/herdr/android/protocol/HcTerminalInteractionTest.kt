@@ -319,6 +319,112 @@ class HcTerminalInteractionTest {
         }
     }
 
+    @Test fun putFileSendsBase64ToTerminalPutAndRejectsObserveOrOversizedBytes() = runBlocking {
+        ProtocolPeer().also { peer ->
+            peer.handler = { request ->
+                val terminal = ProtocolPeer.terminal().put("status", JSONObject().put("state", "idle"))
+                when (request.getString("method")) {
+                    "terminal.get" -> peer.reply(request, terminal)
+                    "terminal.attach" -> peer.reply(
+                        request,
+                        JSONObject().put("channel", 41).put("terminal", terminal).put("resize_notifications", false)
+                    )
+                    "terminal.put" -> {
+                        val p = request.getJSONObject("params")
+                        val rawLen = java.util.Base64.getDecoder().decode(p.getString("data")).size
+                        peer.reply(
+                            request,
+                            JSONObject()
+                                .put("path", "C:\\Users\\herdr\\AppData\\Local\\Temp\\herdr-drops\\t7\\${p.getString("name")}")
+                                .put("bytes", rawLen)
+                        )
+                    }
+                    else -> peer.reply(request)
+                }
+            }
+        }.use { peer ->
+            peer.client.start()
+            val observeSession = peer.client.openTerminalSession("t7", AttachMode.OBSERVE)
+            assertTrue(observeSession.putFile("shot.png", byteArrayOf(1, 2, 3)).isFailure)
+            observeSession.detach()
+
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            val sampleBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 1, 2, 3, 4)
+            val putRes = session.putFile("C:\\fake\\screen shot.png", sampleBytes).getOrThrow()
+            assertTrue(putRes.path.endsWith("screen shot.png"))
+            assertEquals(sampleBytes.size.toLong(), putRes.bytes)
+
+            val putReq = rpcRequests(peer).last { it.optString("method") == "terminal.put" }.getJSONObject("params")
+            assertEquals("t7", putReq.getString("terminal"))
+            assertEquals("screen shot.png", putReq.getString("name"))
+            assertArrayEquals(sampleBytes, java.util.Base64.getDecoder().decode(putReq.getString("data")))
+
+            val oversized = ByteArray(HcFramedClient.MAX_PUT_RAW_BYTES + 1)
+            assertTrue(session.putFile("too_big.png", oversized).isFailure)
+            session.detach()
+        }
+    }
+
+    @Test fun sendSubmissionWithAttachmentsSendsSeparateBracketedPastesThenEnterOverStream() = runBlocking {
+        interactivePeer().use { peer ->
+            peer.client.start()
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            val res = session.sendSubmission(
+                text = "请看这两张截图",
+                attachmentPaths = listOf(
+                    "C:\\Users\\herdr\\AppData\\Local\\Temp\\herdr-drops\\t7\\a.png",
+                    "C:\\Users\\herdr\\AppData\\Local\\Temp\\herdr-drops\\t7\\b.png"
+                ),
+                isAgentTui = true,
+                submitWithEnter = true
+            )
+            assertTrue(res.isSuccess)
+            awaitUntil { rawInput(peer).size == 4 }
+            val writes = rawInput(peer)
+            assertTrue(writes.all { it.channel == 41L })
+            assertEquals("\u001B[200~C:\\Users\\herdr\\AppData\\Local\\Temp\\herdr-drops\\t7\\a.png\u001B[201~", writes[0].payload.toString(Charsets.UTF_8))
+            assertEquals("\u001B[200~C:\\Users\\herdr\\AppData\\Local\\Temp\\herdr-drops\\t7\\b.png\u001B[201~", writes[1].payload.toString(Charsets.UTF_8))
+            assertEquals("\u001B[200~请看这两张截图\u001B[201~", writes[2].payload.toString(Charsets.UTF_8))
+            assertArrayEquals(byteArrayOf(13), writes[3].payload)
+            assertFalse(rpcRequests(peer).any { it.optString("method") == "terminal.send" })
+
+            // Verify submitWithEnter = false omits trailing CR
+            assertTrue(
+                session.sendSubmission(
+                    text = "",
+                    attachmentPaths = listOf("C:\\tmp\\only.png"),
+                    isAgentTui = true,
+                    submitWithEnter = false
+                ).isSuccess
+            )
+            awaitUntil { rawInput(peer).size == 5 }
+            assertEquals("\u001B[200~C:\\tmp\\only.png\u001B[201~", rawInput(peer)[4].payload.toString(Charsets.UTF_8))
+            session.detach()
+        }
+    }
+
+    @Test fun fourWayArrowsShiftTabAndSpaceSendRawEscapeBytesOverStream() = runBlocking {
+        interactivePeer().use { peer ->
+            peer.client.start()
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            val keys = listOf("left", "right", "up", "down", "shift+tab", "space")
+            for (k in keys) {
+                assertTrue(session.sendSpecialKey(k).isSuccess)
+            }
+            awaitUntil { rawInput(peer).size == 6 }
+            val writes = rawInput(peer)
+            assertTrue(writes.all { it.channel == 41L })
+            assertEquals("\u001B[D", writes[0].payload.toString(Charsets.US_ASCII))
+            assertEquals("\u001B[C", writes[1].payload.toString(Charsets.US_ASCII))
+            assertEquals("\u001B[A", writes[2].payload.toString(Charsets.US_ASCII))
+            assertEquals("\u001B[B", writes[3].payload.toString(Charsets.US_ASCII))
+            assertEquals("\u001B[Z", writes[4].payload.toString(Charsets.US_ASCII))
+            assertArrayEquals(byteArrayOf(32), writes[5].payload)
+            assertFalse(rpcRequests(peer).any { it.optString("method") == "terminal.keys" })
+            session.detach()
+        }
+    }
+
     private fun interactivePeer(blocked: Boolean = false) = ProtocolPeer().also { peer ->
         peer.handler = { request ->
             val terminal = ProtocolPeer.terminal().put("status", JSONObject().put("state", if (blocked) "blocked" else "idle"))

@@ -1,5 +1,9 @@
 package dev.herdr.android.ui.workbench
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -40,6 +44,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.Icon
@@ -62,11 +67,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -82,6 +90,7 @@ import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.ui.DispatchedReceipt
 import dev.herdr.android.ui.HerdrAppSettings
+import dev.herdr.android.ui.StagedImageAttachment
 import dev.herdr.android.ui.components.HerdrButton
 import dev.herdr.android.ui.components.HerdrButtonKind
 import dev.herdr.android.ui.components.HerdrDivider
@@ -95,6 +104,7 @@ import dev.herdr.android.ui.components.statusToneOf
 import dev.herdr.android.ui.terminal.AnsiTerminalParser
 import dev.herdr.android.ui.terminal.QuickReplyAction
 import dev.herdr.android.ui.terminal.StructuredTerminalReader
+import dev.herdr.android.ui.terminal.TerminalDialect
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
 import dev.herdr.android.ui.terminal.WorkbenchSnapshot
 import dev.herdr.android.ui.theme.HerdrColors
@@ -107,6 +117,48 @@ import kotlinx.coroutines.withContext
 private val hcWrapperRegex = Regex("^<hc\\b[^>]*?(?:from=\"([^\"]*)\")?[^>]*>([\\s\\S]*?)(?:</hc>)?\\s*$")
 private val whitespaceRegex = Regex("\\s+")
 private val orderedBulletPrefixRegex = Regex("^(\\d{1,2}[.)、]|[（(]\\d{1,2}[)）])\\s*")
+private val attachmentTagRegex = Regex("\\[📎[^\\]]*]")
+
+private val PhotoAttachIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "PhotoAttach",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.Black), pathFillType = PathFillType.EvenOdd) {
+            moveTo(5f, 3f)
+            horizontalLineTo(19f)
+            curveTo(20.1f, 3f, 21f, 3.9f, 21f, 5f)
+            verticalLineTo(19f)
+            curveTo(21f, 20.1f, 20.1f, 21f, 19f, 21f)
+            horizontalLineTo(5f)
+            curveTo(3.9f, 21f, 3f, 20.1f, 3f, 19f)
+            verticalLineTo(5f)
+            curveTo(3f, 3.9f, 3.9f, 3f, 5f, 3f)
+            close()
+            moveTo(5f, 5f)
+            verticalLineTo(19f)
+            horizontalLineTo(19f)
+            verticalLineTo(5f)
+            horizontalLineTo(5f)
+            close()
+        }
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(6.5f, 17.5f)
+            lineTo(10f, 13f)
+            lineTo(12.5f, 16f)
+            lineTo(15f, 12.5f)
+            lineTo(17.5f, 17.5f)
+            close()
+            moveTo(9f, 8f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 9f, 11f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 9f, 8f)
+            close()
+        }
+    }.build()
+}
 
 private fun LazyListState.distanceFromBottomPx(): Int {
     val info = layoutInfo
@@ -138,6 +190,7 @@ fun AgentWorkbenchPane(
     acknowledgedDoneTurns: Map<String, Int>,
     draftText: String,
     dispatchedReceipt: DispatchedReceipt?,
+    stagedAttachments: List<StagedImageAttachment>,
     requestInputFocusSignal: Long,
     appSettings: HerdrAppSettings,
     savedDesktopDims: Map<String, Pair<Int, Int>>,
@@ -145,6 +198,9 @@ fun AgentWorkbenchPane(
     onNavigateBack: () -> Unit,
     onSwitchTerminal: (TerminalSummary) -> Unit,
     onUpdateDraft: (String) -> Unit,
+    onUploadImages: (List<Uri>) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    onSendSubmission: (String, Boolean, Boolean) -> Unit,
     onTakeoverPtyWidth: (Int) -> Unit,
     onReleasePtyWidth: () -> Unit,
     onSendLine: (String, Boolean) -> Unit,
@@ -211,12 +267,37 @@ fun AgentWorkbenchPane(
 
     val blocks = snapshot.blocks
     val quickActions = snapshot.quickActions
+    val isAgentTui = remember(snapshot.dialect, summary.agentApp) {
+        snapshot.dialect in setOf(
+            TerminalDialect.ANTIGRAVITY,
+            TerminalDialect.CODEX,
+            TerminalDialect.CLAUDE,
+            TerminalDialect.PI
+        ) || summary.agentApp?.lowercase()?.trim() in setOf(
+            "antigravity", "agy", "codex", "claude", "claude-code", "pi", "gemini"
+        )
+    }
+
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 5)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            onUploadImages(uris)
+        }
+    }
 
     val shouldShowPendingReceipt = remember(dispatchedReceipt, blocks, summary.turn) {
         val receipt = dispatchedReceipt ?: return@remember false
         if (summary.turn > receipt.sentAtTurn) return@remember false
-        val normReceipt = receipt.text.trim().replace(whitespaceRegex, "")
-        if (normReceipt.isEmpty()) return@remember false
+        val tailRunningGroup = (blocks.lastOrNull() as? TerminalSemanticBlock.ToolGroupBlock)
+            ?.summaryLabel?.endsWith("· 进行中") == true
+        val normReceipt = receipt.text.replace(attachmentTagRegex, "").trim().replace(whitespaceRegex, "")
+        if (normReceipt.isEmpty()) {
+            val echoedMedia = blocks.takeLast(8).any { b ->
+                b is TerminalSemanticBlock.UserPromptBlock && "[📎" in b.text
+            }
+            return@remember !echoedMedia && !tailRunningGroup
+        }
         val alreadyEchoedInBlocks = blocks.takeLast(8).any { b ->
             if (b is TerminalSemanticBlock.UserPromptBlock) {
                 val body = splitHcPrompt(b.text).second.trim().replace(whitespaceRegex, "")
@@ -226,8 +307,6 @@ fun AgentWorkbenchPane(
                 false
             }
         }
-        val tailRunningGroup = (blocks.lastOrNull() as? TerminalSemanticBlock.ToolGroupBlock)
-            ?.summaryLabel?.endsWith("· 进行中") == true
         !alreadyEchoedInBlocks && !tailRunningGroup
     }
 
@@ -643,30 +722,58 @@ fun AgentWorkbenchPane(
             }
 
             AnimatedVisibility(visible = showKeys) {
-                val keys = listOf("esc" to "Esc", "tab" to "Tab", "up" to "↑", "down" to "↓", "ctrl+o" to "^O", "ctrl+t" to "^T", "enter" to "⏎", "ctrl+c" to "^C")
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    keys.forEach { (wire, label) ->
-                        val danger = wire == "ctrl+c"
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(38.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (danger) HerdrColors.BlockedSubtle else HerdrColors.Raised)
-                                .clickable {
-                                    followBottom = true
-                                    if (danger) onInterrupt() else onSendSpecialKey(wire)
-                                },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                label,
-                                style = HerdrType.Caption,
-                                fontFamily = FontFamily.Monospace,
-                                color = if (danger) HerdrColors.Blocked else HerdrColors.Foreground,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1
-                            )
+                val row1 = listOf("left" to "←", "up" to "↑", "down" to "↓", "right" to "→", "space" to "␣", "enter" to "⏎")
+                val row2 = listOf("esc" to "Esc", "tab" to "Tab", "shift+tab" to "⇧Tab", "ctrl+o" to "^O", "ctrl+t" to "^T", "ctrl+c" to "^C")
+                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        row1.forEach { (wire, label) ->
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(HerdrColors.Raised)
+                                    .clickable {
+                                        followBottom = true
+                                        onSendSpecialKey(wire)
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    label,
+                                    style = HerdrType.Body,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = HerdrColors.Foreground,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        row2.forEach { (wire, label) ->
+                            val danger = wire == "ctrl+c"
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(38.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (danger) HerdrColors.BlockedSubtle else HerdrColors.Raised)
+                                    .clickable {
+                                        followBottom = true
+                                        if (danger) onInterrupt() else onSendSpecialKey(wire)
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    label,
+                                    style = HerdrType.Caption,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = if (danger) HerdrColors.Blocked else HerdrColors.Foreground,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1
+                                )
+                            }
                         }
                     }
                 }
@@ -676,11 +783,22 @@ fun AgentWorkbenchPane(
                 sessionAddress = session.address,
                 targetLabel = summary.address.substringAfterLast('/'),
                 initialDraft = draftText,
+                stagedAttachments = stagedAttachments,
                 focusRequester = inputFocusRequester,
                 onUpdateDraft = onUpdateDraft,
+                onPickImages = {
+                    imagePickerLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                },
+                onRemoveAttachment = onRemoveAttachment,
                 onSubmitLine = { text ->
                     followBottom = true
                     onSendLine(text, false)
+                },
+                onSubmitWithAttachments = { text, submitWithEnter ->
+                    followBottom = true
+                    onSendSubmission(text, isAgentTui, submitWithEnter)
                 },
                 onSubmitEmpty = {
                     followBottom = true
@@ -696,9 +814,13 @@ private fun WorkbenchComposer(
     sessionAddress: String,
     targetLabel: String,
     initialDraft: String,
+    stagedAttachments: List<StagedImageAttachment>,
     focusRequester: FocusRequester,
     onUpdateDraft: (String) -> Unit,
+    onPickImages: () -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onSubmitLine: (String) -> Unit,
+    onSubmitWithAttachments: (String, Boolean) -> Unit,
     onSubmitEmpty: () -> Unit
 ) {
     var localDraft by remember(sessionAddress) { mutableStateOf(initialDraft) }
@@ -716,55 +838,161 @@ private fun WorkbenchComposer(
         }
     }
 
+    val anyUploading = stagedAttachments.any { it.uploading }
+    val hasReadyAttachments = stagedAttachments.any { !it.remotePath.isNullOrBlank() }
+
     fun submit() {
-        val trimmedCheck = localDraft
-        if (trimmedCheck.isNotBlank()) {
+        if (anyUploading) {
+            onSubmitWithAttachments(localDraft, true)
+            return
+        }
+        val currentText = localDraft
+        if (hasReadyAttachments) {
             localDraft = ""
             onUpdateDraft("")
-            onSubmitLine(trimmedCheck)
+            onSubmitWithAttachments(currentText, true)
+        } else if (currentText.isNotBlank()) {
+            localDraft = ""
+            onUpdateDraft("")
+            onSubmitLine(currentText)
         } else {
             onSubmitEmpty()
         }
     }
 
-    Row(verticalAlignment = Alignment.Bottom) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .heightIn(min = 46.dp)
-                .clip(RoundedCornerShape(23.dp))
-                .background(HerdrColors.Raised)
-                .padding(horizontal = 18.dp, vertical = 12.dp),
-            contentAlignment = Alignment.CenterStart
-        ) {
-            if (localDraft.isEmpty()) {
-                OneLine("给 $targetLabel 下达指令", HerdrType.Body.copy(lineHeight = 20.sp), HerdrColors.Dim)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        AnimatedVisibility(visible = stagedAttachments.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    stagedAttachments.forEach { att ->
+                        val bg = if (att.error != null) HerdrColors.BlockedSubtle else HerdrColors.Raised
+                        val fg = if (att.error != null) HerdrColors.Blocked else HerdrColors.Foreground
+                        Row(
+                            modifier = Modifier
+                                .height(30.dp)
+                                .clip(HerdrShapes.Pill)
+                                .background(bg)
+                                .padding(start = 10.dp, end = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            if (att.uploading) {
+                                StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
+                            }
+                            val label = when {
+                                att.uploading -> "上传中 ${att.displayName}"
+                                att.error != null -> "失败 ${att.displayName}"
+                                else -> "📎 ${att.displayName} · ${(att.sizeBytes / 1024).coerceAtLeast(1)}K"
+                            }
+                            Text(
+                                text = label,
+                                style = HerdrType.Caption,
+                                color = fg,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .clip(CircleShape)
+                                    .clickable { onRemoveAttachment(att.id) },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Close, "移除附件", tint = HerdrColors.Muted, modifier = Modifier.size(13.dp))
+                            }
+                        }
+                    }
+                }
+                if (hasReadyAttachments && !anyUploading) {
+                    Box(
+                        modifier = Modifier
+                            .height(30.dp)
+                            .clip(HerdrShapes.Pill)
+                            .background(HerdrColors.AccentSubtle)
+                            .clickable {
+                                val textToFill = localDraft
+                                if (textToFill.isNotEmpty()) {
+                                    localDraft = ""
+                                    onUpdateDraft("")
+                                }
+                                onSubmitWithAttachments(textToFill, false)
+                            }
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "仅填入",
+                            style = HerdrType.Caption,
+                            color = HerdrColors.Accent,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1
+                        )
+                    }
+                }
             }
-            BasicTextField(
-                value = localDraft,
-                onValueChange = { localDraft = it },
-                singleLine = true,
-                textStyle = HerdrType.Body.copy(color = HerdrColors.Foreground, lineHeight = 20.sp),
-                cursorBrush = SolidColor(HerdrColors.Accent),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { submit() }),
-                modifier = Modifier.fillMaxWidth().focusRequester(focusRequester)
-            )
         }
-        Spacer(Modifier.width(8.dp))
-        val hasText = localDraft.isNotBlank()
-        Box(
-            modifier = Modifier
-                .size(46.dp)
-                .clip(CircleShape)
-                .background(if (hasText) HerdrColors.Accent else HerdrColors.Raised)
-                .clickable { submit() },
-            contentAlignment = Alignment.Center
-        ) {
-            if (hasText) {
-                Icon(Icons.AutoMirrored.Filled.Send, "发送", tint = HerdrColors.OnAccent, modifier = Modifier.size(20.dp))
-            } else {
-                Text("⏎", color = HerdrColors.Muted, fontSize = 18.sp)
+
+        Row(verticalAlignment = Alignment.Bottom) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(HerdrColors.Raised)
+                    .clickable(onClick = onPickImages),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(PhotoAttachIcon, "上传图片", tint = HerdrColors.Muted, modifier = Modifier.size(20.dp))
+            }
+            Spacer(Modifier.width(8.dp))
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 46.dp)
+                    .clip(RoundedCornerShape(23.dp))
+                    .background(HerdrColors.Raised)
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                if (localDraft.isEmpty()) {
+                    val placeholder = if (hasReadyAttachments) "补充图片说明，或直接点发送" else "给 $targetLabel 下达指令"
+                    OneLine(placeholder, HerdrType.Body.copy(lineHeight = 20.sp), HerdrColors.Dim)
+                }
+                BasicTextField(
+                    value = localDraft,
+                    onValueChange = { localDraft = it },
+                    singleLine = true,
+                    textStyle = HerdrType.Body.copy(color = HerdrColors.Foreground, lineHeight = 20.sp),
+                    cursorBrush = SolidColor(HerdrColors.Accent),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { submit() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester)
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            val canSend = localDraft.isNotBlank() || hasReadyAttachments
+            Box(
+                modifier = Modifier
+                    .size(46.dp)
+                    .clip(CircleShape)
+                    .background(if (canSend) HerdrColors.Accent else HerdrColors.Raised)
+                    .clickable { submit() },
+                contentAlignment = Alignment.Center
+            ) {
+                if (canSend) {
+                    Icon(Icons.AutoMirrored.Filled.Send, "发送", tint = HerdrColors.OnAccent, modifier = Modifier.size(20.dp))
+                } else {
+                    Text("⏎", color = HerdrColors.Muted, fontSize = 18.sp)
+                }
             }
         }
     }

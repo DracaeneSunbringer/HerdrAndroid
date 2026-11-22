@@ -999,4 +999,101 @@ class StructuredTerminalReaderTest {
             hlAvgUs < 100.0
         )
     }
+
+    @Test
+    fun antigravity1514_stripsNuxCardModePlaceholderOrchestratorFooterAndFoldsUsedExitPlanMode() {
+        val screen1514 = """
+            > 确认修复范围并提交审查
+
+            ● Explored 1 file (StructuredTerminalReader.kt)
+            ● Used ExitPlanMode (Created At: 2026-11-21T14:38:22+08:00)
+            ● Edited 1 file (HANDOFF.md)
+
+              第一段说明已完成前期准备与状态检查。
+              ──────
+              ### 第二部分：正式发布结论
+              已对齐新版 `agy` 终端语法与四方向快捷操作支持。
+
+             ┃ Introducing Gemini 4 Neon
+             ┃ Our best balance of intelligence, cost, and latency. Get building today with Neon.
+             ┃ esc to dismiss
+            ───────────────────────────────────────────────────────────────────────────────────────────────
+            > Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+            ───────────────────────────────────────────────────────────────────────────────────────────────
+            ? for shortcuts                                                    auto · Orchestrator · Gemini 4 Neon · xhigh
+        """.trimIndent()
+
+        val blocks = StructuredTerminalReader.parseBlocks(screen1514, agentApp = "antigravity")
+        val tools = blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertEquals(1, tools.size)
+        assertTrue(tools.single().summaryLabel.contains("3"))
+        assertTrue(tools.single().steps.any { it.contains("Used ExitPlanMode") })
+
+        val prose = blocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertTrue(prose.any { !it.isHeading && it.text.contains("第一段说明已完成前期准备") })
+        assertTrue(prose.any { it.isHeading && it.text == "第二部分：正式发布结论" })
+        assertFalse(prose.any {
+            it.text.contains("Introducing Gemini") ||
+                it.text.contains("esc to dismiss") ||
+                it.text.contains("Auto mode:") ||
+                it.text.contains("Orchestrator") ||
+                it.text.contains("Used ExitPlanMode")
+        })
+
+        val summary = TerminalSummary(address = "t1q", agentApp = "antigravity", agentStatus = AgentStateWord.DONE)
+        val headline = StructuredTerminalReader.extractLatestHeadline(screen1514, summary)
+        assertFalse(headline.contains("Introducing") || headline.contains("Orchestrator") || headline.contains("Auto mode"))
+    }
+
+    @Test
+    fun antigravity1514_newApprovalTitlesAndNavModalProvideFourWayArrowQuickActions() {
+        val runCmdPrompt = """
+            ● Running (git status)
+
+              Run this command?
+
+              git status -sb
+
+            > 1. Yes, run command
+              2. No, tell Antigravity what to do differently
+
+            ↑/↓ Navigate · tab Amend · e edit command
+            ? for shortcuts                                                    auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+
+        val cmdSnapshot = StructuredTerminalReader.analyzeWorkbench(
+            runCmdPrompt,
+            TerminalSummary(address = "t1q", agentApp = "antigravity", agentStatus = AgentStateWord.BLOCKED)
+        )
+        assertEquals(AgentStateWord.BLOCKED, cmdSnapshot.liveStatus)
+        val cmdPayloads = cmdSnapshot.quickActions.map { it.payload }
+        assertTrue(listOf("left", "right", "up", "down", "esc").all { it in cmdPayloads })
+
+        val fileEditPrompt = """
+              Accept this file edit?
+
+            > 1. Yes
+              2. No
+
+            ↑/↓ Navigate · enter Confirm
+        """.trimIndent()
+        val editStatus = StructuredTerminalReader.resolveLiveStatus(fileEditPrompt, null)
+        assertEquals(AgentStateWord.BLOCKED, editStatus)
+
+        val idleNavModal = """
+              Select model or toggle setting:
+
+              Claude Sonnet   [current]
+              Gemini 4 Carbon
+
+            ←/→ Change · ↑/↓ Navigate · enter Confirm · esc Exit
+        """.trimIndent()
+        val modalSnapshot = StructuredTerminalReader.analyzeWorkbench(
+            idleNavModal,
+            TerminalSummary(address = "t1q", agentApp = "antigravity", agentStatus = AgentStateWord.IDLE)
+        )
+        assertEquals(AgentStateWord.IDLE, modalSnapshot.liveStatus)
+        val modalPayloads = modalSnapshot.quickActions.map { it.payload }
+        assertTrue(listOf("left", "up", "down", "right", "enter", "esc").all { it in modalPayloads })
+    }
 }
