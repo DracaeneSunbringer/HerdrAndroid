@@ -46,6 +46,11 @@ sealed interface TerminalSemanticBlock {
         val isHeading: Boolean = false,
         val indentLevel: Int = 0
     ) : TerminalSemanticBlock
+
+    /** Live interactive AskQuestion card rendered in-stream for Antigravity (`agy`). */
+    data class AskCardBlock(
+        val card: AgyAskCardState
+    ) : TerminalSemanticBlock
 }
 
 /**
@@ -82,7 +87,8 @@ data class WorkbenchSnapshot(
     val quickActions: List<QuickReplyAction>,
     val liveStatus: AgentStateWord,
     val isExpandedMode: Boolean,
-    val dialect: TerminalDialect = TerminalDialect.GENERIC
+    val dialect: TerminalDialect = TerminalDialect.GENERIC,
+    val agyState: AgyTerminalState? = null
 )
 
 object StructuredTerminalReader {
@@ -391,19 +397,28 @@ object StructuredTerminalReader {
             )
         }
         val cleaned = cleanScreen(raw, dialect)
-        val blocks = parseBlocksFromCleaned(cleaned, dialect)
+        val parsedBlocks = parseBlocksFromCleaned(cleaned, dialect)
+        val activeAsk = cleaned.agyState?.activeAskCard
+        val blocks = if (activeAsk != null) {
+            parsedBlocks + TerminalSemanticBlock.AskCardBlock(activeAsk)
+        } else {
+            parsedBlocks
+        }
         val cleanTail = cleaned.trimmedLines.asReversed().asSequence().filter { it.isNotEmpty() }.take(16).toList().asReversed()
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { ('/' in it) && yesNoRegex.containsMatchIn(it) }
-        val hasNavModal = cleaned.rawTail.takeLast(8).any { AntigravityTranscriptSpec.hasInteractiveNavigationHint(it) }
-        val status = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, blocks)
-        val actions = buildQuickActionsForStatus(status, dialect, cleaned.isExpandedMode, menuOptions, hasYesNo, hasNavModal)
+        val hasNavModal = (cleaned.agyState?.phase == AgyUiPhase.SLASH_MODAL) ||
+            cleaned.rawTail.takeLast(8).any { AntigravityTranscriptSpec.hasInteractiveNavigationHint(it) }
+        val baseStatus = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, blocks)
+        val status = if (activeAsk != null) AgentStateWord.BLOCKED else baseStatus
+        val actions = buildQuickActionsForStatus(status, dialect, cleaned.isExpandedMode, menuOptions, hasYesNo, hasNavModal, activeAsk)
         return WorkbenchSnapshot(
             blocks = blocks,
             quickActions = actions,
             liveStatus = status,
             isExpandedMode = cleaned.isExpandedMode,
-            dialect = dialect
+            dialect = dialect,
+            agyState = cleaned.agyState
         )
     }
 
@@ -480,8 +495,20 @@ object StructuredTerminalReader {
         isExpanded: Boolean,
         menuOptions: List<Pair<String, String>>,
         hasYesNo: Boolean,
-        hasNavModal: Boolean = false
+        hasNavModal: Boolean = false,
+        activeAsk: AgyAskCardState? = null
     ): List<QuickReplyAction> {
+        if (activeAsk != null) {
+            return buildList {
+                if (activeAsk.totalQuestions > 1 && activeAsk.questionIndex > 1) {
+                    add(QuickReplyAction("← 上一题", "left", isSpecialKey = true))
+                }
+                if (activeAsk.totalQuestions > 1 && activeAsk.questionIndex < activeAsk.totalQuestions) {
+                    add(QuickReplyAction("→ 下一题", "right", isSpecialKey = true))
+                }
+                add(QuickReplyAction("✕ 取消问答", "esc", isSpecialKey = true))
+            }
+        }
         val expandKey = if (dialect == TerminalDialect.CODEX) "ctrl+t" else "ctrl+o"
         val expandLabel = when {
             dialect == TerminalDialect.CODEX && isExpanded -> "收起视图 Ctrl+T"
@@ -575,6 +602,7 @@ object StructuredTerminalReader {
 
         val dialect = detectDialect(summary.agentApp, rawScreen)
         val cleaned = cleanScreen(rawScreen, dialect)
+        cleaned.agyState?.activeAskCard?.let { return polishHeadline(it.questionText) }
         val blocks = parseBlocksFromCleaned(cleaned, dialect)
 
         // 1. Blocked / error: concrete question or failure alert (reusing single-pass `cleaned`).
@@ -649,7 +677,9 @@ object StructuredTerminalReader {
      */
     private data class LineStyle(
         val isDim: Boolean = false,
-        val isItalic: Boolean = false
+        val isItalic: Boolean = false,
+        val isBold: Boolean = false,
+        val hasBgHighlight: Boolean = false
     )
 
     private data class StyledLine(
@@ -697,8 +727,22 @@ object StructuredTerminalReader {
         val boxPipeCounts: IntArray,
         val hasBoxCorners: BooleanArray,
         val isExpandedMode: Boolean,
-        val rawTail: List<String>
+        val rawTail: List<String>,
+        val agyState: AgyTerminalState? = null
     )
+
+    internal fun extractAgyRawStyledLines(raw: String): List<AgyRawStyledLine> =
+        extractStyledLines(raw).map { s ->
+            AgyRawStyledLine(
+                text = s.text,
+                indent = s.indent,
+                firstChar = s.firstChar,
+                isDim = s.style.isDim,
+                isItalic = s.style.isItalic,
+                isBold = s.style.isBold,
+                hasBgHighlight = s.style.hasBgHighlight
+            )
+        }
 
     private fun isSgrMarkerChar(ch: Char): Boolean = when (ch) {
         '•', '●', '⏺', '○', '◦', '▸', '▾', '▼', '│', '└', '├', '⎿', '↳' -> true
@@ -765,7 +809,9 @@ object StructuredTerminalReader {
 
         var dim = false
         var italic = false
+        var bold = false
         var fgDim = false
+        var bgHighlight = false
 
         for (rawLine in rawSplit) {
             val crCleaned = if (rawLine.indexOf('\r') >= 0) {
@@ -779,6 +825,8 @@ object StructuredTerminalReader {
             var visibleChars = 0
             var dimChars = 0
             var italicChars = 0
+            var boldChars = 0
+            var bgChars = 0
             var idx = 0
             while (idx < crCleaned.length) {
                 val ch = crCleaned[idx]
@@ -793,7 +841,9 @@ object StructuredTerminalReader {
                             if (params.isEmpty()) {
                                 dim = false
                                 italic = false
+                                bold = false
                                 fgDim = false
+                                bgHighlight = false
                             } else {
                                 val parts = params.split(';', ':')
                                 var p = 0
@@ -803,15 +853,27 @@ object StructuredTerminalReader {
                                         0 -> {
                                             dim = false
                                             italic = false
+                                            bold = false
                                             fgDim = false
+                                            bgHighlight = false
                                         }
-                                        1 -> dim = false
+                                        1 -> {
+                                            dim = false
+                                            bold = true
+                                        }
                                         2 -> dim = true
                                         3 -> italic = true
-                                        22 -> dim = false
+                                        7 -> bgHighlight = true
+                                        22 -> {
+                                            dim = false
+                                            bold = false
+                                        }
                                         23 -> italic = false
+                                        27 -> bgHighlight = false
                                         39 -> fgDim = false
+                                        49 -> bgHighlight = false
                                         90 -> fgDim = true
+                                        in 40..47, in 100..107 -> bgHighlight = true
                                         38 -> {
                                             val mode = parts.getOrNull(p + 1)?.toIntOrNull()
                                             if (mode == 5) {
@@ -824,6 +886,16 @@ object StructuredTerminalReader {
                                                 val b = parts.getOrNull(p + 4)?.toIntOrNull() ?: 255
                                                 fgDim = r in 70..165 && g in 70..165 && b in 70..165 &&
                                                     kotlin.math.abs(r - g) <= 18 && kotlin.math.abs(g - b) <= 18
+                                                p += 4
+                                            }
+                                        }
+                                        48 -> {
+                                            val mode = parts.getOrNull(p + 1)?.toIntOrNull()
+                                            if (mode == 5) {
+                                                bgHighlight = true
+                                                p += 2
+                                            } else if (mode == 2) {
+                                                bgHighlight = true
                                                 p += 4
                                             }
                                         }
@@ -842,6 +914,8 @@ object StructuredTerminalReader {
                         visibleChars++
                         if (dim || fgDim) dimChars++
                         if (italic) italicChars++
+                        if (bold) boldChars++
+                        if (bgHighlight) bgChars++
                     }
                 }
                 idx++
@@ -849,7 +923,9 @@ object StructuredTerminalReader {
             val cleanText = sb.toString().trimEnd()
             val lineStyle = LineStyle(
                 isDim = visibleChars > 0 && dimChars * 2 >= visibleChars,
-                isItalic = visibleChars > 0 && italicChars * 2 >= visibleChars
+                isItalic = visibleChars > 0 && italicChars * 2 >= visibleChars,
+                isBold = visibleChars > 0 && boldChars * 2 >= visibleChars,
+                hasBgHighlight = visibleChars > 0 && bgChars * 2 >= visibleChars
             )
             result.add(buildStyledLine(cleanText, lineStyle))
         }
@@ -956,6 +1032,28 @@ object StructuredTerminalReader {
             TerminalDialect.CODEX -> detectCodexExpandedMode(rawLines)
             TerminalDialect.ANTIGRAVITY -> detectAntigravityExpandedMode(rawLines)
             else -> false
+        }
+
+        val agyState = if (dialect == TerminalDialect.ANTIGRAVITY) {
+            val projected = rawLines.map { s ->
+                AgyRawStyledLine(
+                    text = s.text,
+                    indent = s.indent,
+                    firstChar = s.firstChar,
+                    isDim = s.style.isDim,
+                    isItalic = s.style.isItalic,
+                    isBold = s.style.isBold,
+                    hasBgHighlight = s.style.hasBgHighlight
+                )
+            }
+            AgyInteractiveParser.inspect(projected)
+        } else {
+            null
+        }
+
+        val activeAskStart = agyState?.activeAskCard?.startRawLineIndex ?: -1
+        if (activeAskStart in rawLines.indices) {
+            rawLines.subList(activeAskStart, rawLines.size).clear()
         }
 
         stripBottomDock(rawLines, dialect)
@@ -1087,7 +1185,8 @@ object StructuredTerminalReader {
             boxPipeCounts = if (count == outBoxPipes.size) outBoxPipes else outBoxPipes.copyOf(count),
             hasBoxCorners = if (count == outBoxCorners.size) outBoxCorners else outBoxCorners.copyOf(count),
             isExpandedMode = isExpandedMode,
-            rawTail = rawTail
+            rawTail = rawTail,
+            agyState = agyState
         )
     }
 
@@ -1651,6 +1750,11 @@ object StructuredTerminalReader {
                         i++
                         skipExpandedAgyAttachmentChildren(line)
                     }
+                    dialect == TerminalDialect.ANTIGRAVITY && c0 == '?' && lineIndents[i] == 0 &&
+                        line.startsWith("? ") && isAgyCompletedQaPairStart(i) -> {
+                        flushParagraph()
+                        consumeAgyCompletedQaPairs()
+                    }
                     dialect == TerminalDialect.ANTIGRAVITY && (c0 in '0'..'9' || c0 == '•' || c0 == '◦' || c0 == '▪' || c0 == '‣') &&
                         isAgyLoneListMarkerStart(i) -> {
                         flushParagraph()
@@ -1914,6 +2018,55 @@ object StructuredTerminalReader {
         }
 
         // ---- Antigravity (`agy`) specific blocks ----
+
+        private fun isAgyCompletedQaPairStart(idx: Int): Boolean {
+            val l = lines[idx]
+            if (!l.startsWith("? ") || lineIndents[idx] != 0) return false
+            val t = l.substring(2).trim()
+            if (t.isEmpty() || t.startsWith("for shortcuts", ignoreCase = true)) return false
+            val next = nextNonBlank(idx + 1) ?: return false
+            if (lineIndents[next] !in 0..4) return false
+            val nextTrim = lines[next].trimStart()
+            if (!nextTrim.startsWith("> ") && !nextTrim.startsWith("› ") && !nextTrim.startsWith("❯ ")) {
+                return false
+            }
+            val ans = nextTrim.drop(2).trim()
+            return ans.isNotEmpty() && !ans.startsWith("<hc") && !AntigravityTranscriptSpec.slashPromptRegex.matches(ans)
+        }
+
+        private fun consumeAgyCompletedQaPairs() {
+            val steps = ArrayList<String>()
+            var pairs = 0
+            while (i < lines.size) {
+                if (lineIsBlank[i]) {
+                    val next = nextNonBlank(i + 1)
+                    if (next != null && isAgyCompletedQaPairStart(next)) {
+                        i = next
+                        continue
+                    }
+                    break
+                }
+                if (!isAgyCompletedQaPairStart(i)) break
+                val qText = lines[i].substring(2).trim()
+                val ansIdx = nextNonBlank(i + 1) ?: break
+                val aText = lines[ansIdx].trimStart().drop(2).trim()
+                pairs++
+                if (steps.size < maxGroupSteps) {
+                    steps.add("Q: $qText")
+                    steps.add("  → $aText")
+                }
+                i = ansIdx + 1
+            }
+            if (steps.isNotEmpty()) {
+                blocks.add(
+                    TerminalSemanticBlock.ToolGroupBlock(
+                        summaryLabel = "问答确认 ($pairs 题)",
+                        steps = steps,
+                        hasError = false
+                    )
+                )
+            }
+        }
 
         private fun isAgyLoneListMarkerStart(idx: Int): Boolean {
             if (idx + 1 >= lines.size) return false

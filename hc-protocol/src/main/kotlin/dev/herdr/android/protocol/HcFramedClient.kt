@@ -97,9 +97,11 @@ class HcFramedClient(
     }
 
     suspend fun serverStatus(): HcServerStatus = HcJson.status(request("server.status"))
-    suspend fun listTerminals(): List<TerminalSummary> = HcJson.terminals(request("terminal.list"))
+    suspend fun listTerminals(timeoutMs: Long = rpcTimeoutMs): List<TerminalSummary> =
+        HcJson.terminals(request("terminal.list", timeoutMs = timeoutMs))
     suspend fun getTerminal(address: String): TerminalSummary = HcJson.terminal(request("terminal.get", terminalParams(address)))
-    suspend fun listMachines(): List<MachineSummary> = HcJson.machines(request("machine.list"))
+    suspend fun listMachines(timeoutMs: Long = rpcTimeoutMs): List<MachineSummary> =
+        HcJson.machines(request("machine.list", timeoutMs = timeoutMs))
     suspend fun readTerminal(address: String, lines: Int = 260): String = readTerminalSnapshot(address, lines).text
 
     internal suspend fun readTerminalSnapshot(address: String, lines: Int): HcTerminalRead {

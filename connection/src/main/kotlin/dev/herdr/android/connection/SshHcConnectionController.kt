@@ -194,11 +194,12 @@ class SshHcConnectionController(
         }
         pollJob = scope.launch {
             var consecutiveFailures = 0
+            val pollRpcTimeoutMs = minOf(rpcTimeoutMs, 5_000L)
             while (isActive && attempt.get() == epoch) {
                 delay(pollIntervalMs)
                 try {
-                    val inventory = connected.listTerminals()
-                    val remoteMachines = readMachines(connected)
+                    val inventory = connected.listTerminals(pollRpcTimeoutMs)
+                    val remoteMachines = readMachines(connected, pollRpcTimeoutMs)
                     consecutiveFailures = 0
                     if (attempt.get() == epoch) {
                         _terminals.value = inventory
@@ -208,7 +209,7 @@ class SshHcConnectionController(
                     throw error
                 } catch (_: Exception) {
                     consecutiveFailures++
-                    if (!connected.isConnected.value || consecutiveFailures >= 3) {
+                    if (!connected.isConnected.value || consecutiveFailures >= 2) {
                         connected.close() // monitor reports the loss; mutating calls are never replayed
                         break
                     }
@@ -270,8 +271,11 @@ class SshHcConnectionController(
     private fun requireClient(): HcFramedClient = client?.takeIf { it.isConnected.value }
         ?: throw IllegalStateException("尚未连接 HC")
 
-    private suspend fun readMachines(connected: HcFramedClient): List<MachineSummary> = try {
-        connected.listMachines()
+    private suspend fun readMachines(
+        connected: HcFramedClient,
+        timeoutMs: Long = rpcTimeoutMs
+    ): List<MachineSummary> = try {
+        connected.listMachines(timeoutMs)
     } catch (error: HcRpcException) {
         if (error.kind == "unknown_method" || error.kind == "method_not_found") emptyList() else throw error
     }

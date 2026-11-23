@@ -118,6 +118,7 @@ interface TerminalSession {
     val screenSnapshot: StateFlow<String>
     val dimensions: StateFlow<Pair<Int, Int>>
     val isAttached: StateFlow<Boolean>
+    val outputEpochCount: Long get() = 0L
 
     suspend fun setMode(newMode: AttachMode)
     suspend fun sendRawInput(bytes: ByteArray): Result<Unit>
@@ -132,5 +133,12 @@ interface TerminalSession {
     suspend fun sendSpecialKey(keyName: String): Result<Unit>
     suspend fun interrupt(): Result<Unit>
     suspend fun requestResize(cols: Int, rows: Int): Result<Unit>
+    suspend fun refreshScreenNow(screenOnly: Boolean = true): Result<String> = Result.success(screenSnapshot.value)
+    suspend fun awaitOutputSettle(
+        previousEpoch: Long,
+        waitFirstByteMs: Long = 450L,
+        quietWindowMs: Long = 55L,
+        maxTotalWaitMs: Long = 1_100L
+    ): Boolean = false
     suspend fun detach()
 }

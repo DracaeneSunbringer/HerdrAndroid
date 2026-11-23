@@ -10,6 +10,12 @@ import dev.herdr.android.connection.ConnectionState
 import dev.herdr.android.connection.HerdrConnectionController
 import dev.herdr.android.connection.HerdrConnectionControllerFactory
 import dev.herdr.android.connection.HostPlatform
+import dev.herdr.android.ui.terminal.AgyAgentMode
+import dev.herdr.android.ui.terminal.AgySlashModalKind
+import dev.herdr.android.ui.terminal.AskNavDirection
+import dev.herdr.android.ui.terminal.SequenceOperation
+import dev.herdr.android.ui.workbench.SequenceExecutionStatus
+import dev.herdr.android.ui.workbench.TerminalSequenceCoordinator
 import dev.herdr.android.connection.ZeroTierOverlayRegistry
 import dev.herdr.android.connection.ZeroTierOverlayState
 import dev.herdr.android.connection.ZeroTierOverlayTransport
@@ -202,6 +208,18 @@ class HerdrMainViewModel(
         val digest: FleetCardDigest
     )
     private val digestCache = ConcurrentHashMap<String, DigestCacheEntry>()
+
+    private val sequenceCoordinator by lazy {
+        TerminalSequenceCoordinator(
+            scope = HerdrKeepAliveCoordinator.processScope,
+            connectionState = controller.connectionState,
+            sessionProvider = { addr -> _activeSession.value?.takeIf { it.address == addr } },
+            onToast = { msg -> _toastBanner.value = msg }
+        )
+    }
+
+    val sequenceStatus: StateFlow<SequenceExecutionStatus?>
+        get() = sequenceCoordinator.status
 
     val fleetDigests: StateFlow<Map<String, FleetCardDigest>> = combine(
         controller.terminals,
@@ -972,9 +990,35 @@ class HerdrMainViewModel(
         autoReconnectJob = HerdrKeepAliveCoordinator.processScope.launch {
             HerdrKeepAliveCoordinator.isReconnectingInBackground = true
             syncKeepAliveNotification()
-            val delaysMs = listOf(1500L, 3000L, 6000L, 12000L, 25000L, 45000L)
+            val delaysMs = listOf(600L, 1500L, 3000L, 6000L, 12000L, 25000L)
             val maxAttempts = 12
             var attemptIndex = 0
+            val primaryProfile = _profile.value
+            val ztHost = _appSettings.value.defaultZeroTierHost.ifBlank { "10.147.17.100" }
+            val lanHost = _appSettings.value.defaultLanHost.ifBlank { "192.168.1.100" }
+            val alternateProfile = if (primaryProfile.host.startsWith("demo://")) {
+                null
+            } else if (primaryProfile.useBuiltInZeroTier) {
+                if (lanHost.isNotBlank() && lanHost != primaryProfile.host && !lanHost.startsWith("demo://")) {
+                    primaryProfile.copy(
+                        displayName = "Windows 主力机 (LAN)",
+                        host = lanHost,
+                        useBuiltInZeroTier = false
+                    )
+                } else {
+                    null
+                }
+            } else {
+                if (primaryProfile.zeroTierNetworkId.length == 16 && ztHost.isNotBlank()) {
+                    primaryProfile.copy(
+                        displayName = "Windows 主力机 (ZeroTier)",
+                        host = ztHost,
+                        useBuiltInZeroTier = true
+                    )
+                } else {
+                    null
+                }
+            }
             while (isActive &&
                 attemptIndex < maxAttempts &&
                 HerdrKeepAliveCoordinator.userWantsConnectionAlive &&
@@ -991,10 +1035,25 @@ class HerdrMainViewModel(
                 ) {
                     break
                 }
-                val result = controller.connect(_profile.value)
+                val candidate = if (alternateProfile != null && attemptIndex % 2 == 1) {
+                    alternateProfile
+                } else {
+                    primaryProfile
+                }
+                val result = controller.connect(candidate)
                 if (result.isSuccess) {
                     HerdrKeepAliveCoordinator.isReconnectingInBackground = false
-                    _toastBanner.value = "后台保活已自动恢复远端连接"
+                    if (candidate != _profile.value) {
+                        _profile.value = candidate
+                        saveProfile(candidate)
+                        _toastBanner.value = if (candidate.useBuiltInZeroTier) {
+                            "后台保活已切换至 ZeroTier 并恢复连接"
+                        } else {
+                            "后台保活已切换至 LAN 直连并恢复连接"
+                        }
+                    } else {
+                        _toastBanner.value = "后台保活已自动恢复远端连接"
+                    }
                     val savedSummary = _activeTerminalSummary.value
                     if (savedSummary != null) {
                         reattachSavedTerminalSilently(savedSummary, lastDesiredAttachMode)
@@ -1002,7 +1061,10 @@ class HerdrMainViewModel(
                     break
                 } else {
                     val currentState = controller.connectionState.value
-                    if (currentState is ConnectionState.Failed && isUnrecoverableErrorKind(currentState.errorKind)) {
+                    if (currentState is ConnectionState.Failed &&
+                        isUnrecoverableErrorKind(currentState.errorKind) &&
+                        alternateProfile == null
+                    ) {
                         break
                     }
                 }
@@ -1096,6 +1158,7 @@ class HerdrMainViewModel(
     }
 
     fun disconnectNow() {
+        sequenceCoordinator.cancel()
         HerdrKeepAliveCoordinator.userWantsConnectionAlive = false
         HerdrKeepAliveCoordinator.isReconnectingInBackground = false
         autoReconnectJob?.cancel()
@@ -1125,6 +1188,9 @@ class HerdrMainViewModel(
     }
 
     fun attachTerminal(summary: TerminalSummary, initialMode: AttachMode = AttachMode.OBSERVE) {
+        if (_activeSession.value?.address != summary.address) {
+            sequenceCoordinator.cancel()
+        }
         sessionJob?.cancel()
         lastDesiredAttachMode = initialMode
         sessionJob = HerdrKeepAliveCoordinator.processScope.launch {
@@ -1508,6 +1574,167 @@ class HerdrMainViewModel(
                 _toastBanner.value = err.message ?: "发送失败"
             }
         }
+    }
+
+    fun cancelActiveSequence() {
+        sequenceCoordinator.cancel()
+    }
+
+    fun submitAgyAskAnswer(
+        questionIndex: Int,
+        selectedNumbers: Set<Int>,
+        writeInText: String?
+    ) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "提交问答 Q$questionIndex",
+            operations = listOf(
+                SequenceOperation.SubmitAskAnswer(
+                    questionIndex = questionIndex,
+                    selectedNumbers = selectedNumbers,
+                    writeInText = writeInText?.takeIf { it.isNotBlank() }
+                )
+            )
+        )
+    }
+
+    fun navigateAgyAsk(direction: AskNavDirection, fromQuestionIndex: Int?) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = direction.label,
+            operations = listOf(
+                SequenceOperation.NavigateAskQuestion(
+                    direction = direction,
+                    expectedFromQuestionIndex = fromQuestionIndex
+                )
+            )
+        )
+    }
+
+    fun cycleAgyModeTo(targetMode: AgyAgentMode) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "切换模式 · ${targetMode.label}",
+            operations = listOf(
+                SequenceOperation.EnsureComposerReady,
+                SequenceOperation.CycleAgentModeTo(targetMode)
+            )
+        )
+    }
+
+    fun runAgySlashCommand(commandText: String, expectModal: AgySlashModalKind?) {
+        val trimmed = commandText.trim()
+        if (trimmed.isBlank()) return
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "执行 $trimmed",
+            operations = listOf(
+                SequenceOperation.EnsureComposerReady,
+                SequenceOperation.SendSlashCommand(command = trimmed, expectModal = expectModal)
+            )
+        )
+    }
+
+    fun selectAgyModalItem(
+        expectedKind: AgySlashModalKind,
+        targetIndex: Int,
+        confirmWithEnter: Boolean,
+        titleHint: String?
+    ) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = titleHint?.let { "选择 $it" } ?: "选择面板项 #${targetIndex + 1}",
+            operations = listOf(
+                SequenceOperation.ModalSelectItem(
+                    expectedKind = expectedKind,
+                    targetIndex = targetIndex,
+                    confirmWithEnter = confirmWithEnter,
+                    targetTitleHint = titleHint
+                )
+            )
+        )
+    }
+
+    fun stepAgyModalValue(
+        expectedKind: AgySlashModalKind,
+        targetIndex: Int,
+        moveRight: Boolean,
+        labelHint: String?
+    ) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = labelHint?.let { "调整 $it" } ?: "调整面板设置",
+            operations = listOf(
+                SequenceOperation.ModalStepItemValue(
+                    expectedKind = expectedKind,
+                    targetIndex = targetIndex,
+                    moveRight = moveRight,
+                    itemLabelHint = labelHint
+                )
+            )
+        )
+    }
+
+    fun switchAgyModalTab(expectedKind: AgySlashModalKind, forward: Boolean) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = if (forward) "下一分页" else "上一分页",
+            operations = listOf(
+                SequenceOperation.ModalSwitchTab(expectedKind = expectedKind, forward = forward)
+            )
+        )
+    }
+
+    fun filterAgyModal(expectedKind: AgySlashModalKind, query: String) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "筛选 ${query.trim()}",
+            operations = listOf(
+                SequenceOperation.ModalFilterText(expectedKind = expectedKind, query = query)
+            )
+        )
+    }
+
+    fun sendAgyModalKey(expectedKind: AgySlashModalKind, keyOrText: String, isSpecialKey: Boolean) {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "操作 $keyOrText",
+            operations = listOf(
+                SequenceOperation.ModalRawKey(
+                    expectedKind = expectedKind,
+                    keyOrText = keyOrText,
+                    isSpecialKey = isSpecialKey
+                )
+            )
+        )
+    }
+
+    fun closeAgyModal() {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "退出当前面板",
+            operations = listOf(SequenceOperation.CloseSlashModal)
+        )
     }
 
     fun sendSpecialKey(keyName: String) {

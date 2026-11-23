@@ -6,6 +6,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -466,6 +467,60 @@ class HcTerminalInteractionTest {
                 }
             }
         }
+
+    @Test fun streamDataEpochIgnoresLocalWritesAndAdvancesOnlyOnRemoteDataFrames() = runBlocking {
+        interactivePeer().use { peer ->
+            peer.client.start()
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            try {
+                val epochBefore = session.outputEpochCount
+                session.sendRawInput("hello".toByteArray()).getOrThrow()
+                delay(50)
+                assertEquals(epochBefore, session.outputEpochCount)
+
+                peer.send(HcFrame(41L, HcFrameKind.DATA, "remote-1\r\n".toByteArray()))
+                awaitUntil { session.outputEpochCount > epochBefore }
+                assertTrue(session.outputEpochCount >= epochBefore + 1)
+            } finally {
+                session.detach()
+            }
+        }
+    }
+
+    @Test fun awaitOutputSettleWaitsForBurstQuietWindowAndRefreshesScreenOnly() = runBlocking {
+        interactivePeer().use { peer ->
+            peer.client.start()
+            val session = peer.client.openTerminalSession("t7", AttachMode.TAKEOVER)
+            try {
+                val epochBefore = session.outputEpochCount
+                val readsBefore = rpcRequests(peer).count {
+                    it.getString("method") == "terminal.read"
+                }
+
+                val job = launch {
+                    delay(40)
+                    peer.send(HcFrame(41L, HcFrameKind.DATA, "chunk-a".toByteArray()))
+                    delay(35)
+                    peer.send(HcFrame(41L, HcFrameKind.DATA, "chunk-b".toByteArray()))
+                }
+                val settled = session.awaitOutputSettle(
+                    previousEpoch = epochBefore,
+                    waitFirstByteMs = 600L,
+                    quietWindowMs = 80L,
+                    maxTotalWaitMs = 900L
+                )
+                job.join()
+
+                assertTrue(settled)
+                assertTrue(session.outputEpochCount >= epochBefore + 2)
+                val readCalls = rpcRequests(peer).filter { it.getString("method") == "terminal.read" }
+                assertTrue(readCalls.size > readsBefore)
+                assertEquals(0, readCalls.last().getJSONObject("params").getInt("lines"))
+            } finally {
+                session.detach()
+            }
+        }
+    }
 
     private fun rawInput(peer: ProtocolPeer) = peer.frames.filter { it.channel != 0L && it.kind == HcFrameKind.DATA }
     private fun rpcRequests(peer: ProtocolPeer) = peer.frames.filter { it.channel == 0L }

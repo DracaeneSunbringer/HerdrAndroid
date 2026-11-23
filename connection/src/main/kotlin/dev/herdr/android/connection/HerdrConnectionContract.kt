@@ -379,6 +379,8 @@ private class PreviewTerminalSession(
 
     private val _isAttached = MutableStateFlow(true)
     override val isAttached: StateFlow<Boolean> = _isAttached.asStateFlow()
+    private val previewEpoch = java.util.concurrent.atomic.AtomicLong(0L)
+    override val outputEpochCount: Long get() = previewEpoch.get()
 
     override suspend fun setMode(newMode: AttachMode) {
         _mode.value = newMode
@@ -390,6 +392,7 @@ private class PreviewTerminalSession(
         }
         val text = bytes.decodeToString()
         _screenSnapshot.value = _screenSnapshot.value + text
+        previewEpoch.incrementAndGet()
         _outputFrames.emit(bytes)
         return Result.success(Unit)
     }
@@ -400,6 +403,7 @@ private class PreviewTerminalSession(
         }
         val appended = "\n› $text\n• [hc send ${summary.address}] 已投递到远端终端 (turn ${summary.turn + 1})\n"
         _screenSnapshot.value = _screenSnapshot.value + appended
+        previewEpoch.incrementAndGet()
         _outputFrames.emit(appended.encodeToByteArray())
         return Result.success(Unit)
     }
@@ -451,8 +455,18 @@ private class PreviewTerminalSession(
         }
         val note = "\n[hc keys ${summary.address} $keyName]"
         _screenSnapshot.value = _screenSnapshot.value + note
+        previewEpoch.incrementAndGet()
         return Result.success(Unit)
     }
+
+    override suspend fun refreshScreenNow(screenOnly: Boolean): Result<String> = Result.success(_screenSnapshot.value)
+
+    override suspend fun awaitOutputSettle(
+        previousEpoch: Long,
+        waitFirstByteMs: Long,
+        quietWindowMs: Long,
+        maxTotalWaitMs: Long
+    ): Boolean = previewEpoch.get() > previousEpoch
 
     override suspend fun interrupt(): Result<Unit> {
         val note = "\n[hc interrupt ${summary.address}] 已发送中断键\n"

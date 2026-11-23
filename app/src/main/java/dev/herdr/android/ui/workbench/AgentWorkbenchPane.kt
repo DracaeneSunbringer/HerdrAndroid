@@ -104,6 +104,10 @@ import dev.herdr.android.ui.components.statusToneOf
 import dev.herdr.android.ui.terminal.AnsiTerminalParser
 import dev.herdr.android.ui.terminal.QuickReplyAction
 import dev.herdr.android.ui.terminal.StructuredTerminalReader
+import dev.herdr.android.ui.terminal.AgyAgentMode
+import dev.herdr.android.ui.terminal.AgySlashCatalog
+import dev.herdr.android.ui.terminal.AgySlashModalKind
+import dev.herdr.android.ui.terminal.AskNavDirection
 import dev.herdr.android.ui.terminal.TerminalDialect
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
 import dev.herdr.android.ui.terminal.WorkbenchSnapshot
@@ -192,6 +196,7 @@ fun AgentWorkbenchPane(
     dispatchedReceipt: DispatchedReceipt?,
     stagedAttachments: List<StagedImageAttachment>,
     requestInputFocusSignal: Long,
+    sequenceStatus: SequenceExecutionStatus?,
     appSettings: HerdrAppSettings,
     savedDesktopDims: Map<String, Pair<Int, Int>>,
     mobilePtyTargetCols: Int,
@@ -206,6 +211,17 @@ fun AgentWorkbenchPane(
     onSendLine: (String, Boolean) -> Unit,
     onSendSpecialKey: (String) -> Unit,
     onInterrupt: () -> Unit,
+    onCancelSequence: () -> Unit,
+    onSubmitAgyAskAnswer: (questionIndex: Int, selectedNumbers: Set<Int>, writeInText: String?) -> Unit,
+    onNavigateAgyAsk: (AskNavDirection, Int) -> Unit,
+    onCycleAgyModeTo: (AgyAgentMode) -> Unit,
+    onRunAgySlashCommand: (commandText: String, expectModal: AgySlashModalKind?) -> Unit,
+    onSelectAgyModalItem: (AgySlashModalKind, Int, Boolean, String?) -> Unit,
+    onStepAgyModalValue: (AgySlashModalKind, Int, Boolean, String?) -> Unit,
+    onSwitchAgyModalTab: (AgySlashModalKind, Boolean) -> Unit,
+    onFilterAgyModal: (AgySlashModalKind, String) -> Unit,
+    onSendAgyModalKey: (AgySlashModalKind, String, Boolean) -> Unit,
+    onCloseAgyModal: () -> Unit,
     onPickTerminal: () -> Unit
 ) {
     if (session == null || summary == null) {
@@ -231,6 +247,8 @@ fun AgentWorkbenchPane(
     var fontZoomDeltaSp by remember(session.address) { mutableFloatStateOf(0f) }
     var softWrapLines by remember(session.address) { mutableStateOf(false) }
     var showKeys by remember(session.address) { mutableStateOf(false) }
+    var showSlashCenter by remember(session.address) { mutableStateOf(false) }
+    val isSequenceBusy = sequenceStatus != null && sequenceStatus.address == session.address
     val inputFocusRequester = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
 
@@ -438,7 +456,8 @@ fun AgentWorkbenchPane(
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(HerdrColors.Canvas)) {
+    Box(modifier = Modifier.fillMaxSize().background(HerdrColors.Canvas)) {
+    Column(modifier = Modifier.fillMaxSize()) {
         // ---------------- Header ----------------
         Column(modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
             Row(
@@ -591,6 +610,9 @@ fun AgentWorkbenchPane(
                             ReaderBlock(
                                 block = block,
                                 stateKey = "${session.address}#$idx",
+                                isSequenceBusy = isSequenceBusy,
+                                onSubmitAgyAskAnswer = onSubmitAgyAskAnswer,
+                                onNavigateAgyAsk = onNavigateAgyAsk,
                                 onCopy = { clipboard.setText(AnnotatedString(it)) }
                             )
                         }
@@ -685,7 +707,50 @@ fun AgentWorkbenchPane(
             }
         }
 
-        // ---------------- Composer ----------------
+        // ---------------- Agy Sequence Strip & Modal Host + Composer ----------------
+        val activeAgyState = snapshot.agyState
+        val isAgyDialect = snapshot.dialect == TerminalDialect.ANTIGRAVITY ||
+            summary?.agentApp.equals("antigravity", ignoreCase = true) ||
+            summary?.agentApp.equals("agy", ignoreCase = true) ||
+            activeAgyState != null
+        val activeModal = activeAgyState?.activeSlashModal
+        if (isSequenceBusy || activeModal != null) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (sequenceStatus != null && sequenceStatus.address == session.address) {
+                    SequenceStatusStrip(
+                        status = sequenceStatus,
+                        onCancel = onCancelSequence
+                    )
+                }
+                if (activeModal != null) {
+                    AgySlashModalHostCard(
+                        modal = activeModal,
+                        isBusy = isSequenceBusy,
+                        onSelectItem = { index, confirmEnter, title ->
+                            onSelectAgyModalItem(activeModal.kind, index, confirmEnter, title)
+                        },
+                        onStepValue = { index, moveRight, label ->
+                            onStepAgyModalValue(activeModal.kind, index, moveRight, label)
+                        },
+                        onSwitchTab = { forward ->
+                            onSwitchAgyModalTab(activeModal.kind, forward)
+                        },
+                        onFilter = { query ->
+                            onFilterAgyModal(activeModal.kind, query)
+                        },
+                        onSendRawKey = { rawKey ->
+                            onSendAgyModalKey(activeModal.kind, rawKey, true)
+                        },
+                        onClose = onCloseAgyModal
+                    )
+                }
+            }
+        }
         HerdrDivider()
         Column(
             modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
@@ -699,6 +764,27 @@ fun AgentWorkbenchPane(
                 ) {
                     quickActions.forEach { action ->
                         QuickChip(action) { dispatch(action) }
+                    }
+                }
+                if (isAgyDialect) {
+                    Spacer(Modifier.width(6.dp))
+                    val modeTag = activeAgyState?.agentMode?.label
+                    Row(
+                        modifier = Modifier
+                            .height(34.dp)
+                            .clip(HerdrShapes.Pill)
+                            .background(if (showSlashCenter) HerdrColors.AccentSubtle else HerdrColors.Raised)
+                            .clickable { showSlashCenter = true }
+                            .padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = if (modeTag != null) "/ · $modeTag" else "/ 命令",
+                            style = HerdrType.Caption,
+                            color = if (showSlashCenter) HerdrColors.Accent else HerdrColors.Foreground,
+                            maxLines = 1
+                        )
                     }
                 }
                 Spacer(Modifier.width(6.dp))
@@ -785,6 +871,12 @@ fun AgentWorkbenchPane(
                 initialDraft = draftText,
                 stagedAttachments = stagedAttachments,
                 focusRequester = inputFocusRequester,
+                isAgyDialect = isAgyDialect,
+                isSequenceBusy = isSequenceBusy,
+                onRunAgySlashCommand = { cmdText, expectModal ->
+                    followBottom = true
+                    onRunAgySlashCommand(cmdText, expectModal)
+                },
                 onUpdateDraft = onUpdateDraft,
                 onPickImages = {
                     imagePickerLauncher.launch(
@@ -807,6 +899,22 @@ fun AgentWorkbenchPane(
             )
         }
     }
+    AgySlashCommandCenterSheet(
+        visible = showSlashCenter,
+        agyState = snapshot.agyState,
+        isBusy = isSequenceBusy,
+        onDismiss = { showSlashCenter = false },
+        onCycleModeTo = { targetMode ->
+            showSlashCenter = false
+            onCycleAgyModeTo(targetMode)
+        },
+        onRunCommand = { cmdText, expectModal ->
+            showSlashCenter = false
+            followBottom = true
+            onRunAgySlashCommand(cmdText, expectModal)
+        }
+    )
+    }
 }
 
 @Composable
@@ -816,6 +924,9 @@ private fun WorkbenchComposer(
     initialDraft: String,
     stagedAttachments: List<StagedImageAttachment>,
     focusRequester: FocusRequester,
+    isAgyDialect: Boolean,
+    isSequenceBusy: Boolean,
+    onRunAgySlashCommand: (String, AgySlashModalKind?) -> Unit,
     onUpdateDraft: (String) -> Unit,
     onPickImages: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
@@ -852,15 +963,128 @@ private fun WorkbenchComposer(
             onUpdateDraft("")
             onSubmitWithAttachments(currentText, true)
         } else if (currentText.isNotBlank()) {
+            val trimmed = currentText.trim()
+            val matchedSpec = if (isAgyDialect && trimmed.startsWith("/") && '\n' !in trimmed) {
+                val cmdToken = trimmed.substringBefore(' ')
+                AgySlashCatalog.allCommands.firstOrNull { it.cmd.equals(cmdToken, ignoreCase = true) }
+            } else {
+                null
+            }
             localDraft = ""
             onUpdateDraft("")
-            onSubmitLine(currentText)
+            if (matchedSpec != null && !isSequenceBusy) {
+                val expectModal = if (' ' !in trimmed) matchedSpec.modalKind else null
+                onRunAgySlashCommand(trimmed, expectModal)
+            } else {
+                onSubmitLine(currentText)
+            }
         } else {
             onSubmitEmpty()
         }
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (isAgyDialect && localDraft.startsWith("/") && '\n' !in localDraft) {
+            val firstWord = localDraft.trimStart().substringBefore(' ')
+            val exactSpec = remember(firstWord) {
+                AgySlashCatalog.allCommands.firstOrNull { it.cmd.equals(firstWord, ignoreCase = true) }
+            }
+            val matchedCommands = remember(firstWord) {
+                AgySlashCatalog.allCommands
+                    .filter { it.cmd.startsWith(firstWord, ignoreCase = true) }
+                    .take(8)
+            }
+            if (matchedCommands.isNotEmpty() || exactSpec != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (exactSpec != null && exactSpec.quickParams.isNotEmpty()) {
+                        if (exactSpec.modalKind != null) {
+                            Row(
+                                modifier = Modifier
+                                    .height(28.dp)
+                                    .clip(HerdrShapes.Pill)
+                                    .background(HerdrColors.AccentSubtle)
+                                    .clickable(enabled = !isSequenceBusy) {
+                                        localDraft = ""
+                                        onUpdateDraft("")
+                                        onRunAgySlashCommand(exactSpec.cmd, exactSpec.modalKind)
+                                    }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "${exactSpec.cmd} 面板",
+                                    style = HerdrType.Caption,
+                                    color = HerdrColors.Accent
+                                )
+                            }
+                        }
+                        exactSpec.quickParams.forEach { param ->
+                            Row(
+                                modifier = Modifier
+                                    .height(28.dp)
+                                    .clip(HerdrShapes.Pill)
+                                    .background(HerdrColors.Raised)
+                                    .clickable(enabled = !isSequenceBusy) {
+                                        localDraft = ""
+                                        onUpdateDraft("")
+                                        onRunAgySlashCommand("${exactSpec.cmd} $param", null)
+                                    }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "${exactSpec.cmd} $param",
+                                    style = HerdrType.Caption,
+                                    color = HerdrColors.Foreground
+                                )
+                            }
+                        }
+                    } else {
+                        matchedCommands.forEach { spec ->
+                            val directModal = spec.modalKind != null &&
+                                spec.quickParams.isEmpty() &&
+                                !spec.acceptsFreeTextArg &&
+                                !spec.requiresConfirm
+                            Row(
+                                modifier = Modifier
+                                    .height(28.dp)
+                                    .clip(HerdrShapes.Pill)
+                                    .background(HerdrColors.Raised)
+                                    .clickable(enabled = !isSequenceBusy) {
+                                        if (directModal) {
+                                            localDraft = ""
+                                            onUpdateDraft("")
+                                            onRunAgySlashCommand(spec.cmd, spec.modalKind)
+                                        } else {
+                                            localDraft = if (spec.requiresConfirm) spec.cmd else "${spec.cmd} "
+                                        }
+                                    }
+                                    .padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Text(
+                                    text = spec.cmd,
+                                    style = HerdrType.Caption,
+                                    color = HerdrColors.Accent
+                                )
+                                Text(
+                                    text = spec.title,
+                                    style = HerdrType.Caption,
+                                    color = HerdrColors.Muted
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
         AnimatedVisibility(visible = stagedAttachments.isNotEmpty()) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1069,8 +1293,23 @@ private fun SentBubble(text: String) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ReaderBlock(block: TerminalSemanticBlock, stateKey: String, onCopy: (String) -> Unit) {
+private fun ReaderBlock(
+    block: TerminalSemanticBlock,
+    stateKey: String,
+    isSequenceBusy: Boolean,
+    onSubmitAgyAskAnswer: (questionIndex: Int, selectedNumbers: Set<Int>, writeInText: String?) -> Unit,
+    onNavigateAgyAsk: (AskNavDirection, Int) -> Unit,
+    onCopy: (String) -> Unit
+) {
     when (block) {
+        is TerminalSemanticBlock.AskCardBlock -> {
+            AgyAskCardComposable(
+                card = block.card,
+                isBusy = isSequenceBusy,
+                onSubmitAnswer = onSubmitAgyAskAnswer,
+                onNavigate = onNavigateAgyAsk
+            )
+        }
         is TerminalSemanticBlock.UserPromptBlock -> {
             val (from, body) = remember(block.text) { splitHcPrompt(block.text) }
             Row(modifier = Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {

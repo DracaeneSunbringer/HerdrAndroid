@@ -142,8 +142,12 @@ class SshjHcConnector(
             ssh.authPublickey(profile.username, key)
             ssh.setTimeout(0)
             // SSHJ's setTimeout changes the setting used on the next connect, not this socket.
-            ssh.socket.soTimeout = 0
-            ssh.getConnection().getKeepAlive().setKeepAliveInterval(15)
+            ssh.socket?.let { sock ->
+                runCatching { sock.soTimeout = 0 }
+                runCatching { sock.tcpNoDelay = true }
+                runCatching { sock.keepAlive = true }
+            }
+            ssh.getConnection().getKeepAlive().setKeepAliveInterval(10)
             object : AuthenticatedSshConnection {
                 override val hostKeyFingerprint: String = actualFingerprint
                 override suspend fun exec(command: String): SshHcExecChannel = withContext(Dispatchers.IO) {

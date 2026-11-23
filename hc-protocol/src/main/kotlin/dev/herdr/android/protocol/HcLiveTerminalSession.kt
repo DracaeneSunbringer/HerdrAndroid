@@ -33,10 +33,14 @@ internal class HcLiveTerminalSession(
     private val snapshotOperation = Mutex()
     private val gridRevision = AtomicLong()
     private val outputEpoch = AtomicLong(1L)
+    private val streamDataEpoch = AtomicLong(0L)
+    override val outputEpochCount: Long
+        get() = streamDataEpoch.get()
     private var historyPrefix: List<String> = emptyList() // protected by snapshotOperation
     private var lastReadWasStitched: Boolean = false // protected by snapshotOperation
     private var lastStitchedEpoch: Long = -1L // protected by snapshotOperation
     private var quickRefreshJob: Job? = null
+    private var streamRefreshJob: Job? = null
     private var stream = initialStream
     private var pump: Job? = null
     private var streamEpoch = 0L
@@ -83,6 +87,8 @@ internal class HcLiveTerminalSession(
                     when (frame.kind) {
                         HcFrameKind.DATA -> {
                             outputEpoch.incrementAndGet()
+                            streamDataEpoch.incrementAndGet()
+                            scheduleStreamRefresh()
                             _outputFrames.emit(frame.payload.copyOf())
                         }
                         HcFrameKind.RESIZE -> {
@@ -143,9 +149,87 @@ internal class HcLiveTerminalSession(
         outputEpoch.incrementAndGet()
         quickRefreshJob?.cancel()
         quickRefreshJob = scope.launch {
-            delay(180)
+            delay(160)
             readOrNull { refreshSnapshot() }
         }
+    }
+
+    private fun scheduleStreamRefresh() {
+        if (streamRefreshJob?.isActive == true) return
+        streamRefreshJob = scope.launch {
+            delay(120)
+            if (_isAttached.value) {
+                readOrNull { refreshSnapshot() }
+            }
+        }
+    }
+
+    override suspend fun refreshScreenNow(screenOnly: Boolean): Result<String> {
+        if (!_isAttached.value) {
+            return Result.failure(IllegalStateException("Terminal is detached"))
+        }
+        return try {
+            if (screenOnly) {
+                snapshotOperation.withLock {
+                    if (!_isAttached.value) {
+                        return Result.failure(IllegalStateException("Terminal is detached"))
+                    }
+                    val revision = gridRevision.get()
+                    val read = client.readTerminalSnapshot(address, lines = 0)
+                    if (gridRevision.get() != revision || !_isAttached.value) {
+                        return@withLock
+                    }
+                    _screenSnapshot.value = if (historyPrefix.isEmpty()) {
+                        read.text
+                    } else {
+                        historyPrefix.joinToString("\n") + "\n" + read.text
+                    }
+                }
+            } else {
+                refreshSnapshot()
+            }
+            Result.success(_screenSnapshot.value)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+    }
+
+    override suspend fun awaitOutputSettle(
+        previousEpoch: Long,
+        waitFirstByteMs: Long,
+        quietWindowMs: Long,
+        maxTotalWaitMs: Long
+    ): Boolean {
+        val beforeScreen = _screenSnapshot.value
+        val started = System.nanoTime()
+        fun elapsedMs(): Long = (System.nanoTime() - started) / 1_000_000L
+
+        var observedEpoch = streamDataEpoch.get()
+        while (_isAttached.value && observedEpoch <= previousEpoch && elapsedMs() < waitFirstByteMs) {
+            delay(15)
+            observedEpoch = streamDataEpoch.get()
+        }
+
+        if (observedEpoch > previousEpoch) {
+            var lastEpoch = observedEpoch
+            var lastChangeMs = elapsedMs()
+            while (_isAttached.value && elapsedMs() < maxTotalWaitMs) {
+                if (elapsedMs() - lastChangeMs >= quietWindowMs) {
+                    break
+                }
+                delay(15)
+                val nowEpoch = streamDataEpoch.get()
+                if (nowEpoch > lastEpoch) {
+                    lastEpoch = nowEpoch
+                    lastChangeMs = elapsedMs()
+                }
+            }
+        }
+
+        val updatedScreen = refreshScreenNow(screenOnly = true).getOrNull()
+        return streamDataEpoch.get() > previousEpoch || (updatedScreen != null && updatedScreen != beforeScreen)
     }
 
     override suspend fun setMode(newMode: AttachMode) = operation.withLock {

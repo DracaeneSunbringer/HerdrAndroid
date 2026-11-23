@@ -152,6 +152,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val fleetDigests by viewModel.fleetDigests.collectAsState()
     val stagedAttachmentsByAddress by viewModel.stagedAttachmentsByAddress.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
+    val sequenceStatus by viewModel.sequenceStatus.collectAsState()
     val liveTerminals = remember(allTerminals) { allTerminals.filter { it.state == "live" } }
     val context = LocalContext.current
 
@@ -268,6 +269,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         dispatchedReceipt = activeSession?.address?.let { dispatchedReceipts[it] },
                         stagedAttachments = activeSession?.address?.let { stagedAttachmentsByAddress[it] }.orEmpty(),
                         requestInputFocusSignal = requestInputFocusSignal,
+                        sequenceStatus = sequenceStatus,
                         appSettings = appSettings,
                         savedDesktopDims = savedDesktopDims,
                         mobilePtyTargetCols = mobilePtyTargetCols,
@@ -286,6 +288,17 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         onSendLine = viewModel::sendTerminalLine,
                         onSendSpecialKey = viewModel::sendSpecialKey,
                         onInterrupt = viewModel::interruptActiveTerminal,
+                        onCancelSequence = viewModel::cancelActiveSequence,
+                        onSubmitAgyAskAnswer = viewModel::submitAgyAskAnswer,
+                        onNavigateAgyAsk = viewModel::navigateAgyAsk,
+                        onCycleAgyModeTo = viewModel::cycleAgyModeTo,
+                        onRunAgySlashCommand = viewModel::runAgySlashCommand,
+                        onSelectAgyModalItem = viewModel::selectAgyModalItem,
+                        onStepAgyModalValue = viewModel::stepAgyModalValue,
+                        onSwitchAgyModalTab = viewModel::switchAgyModalTab,
+                        onFilterAgyModal = viewModel::filterAgyModal,
+                        onSendAgyModalKey = viewModel::sendAgyModalKey,
+                        onCloseAgyModal = viewModel::closeAgyModal,
                         onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                     )
 
