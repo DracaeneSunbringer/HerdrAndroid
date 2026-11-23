@@ -288,6 +288,27 @@ object AnsiTerminalParser {
                             handled = true
                         }
                     }
+
+                    in '\u2580'..'\u259F' -> {
+                        if (!isFooterLine(trimmed)) {
+                            var p = firstIdx
+                            while (p < line.length && (line[p] == ' ' || line[p] in '\u2580'..'\u259F')) {
+                                p++
+                            }
+                            appendStyledSegment(line.substring(0, p), HerdrColors.Accent, Color.Unspecified, false)
+                            if (p < line.length) {
+                                val right = line.substring(p)
+                                val isTitle = "Antigravity CLI" in right || "Claude Code" in right
+                                appendStyledSegment(
+                                    right,
+                                    if (isTitle) HerdrColors.Foreground else HerdrColors.Muted,
+                                    Color.Unspecified,
+                                    isTitle
+                                )
+                            }
+                            handled = true
+                        }
+                    }
                 }
 
                 if (!handled) {

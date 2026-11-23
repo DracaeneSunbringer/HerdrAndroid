@@ -1025,6 +1025,182 @@ class AgyInteractiveAndSequenceTest {
         }
     }
 
+    @Test(timeout = 15_000)
+    fun btwRichContentParsesAgyPipeTablesBoxTablesMarkdownTablesAndCodeBlocks() {
+        val mixedAnswer = """
+            ## Architecture Overview
+
+            Here is the Antigravity borderless table:
+
+            Module │ Layer │ Summary
+            ───────┼───────┼────────────────────────
+            app    │ UI    │ Jetpack Compose workbench
+            connection │ SSH │ SshHcConnectionController
+
+            Box table sample:
+
+            ┌────────────┬────────────┐
+            │ Key        │ Value      │
+            ├────────────┼────────────┤
+            │ appId      │ dev.herdr  │
+            │ version    │ 0.4.0      │
+            └────────────┴────────────┘
+
+            Standard markdown table:
+
+            | File | Lines | Scope |
+            | :--- | :---: | ---: |
+            | `Main.kt` | 42 | **core** |
+            | App.kt | 18 | ui |
+
+            ```kotlin
+            fun greet() {
+                println("hi")
+            }
+            ```
+
+            - First bullet with `inline` code
+            - Second bullet item
+        """.trimIndent()
+
+        val segments = BtwRichContentParser.parse(mixedAnswer)
+        val headings = segments.filterIsInstance<BtwContentSegment.Heading>()
+        assertEquals(1, headings.size)
+        assertEquals("Architecture Overview", headings[0].text)
+        assertEquals(2, headings[0].level)
+
+        val tables = segments.filterIsInstance<BtwContentSegment.Table>()
+        assertEquals("Expected all 3 table families parsed", 3, tables.size)
+
+        // 1. Borderless agy table
+        assertEquals(listOf("Module", "Layer", "Summary"), tables[0].headers)
+        assertEquals(2, tables[0].rows.size)
+        assertEquals(listOf("app", "UI", "Jetpack Compose workbench"), tables[0].rows[0])
+
+        // 2. Unicode box table
+        assertEquals(listOf("Key", "Value"), tables[1].headers)
+        assertEquals(listOf("appId", "dev.herdr"), tables[1].rows[0])
+        assertEquals(listOf("version", "0.4.0"), tables[1].rows[1])
+
+        // 3. Markdown table with alignments
+        assertEquals(listOf("File", "Lines", "Scope"), tables[2].headers)
+        assertEquals(listOf(BtwTableAlign.START, BtwTableAlign.CENTER, BtwTableAlign.END), tables[2].alignments)
+        assertEquals(listOf("`Main.kt`", "42", "**core**"), tables[2].rows[0])
+
+        // 4. Fenced code preserves indentation
+        val codeBlocks = segments.filterIsInstance<BtwContentSegment.CodeBlock>()
+        assertEquals(1, codeBlocks.size)
+        assertEquals("kotlin", codeBlocks[0].language)
+        assertTrue(codeBlocks[0].code.contains("    println(\"hi\")"))
+
+        // 5. Bullet list
+        val lists = segments.filterIsInstance<BtwContentSegment.BulletList>()
+        assertEquals(1, lists.size)
+        assertEquals(2, lists[0].items.size)
+        assertEquals("First bullet with `inline` code", lists[0].items[0].text)
+    }
+
+    @Test(timeout = 15_000)
+    fun multiTurnBtwCardPreservesIndentationAndSplitsTurns() {
+        val rule = "─".repeat(100)
+        val multiTurnScreen = """
+             ┃ /btw Compare modules in a table
+             ┃
+             ┃   Called 1 tool (1 read_file)
+             ┃
+             ┃   Module     │ Role
+             ┃   ───────────┼───────────────────────
+             ┃   app        │ Compose UI
+             ┃   connection │ SSH & ZeroTier control
+             ┃
+             ┃ /btw Show indented sample
+             ┃
+             ┃   ```kotlin
+             ┃   fun hello() {
+             ┃       val x = 1
+             ┃   }
+             ┃   ```
+             ┃
+             ┃   - Item mentions failed validation gracefully
+             ┃ Tab to expand · Enter/Esc to dismiss
+            $rule
+            >
+            $rule
+            ? for shortcuts   auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+
+        val state = AgyInteractiveParser.inspectRaw(multiTurnScreen)
+        val card = state.activeBtwCard
+        assertNotNull(card)
+        requireNotNull(card)
+        assertEquals(2, card.turns.size)
+
+        val t1 = card.turns[0]
+        assertEquals("Compare modules in a table", t1.question)
+        assertFalse(t1.isRunning)
+        assertEquals("Called 1 tool (1 read_file)", t1.statusSummary)
+        val t1Segments = BtwRichContentParser.parse(t1.answerText)
+        val t1Tables = t1Segments.filterIsInstance<BtwContentSegment.Table>()
+        assertEquals("Expected turn 1 pipe table to parse cleanly", 1, t1Tables.size)
+        assertEquals(listOf("Module", "Role"), t1Tables[0].headers)
+        assertEquals(listOf("connection", "SSH & ZeroTier control"), t1Tables[0].rows[1])
+
+        val t2 = card.turns[1]
+        assertEquals("Show indented sample", t2.question)
+        assertFalse("Prose mentioning 'failed' must not mark turn as error", t2.isError)
+        assertTrue("Relative code indentation must be preserved", "    val x = 1" in t2.answerText)
+        val t2Segs = BtwRichContentParser.parse(t2.answerText)
+        assertTrue(t2Segs.any { it is BtwContentSegment.CodeBlock && "    val x = 1" in it.code })
+        assertTrue(t2Segs.any { it is BtwContentSegment.BulletList })
+    }
+
+    @Test(timeout = 15_000)
+    fun sendBtwQuestionWaitsPastPreviousFinishedCardWithoutRequiringEsc() {
+        val rule = "─".repeat(80)
+        val oldFinishedScreen = """
+             ┃ /btw First question
+             ┃
+             ┃   First answer.
+             ┃ Tab to expand · Enter/Esc to dismiss
+            $rule
+            >
+            $rule
+            ? for shortcuts   auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+        val oldState = AgyInteractiveParser.inspectRaw(oldFinishedScreen)
+
+        val op = SequenceOperation.SendBtwQuestion(
+            question = "Follow-up question",
+            previousQuestion = "First question",
+            previousTurnCount = 1
+        )
+        // Before sending, should send RawText
+        val preStep = AgySequencePlanner.nextAction(op, oldState, sentCommandThisOp = false)
+        assertEquals(SequenceStepVerdict.EXECUTE_TEXT, preStep.verdict)
+
+        // After sending, if frame still reflects old finished card, WAIT_MORE instead of premature done
+        val staleStep = AgySequencePlanner.nextAction(op, oldState, sentCommandThisOp = true)
+        assertEquals(SequenceStepVerdict.WAIT_MORE, staleStep.verdict)
+
+        // Once new question card appears (single or multi-turn), ALREADY_DONE
+        val newScreen = """
+             ┃ /btw First question
+             ┃
+             ┃   First answer.
+             ┃
+             ┃ /btw Follow-up question
+             ┃
+             ┃ ⣯  Thinking... (Enter/Esc to cancel)
+            $rule
+            >
+            $rule
+            ? for shortcuts   auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+        val newState = AgyInteractiveParser.inspectRaw(newScreen)
+        val liveStep = AgySequencePlanner.nextAction(op, newState, sentCommandThisOp = true)
+        assertEquals(SequenceStepVerdict.ALREADY_DONE, liveStep.verdict)
+    }
+
     private fun fakeConnectedState(host: String = "192.168.1.100"): ConnectionState.Connected =
         ConnectionState.Connected(
             profile = ConnectionProfile(host = host),

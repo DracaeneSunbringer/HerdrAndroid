@@ -1096,4 +1096,131 @@ class StructuredTerminalReaderTest {
         val modalPayloads = modalSnapshot.quickActions.map { it.payload }
         assertTrue(listOf("left", "up", "down", "right", "enter", "esc").all { it in modalPayloads })
     }
+
+    @Test
+    fun antigravityStartupLogo_rendersCleanSessionHeaderBeforeTurnOneAndStripsOnceConversationStarts() {
+        val freshAgyScreen = """
+                  ▄▀▀▄        Antigravity CLI 1.5.14
+                 ▀▀▀▀▀▀       nebrenskyvanessa662@gmail.com (Google AI Ultra)
+                ▀▀▀▀▀▀▀▀      Orchestrator (Carbon)
+               ▄▀▀    ▀▀▄     D:/luoyu/Documents/Code/HerdrAndroid
+              ▄▀▀      ▀▀▄
+
+            ───────────────────────────────────────────────────────────────────────────
+            >
+            ───────────────────────────────────────────────────────────────────────────
+            ? for shortcuts                          auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+
+        assertEquals(TerminalDialect.ANTIGRAVITY, StructuredTerminalReader.detectDialect(null, freshAgyScreen))
+
+        val freshBlocks = StructuredTerminalReader.parseBlocks(freshAgyScreen, agentApp = "antigravity")
+        assertEquals(1, freshBlocks.size)
+        val header = freshBlocks.single() as TerminalSemanticBlock.SessionHeaderBlock
+        assertEquals("Antigravity CLI 1.5.14", header.agentTitle)
+        assertEquals("Orchestrator (Carbon)", header.modelOrRole)
+        assertEquals("nebrenskyvanessa662@gmail.com (Google AI Ultra)", header.accountOrPlan)
+        assertTrue(header.details.none { it.contains("HerdrAndroid") || it.contains("▄") || it.contains("▀") })
+
+        val freshSummary = TerminalSummary(
+            address = "t43",
+            name = "agy-logo-verify",
+            cwd = "D:/luoyu/Documents/Code/HerdrAndroid",
+            agentApp = "antigravity",
+            agentStatus = AgentStateWord.IDLE
+        )
+        val headline = StructuredTerminalReader.extractLatestHeadline(freshAgyScreen, freshSummary)
+        assertEquals("已就绪 · Orchestrator (Carbon)", headline)
+        assertFalse(headline.contains("▀") || headline.contains("▄"))
+
+        // Once turn 1 starts with the logo still visible in scrollback, strip the logo completely
+        val activeAgyScreen = """
+                  ▄▀▀▄        Antigravity CLI 1.5.14
+                 ▀▀▀▀▀▀       nebrenskyvanessa662@gmail.com (Google AI Ultra)
+                ▀▀▀▀▀▀▀▀      Orchestrator (Carbon)
+               ▄▀▀    ▀▀▄     D:/luoyu/Documents/Code/HerdrAndroid
+              ▄▀▀      ▀▀▄
+
+            ───────────────────────────────────────────────────────────────────────────
+            > 检查构建脚本
+            ● Explored 1 file (app/build.gradle.kts)
+              构建配置正常。
+        """.trimIndent()
+
+        val activeBlocks = StructuredTerminalReader.parseBlocks(activeAgyScreen, agentApp = "antigravity")
+        assertTrue(activeBlocks.none { it is TerminalSemanticBlock.SessionHeaderBlock })
+        assertTrue(activeBlocks.none { it is TerminalSemanticBlock.CodeOrTableBlock })
+        val prose = activeBlocks.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>()
+        assertEquals(listOf("构建配置正常。"), prose.map { it.text })
+    }
+
+    @Test
+    fun claudeCodeAndCodexStartupBanners_renderCleanSessionHeaderAndPreserveStatusCommandCards() {
+        // 1. Borderless Claude Code mascot banner
+        val claudeMascotScreen = """
+             ▐▛███▜▌   Claude Code v2.1.12
+            ▝▜█████▛▘  Opus 4.6 · Claude Max
+              ▘▘ ▝▝    ~/Code/HerdrAndroid
+
+            ───────────────────────────────────────────────────────────────────────────
+            ❯
+            ───────────────────────────────────────────────────────────────────────────
+        """.trimIndent()
+        assertEquals(TerminalDialect.CLAUDE, StructuredTerminalReader.detectDialect(null, claudeMascotScreen))
+        val claudeMascotBlocks = StructuredTerminalReader.parseBlocks(claudeMascotScreen, agentApp = "claude")
+        assertEquals(1, claudeMascotBlocks.size)
+        val claudeHeader = claudeMascotBlocks.single() as TerminalSemanticBlock.SessionHeaderBlock
+        assertEquals("Claude Code v2.1.12", claudeHeader.agentTitle)
+        assertEquals("Opus 4.6", claudeHeader.modelOrRole)
+        assertEquals("Claude Max", claudeHeader.accountOrPlan)
+
+        // 2. Two-column boxed Claude Code welcome banner
+        val claudeBoxScreen = """
+            ╭─── Claude Code v2.1.12 ───────────────────────────────────────────────╮
+            │ Welcome back Luoyu!                 │ Tips for getting started        │
+            │        ▐▛███▜▌                      │ Run /init to create a CLAUDE.md │
+            │       ▝▜█████▛▘                     │ ─────────────────────────────── │
+            │         ▘▘ ▝▝                       │ Recent activity                 │
+            │ Opus 4.6 · Claude Max               │ No recent activity              │
+            │ D:\luoyu\Documents\Code\HerdrAndroid│                                 │
+            ╰───────────────────────────────────────────────────────────────────────╯
+        """.trimIndent()
+        val claudeBoxBlocks = StructuredTerminalReader.parseBlocks(claudeBoxScreen, agentApp = "claude")
+        assertEquals(1, claudeBoxBlocks.size)
+        val boxHeader = claudeBoxBlocks.single() as TerminalSemanticBlock.SessionHeaderBlock
+        assertEquals("Claude Code v2.1.12", boxHeader.agentTitle)
+        assertEquals("Opus 4.6", boxHeader.modelOrRole)
+        assertEquals("Claude Max", boxHeader.accountOrPlan)
+        assertTrue(boxHeader.details.none { it.contains("Tips") || it.contains("HerdrAndroid") })
+
+        // 3. Newly created Codex startup box -> SessionHeaderBlock (not raw CodeOrTableBlock)
+        val freshCodexScreen = """
+            ╭──────────────────────────────────────────────────╮
+            │ >_ OpenAI Codex (v0.167.0)                       │
+            │                                                  │
+            │ model:     gpt-5-codex   /model to change        │
+            │ directory: ~/Code/HerdrAndroid                   │
+            ╰──────────────────────────────────────────────────╯
+
+            › Ask Codex to do anything
+        """.trimIndent()
+        val codexBlocks = StructuredTerminalReader.parseBlocks(freshCodexScreen, agentApp = "codex")
+        assertEquals(1, codexBlocks.size)
+        val codexHeader = codexBlocks.single() as TerminalSemanticBlock.SessionHeaderBlock
+        assertEquals("OpenAI Codex (v0.167.0)", codexHeader.agentTitle)
+        assertEquals("gpt-5-codex", codexHeader.modelOrRole)
+
+        // 4. Explicit Codex /status card with limits still renders as CodeOrTableBlock("Codex 状态")
+        val codexStatusScreen = """
+            ╭──────────────────────────────────────────────────╮
+            │ >_ OpenAI Codex (v0.167.0)                       │
+            │ Model:     gpt-5-codex                           │
+            │ 5h limit:  [██████████] 100% left                │
+            ╰──────────────────────────────────────────────────╯
+        """.trimIndent()
+        val statusBlocks = StructuredTerminalReader.parseBlocks(codexStatusScreen, agentApp = "codex")
+        val statusCard = statusBlocks.single() as TerminalSemanticBlock.CodeOrTableBlock
+        assertEquals("Codex 状态", statusCard.kindLabel)
+        assertTrue(statusCard.content.contains("5h limit:"))
+    }
 }

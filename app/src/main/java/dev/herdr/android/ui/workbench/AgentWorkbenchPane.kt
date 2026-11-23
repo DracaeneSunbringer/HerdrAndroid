@@ -7,6 +7,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
@@ -105,6 +106,8 @@ import dev.herdr.android.ui.terminal.AnsiTerminalParser
 import dev.herdr.android.ui.terminal.QuickReplyAction
 import dev.herdr.android.ui.terminal.StructuredTerminalReader
 import dev.herdr.android.ui.terminal.AgyAgentMode
+import dev.herdr.android.ui.terminal.AgyBtwCardState
+import dev.herdr.android.ui.terminal.AgyBtwTurn
 import dev.herdr.android.ui.terminal.AgySlashCatalog
 import dev.herdr.android.ui.terminal.AgySlashModalKind
 import dev.herdr.android.ui.terminal.AskNavDirection
@@ -225,6 +228,10 @@ fun AgentWorkbenchPane(
     onSendAgyBtwQuestion: (String) -> Unit,
     onDismissAgyBtw: () -> Unit,
     onToggleAgyBtwExpand: () -> Unit,
+    btwHistory: List<AgyBtwTurn> = emptyList(),
+    isViewingBtwHistory: Boolean = false,
+    onSyncLiveBtwCard: (AgyBtwCardState?) -> Unit = {},
+    onOpenBtwHistory: () -> Unit = {},
     onPickTerminal: () -> Unit
 ) {
     if (session == null || summary == null) {
@@ -251,6 +258,7 @@ fun AgentWorkbenchPane(
     var softWrapLines by remember(session.address) { mutableStateOf(false) }
     var showKeys by remember(session.address) { mutableStateOf(false) }
     var showSlashCenter by remember(session.address) { mutableStateOf(false) }
+    var btwFollowUpFocused by remember(session.address) { mutableStateOf(false) }
     val isSequenceBusy = sequenceStatus != null && sequenceStatus.address == session.address
     val inputFocusRequester = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
@@ -295,6 +303,10 @@ fun AgentWorkbenchPane(
                 session.refreshScreenNow(screenOnly = true)
             }
         }
+    }
+
+    LaunchedEffect(session.address, snapshot.agyState?.activeBtwCard) {
+        onSyncLiveBtwCard(snapshot.agyState?.activeBtwCard)
     }
 
     val blocks = snapshot.blocks
@@ -470,7 +482,8 @@ fun AgentWorkbenchPane(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(HerdrColors.Canvas)) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize().background(HerdrColors.Canvas)) {
+    val isCompactViewport = maxHeight < 580.dp
     Column(modifier = Modifier.fillMaxSize()) {
         // ---------------- Header ----------------
         Column(modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
@@ -609,8 +622,14 @@ fun AgentWorkbenchPane(
                     }
                     if (blocks.isEmpty()) {
                         item(key = "empty", contentType = "empty") {
+                            val emptyHint = summary.agentMessage?.takeIf { it.isNotBlank() }
+                                ?: if (hasInitialSnapshot && rawScreen.isNotBlank()) {
+                                    if (isAgentTui) "终端已就绪，在下方输入首条指令" else "终端空闲"
+                                } else {
+                                    "正在同步画面…"
+                                }
                             Text(
-                                summary.agentMessage?.takeIf { it.isNotBlank() } ?: "正在同步画面…",
+                                emptyHint,
                                 style = HerdrType.Body,
                                 color = HerdrColors.Muted
                             )
@@ -729,7 +748,8 @@ fun AgentWorkbenchPane(
             activeAgyState != null
         val activeModal = activeAgyState?.activeSlashModal
         val activeBtw = activeAgyState?.activeBtwCard
-        if (isSequenceBusy || activeBtw != null || activeModal != null) {
+        val showBtwCard = activeBtw != null || (isViewingBtwHistory && btwHistory.isNotEmpty())
+        if (isSequenceBusy || showBtwCard || activeModal != null) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -742,10 +762,14 @@ fun AgentWorkbenchPane(
                         onCancel = onCancelSequence
                     )
                 }
-                if (activeBtw != null) {
+                if (showBtwCard) {
                     AgyBtwCardComposable(
-                        card = activeBtw,
+                        liveCard = activeBtw,
+                        historyTurns = btwHistory,
+                        isHistoryPreviewOnly = activeBtw == null && isViewingBtwHistory,
                         isBusy = isSequenceBusy,
+                        compactViewport = isCompactViewport,
+                        onFollowUpFocusChanged = { btwFollowUpFocused = it },
                         onCopyText = { text ->
                             clipboard.setText(AnnotatedString(text))
                         },
@@ -785,10 +809,18 @@ fun AgentWorkbenchPane(
             }
         }
         HerdrDivider()
+        val collapseAuxComposerRows = isCompactViewport && (showBtwCard || activeModal != null)
+        val compactComposerPadding = isCompactViewport && (showBtwCard || btwFollowUpFocused)
         Column(
-            modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            modifier = Modifier.fillMaxWidth().padding(
+                start = 12.dp,
+                end = 12.dp,
+                top = if (compactComposerPadding) 4.dp else 10.dp,
+                bottom = if (compactComposerPadding) 4.dp else 10.dp
+            ),
+            verticalArrangement = Arrangement.spacedBy(if (compactComposerPadding) 4.dp else 8.dp)
         ) {
+            if (!collapseAuxComposerRows) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Row(
                     modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
@@ -897,6 +929,7 @@ fun AgentWorkbenchPane(
                     }
                 }
             }
+            }
 
             WorkbenchComposer(
                 sessionAddress = session.address,
@@ -940,6 +973,8 @@ fun AgentWorkbenchPane(
         visible = showSlashCenter,
         agyState = snapshot.agyState,
         isBusy = isSequenceBusy,
+        btwHistoryCount = btwHistory.size,
+        onOpenBtwHistory = onOpenBtwHistory,
         onDismiss = { showSlashCenter = false },
         onCycleModeTo = { targetMode ->
             showSlashCenter = false
@@ -1408,6 +1443,78 @@ private fun ReaderBlock(
     onCopy: (String) -> Unit
 ) {
     when (block) {
+        is TerminalSemanticBlock.SessionHeaderBlock -> {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(HerdrShapes.Block)
+                    .background(HerdrColors.Surface)
+                    .border(1.dp, HerdrColors.Border, HerdrShapes.Block)
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    StatusDot(HerdrColors.Done, 7.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = block.agentTitle,
+                        style = HerdrType.Label,
+                        color = HerdrColors.Foreground,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(HerdrShapes.Pill)
+                            .background(HerdrColors.DoneSubtle)
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text = "已就绪",
+                            style = HerdrType.Caption,
+                            color = HerdrColors.Done,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1
+                        )
+                    }
+                }
+                if (!block.modelOrRole.isNullOrBlank()) {
+                    Box(
+                        modifier = Modifier
+                            .clip(HerdrShapes.Small)
+                            .background(HerdrColors.Raised)
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = block.modelOrRole,
+                            style = HerdrType.Caption,
+                            color = HerdrColors.Foreground,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                if (!block.accountOrPlan.isNullOrBlank()) {
+                    OneLine(block.accountOrPlan, HerdrType.Caption, HerdrColors.Muted)
+                }
+                block.details.forEach { detail ->
+                    OneLine(detail, HerdrType.Caption, HerdrColors.Muted)
+                }
+                val hint = if (block.agentTitle.contains("Antigravity", ignoreCase = true)) {
+                    "在下方输入首条指令，或点「/」调用斜杠命令"
+                } else {
+                    "在下方输入首条指令即可开始对话"
+                }
+                Text(hint, style = HerdrType.Caption, color = HerdrColors.Dim)
+            }
+        }
         is TerminalSemanticBlock.AskCardBlock -> {
             AgyAskCardComposable(
                 card = block.card,

@@ -11,6 +11,9 @@ import dev.herdr.android.connection.HerdrConnectionController
 import dev.herdr.android.connection.HerdrConnectionControllerFactory
 import dev.herdr.android.connection.HostPlatform
 import dev.herdr.android.ui.terminal.AgyAgentMode
+import dev.herdr.android.ui.terminal.AgyBtwCardState
+import dev.herdr.android.ui.terminal.AgyBtwTurn
+import dev.herdr.android.ui.terminal.AgyInteractiveParser
 import dev.herdr.android.ui.terminal.AgySlashModalKind
 import dev.herdr.android.ui.terminal.AskNavDirection
 import dev.herdr.android.ui.terminal.SequenceOperation
@@ -202,6 +205,12 @@ class HerdrMainViewModel(
 
     private val _stagedAttachmentsByAddress = MutableStateFlow<Map<String, List<StagedImageAttachment>>>(emptyMap())
     val stagedAttachmentsByAddress: StateFlow<Map<String, List<StagedImageAttachment>>> = _stagedAttachmentsByAddress.asStateFlow()
+
+    private val _btwHistoryByAddress = MutableStateFlow<Map<String, List<AgyBtwTurn>>>(emptyMap())
+    val btwHistoryByAddress: StateFlow<Map<String, List<AgyBtwTurn>>> = _btwHistoryByAddress.asStateFlow()
+
+    private val _viewingBtwHistoryAddress = MutableStateFlow<String?>(null)
+    val viewingBtwHistoryAddress: StateFlow<String?> = _viewingBtwHistoryAddress.asStateFlow()
 
     private data class DigestCacheEntry(
         val cacheKey: String,
@@ -1648,6 +1657,62 @@ class HerdrMainViewModel(
         )
     }
 
+    fun syncLiveBtwCard(address: String, liveCard: AgyBtwCardState?) {
+        val currentMap = _btwHistoryByAddress.value
+        val existing = currentMap[address].orEmpty()
+        if (liveCard == null) {
+            if (existing.any { it.isRunning }) {
+                val settled = existing.map {
+                    if (it.isRunning) it.copy(isRunning = false, statusSummary = it.statusSummary.ifBlank { "已结束" }) else it
+                }
+                _btwHistoryByAddress.value = currentMap + (address to settled)
+            }
+            return
+        }
+        if (_viewingBtwHistoryAddress.value == address) {
+            _viewingBtwHistoryAddress.value = null
+        }
+        val liveTurns = liveCard.turns.ifEmpty {
+            listOf(
+                AgyBtwTurn(
+                    question = liveCard.question,
+                    isRunning = liveCard.isRunning,
+                    statusSummary = liveCard.statusSummary,
+                    toolSteps = liveCard.toolSteps,
+                    answerText = liveCard.answerText,
+                    isError = liveCard.isError
+                )
+            )
+        }
+        val merged = existing.toMutableList()
+        val tailSearchFloor = (merged.size - liveTurns.size.coerceAtLeast(1) - 1).coerceAtLeast(0)
+        for (turn in liveTurns) {
+            val normQ = turn.question.trim()
+            val matchIdx = (merged.lastIndex downTo tailSearchFloor).firstOrNull { idx ->
+                merged[idx].question.trim().equals(normQ, ignoreCase = true)
+            }
+            if (matchIdx != null) {
+                val prev = merged[matchIdx]
+                merged[matchIdx] = turn.copy(
+                    statusSummary = turn.statusSummary.ifBlank { prev.statusSummary },
+                    toolSteps = if (turn.toolSteps.isNotEmpty()) turn.toolSteps else prev.toolSteps,
+                    answerText = if (turn.answerText.isNotBlank() || turn.isRunning) turn.answerText else prev.answerText
+                )
+            } else {
+                merged.add(turn)
+            }
+        }
+        val capped = if (merged.size > 30) merged.takeLast(30) else merged
+        if (capped != existing) {
+            _btwHistoryByAddress.value = currentMap + (address to capped)
+        }
+    }
+
+    fun openBtwHistoryViewer() {
+        val addr = _activeSession.value?.address ?: return
+        _viewingBtwHistoryAddress.value = addr
+    }
+
     fun sendBtwQuestion(question: String) {
         val cleanQuestion = question.trim()
         if (cleanQuestion.isEmpty()) {
@@ -1655,20 +1720,41 @@ class HerdrMainViewModel(
             return
         }
         val session = _activeSession.value ?: return
+        if (_viewingBtwHistoryAddress.value == session.address) {
+            _viewingBtwHistoryAddress.value = null
+        }
         lastDesiredAttachMode = AttachMode.TAKEOVER
+        val liveBtw = AgyInteractiveParser.inspectRaw(session.screenSnapshot.value).activeBtwCard
+        val sameQuestionActive = liveBtw != null && liveBtw.question.trim().equals(cleanQuestion, ignoreCase = true)
+        val ops = buildList {
+            add(SequenceOperation.EnsureComposerReady)
+            if (sameQuestionActive) {
+                add(SequenceOperation.DismissBtwCard)
+                add(SequenceOperation.SendBtwQuestion(cleanQuestion))
+            } else {
+                add(
+                    SequenceOperation.SendBtwQuestion(
+                        question = cleanQuestion,
+                        previousQuestion = liveBtw?.question,
+                        previousTurnCount = liveBtw?.turns?.size ?: 0
+                    )
+                )
+            }
+        }
         sequenceCoordinator.execute(
             address = session.address,
             label = "旁路快问 /btw",
-            operations = listOf(
-                SequenceOperation.EnsureComposerReady,
-                SequenceOperation.DismissBtwCard,
-                SequenceOperation.SendBtwQuestion(cleanQuestion)
-            )
+            operations = ops
         )
     }
 
     fun dismissBtwCard() {
         val session = _activeSession.value ?: return
+        if (_viewingBtwHistoryAddress.value == session.address) {
+            _viewingBtwHistoryAddress.value = null
+        }
+        val hasLiveBtw = AgyInteractiveParser.inspectRaw(session.screenSnapshot.value).activeBtwCard != null
+        if (!hasLiveBtw) return
         lastDesiredAttachMode = AttachMode.TAKEOVER
         sequenceCoordinator.execute(
             address = session.address,

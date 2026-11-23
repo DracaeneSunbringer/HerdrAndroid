@@ -110,7 +110,11 @@ sealed interface SequenceOperation {
     }
 
     /** Sends `/btw <question>` cleanly into an Antigravity session. */
-    data class SendBtwQuestion(val question: String) : SequenceOperation {
+    data class SendBtwQuestion(
+        val question: String,
+        val previousQuestion: String? = null,
+        val previousTurnCount: Int = 0
+    ) : SequenceOperation {
         override val description: String = "发起旁路快问"
     }
 }
@@ -327,8 +331,20 @@ internal object AgySequencePlanner {
             )
         }
         if (sentAlready) {
-            if (state.activeBtwCard != null) {
-                return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
+            val activeCard = state.activeBtwCard
+            if (activeCard != null) {
+                val isNewOrActive = activeCard.isRunning ||
+                    (op.previousTurnCount > 0 && activeCard.turns.size > op.previousTurnCount) ||
+                    op.previousQuestion == null ||
+                    !activeCard.question.equals(op.previousQuestion.trim(), ignoreCase = true)
+                return if (isNewOrActive) {
+                    SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
+                } else {
+                    SequenceStepInstruction(
+                        verdict = SequenceStepVerdict.WAIT_MORE,
+                        settleWaitMs = 250L
+                    )
+                }
             }
             if (state.phase == AgyUiPhase.COMPOSER_HAS_DRAFT &&
                 state.composerDraft.trimStart().startsWith("/btw", ignoreCase = true)

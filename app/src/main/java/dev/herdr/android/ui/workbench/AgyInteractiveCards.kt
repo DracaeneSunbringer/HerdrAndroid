@@ -5,6 +5,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -38,19 +39,37 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.herdr.android.ui.components.HerdrButton
@@ -62,11 +81,15 @@ import dev.herdr.android.ui.components.StatusDot
 import dev.herdr.android.ui.terminal.AgyAgentMode
 import dev.herdr.android.ui.terminal.AgyAskCardState
 import dev.herdr.android.ui.terminal.AgyBtwCardState
+import dev.herdr.android.ui.terminal.AgyBtwTurn
 import dev.herdr.android.ui.terminal.AgySlashCatalog
 import dev.herdr.android.ui.terminal.AgySlashModalKind
 import dev.herdr.android.ui.terminal.AgySlashModalState
 import dev.herdr.android.ui.terminal.AgyTerminalState
 import dev.herdr.android.ui.terminal.AskNavDirection
+import dev.herdr.android.ui.terminal.BtwContentSegment
+import dev.herdr.android.ui.terminal.BtwRichContentParser
+import dev.herdr.android.ui.terminal.BtwTableAlign
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrType
 
@@ -418,40 +441,112 @@ fun AgyAskCardComposable(
 }
 
 /**
- * Native docked card for Antigravity `/btw` side-questions, showing live thinking/tool progress,
- * streamed or final answer text, copy & expand actions, follow-up `/btw`, and one-tap Esc cancel/close.
+ * Native docked card for Antigravity `/btw` side-questions, supporting:
+ * - Left/right history paging (`‹ 1 / N ›` + horizontal swipe) across all Q&A turns in the session
+ * - Structured rendering for tables (borderless `│`, box `┌┬┐`, Markdown `|...|`), code blocks, lists & prose
+ * - Live thinking/tool progress, copy & Tab expand actions, follow-up `/btw`, and one-tap Esc cancel/close.
  */
 @Composable
 fun AgyBtwCardComposable(
-    card: AgyBtwCardState,
+    liveCard: AgyBtwCardState?,
+    historyTurns: List<AgyBtwTurn>,
+    isHistoryPreviewOnly: Boolean,
     isBusy: Boolean,
+    compactViewport: Boolean = false,
+    onFollowUpFocusChanged: (Boolean) -> Unit = {},
     onCopyText: (String) -> Unit,
     onToggleExpand: () -> Unit,
     onFollowUp: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var followUpText by remember(card.question, card.answerText) { mutableStateOf("") }
-    var copiedOnce by remember(card.answerText) { mutableStateOf(false) }
+    val followUpFocusRequester = remember { FocusRequester() }
+    DisposableEffect(Unit) {
+        onDispose { onFollowUpFocusChanged(false) }
+    }
+    val turns = remember(liveCard, historyTurns) {
+        when {
+            historyTurns.isNotEmpty() -> historyTurns
+            liveCard == null -> emptyList()
+            liveCard.turns.isNotEmpty() -> liveCard.turns
+            else -> listOf(
+                AgyBtwTurn(
+                    question = liveCard.question,
+                    isRunning = liveCard.isRunning,
+                    statusSummary = liveCard.statusSummary,
+                    toolSteps = liveCard.toolSteps,
+                    answerText = liveCard.answerText,
+                    isError = liveCard.isError
+                )
+            )
+        }
+    }
+    if (turns.isEmpty()) return
+
+    var pageIndex by remember { mutableIntStateOf(turns.lastIndex) }
+    LaunchedEffect(turns.size) {
+        pageIndex = turns.lastIndex
+    }
+    val safePage = pageIndex.coerceIn(0, turns.lastIndex)
+    if (safePage != pageIndex) {
+        pageIndex = safePage
+    }
+    val currentTurn = turns[safePage]
+    val isLatestPage = safePage == turns.lastIndex
+    val latestRunning = turns.last().isRunning
+
+    var followUpText by remember(currentTurn.question, safePage) { mutableStateOf("") }
+    var copiedOnce by remember(currentTurn.answerText, safePage) { mutableStateOf(false) }
+    var toolsExpanded by remember(currentTurn.question, safePage) { mutableStateOf(false) }
+
+    val showFatalError = !currentTurn.isRunning &&
+        currentTurn.isError &&
+        (currentTurn.answerText.isBlank() ||
+            currentTurn.answerText.startsWith("Error:", ignoreCase = true) ||
+            currentTurn.answerText.startsWith("Got an error:", ignoreCase = true))
 
     val borderTone = when {
-        card.isError -> HerdrColors.Blocked
-        card.isRunning -> HerdrColors.Working
+        currentTurn.isRunning -> HerdrColors.Working
+        showFatalError -> HerdrColors.Blocked
         else -> HerdrColors.Accent
     }
     val statusBadgeBg = when {
-        card.isError -> HerdrColors.BlockedSubtle
-        card.isRunning -> HerdrColors.WorkingSubtle
+        currentTurn.isRunning -> HerdrColors.WorkingSubtle
+        showFatalError -> HerdrColors.BlockedSubtle
+        isHistoryPreviewOnly && isLatestPage -> HerdrColors.Raised
         else -> HerdrColors.DoneSubtle
     }
     val statusBadgeFg = when {
-        card.isError -> HerdrColors.Blocked
-        card.isRunning -> HerdrColors.Working
+        currentTurn.isRunning -> HerdrColors.Working
+        showFatalError -> HerdrColors.Blocked
+        isHistoryPreviewOnly && isLatestPage -> HerdrColors.Muted
         else -> HerdrColors.Done
     }
     val statusBadgeText = when {
-        card.isError -> "异常"
-        card.isRunning -> "思考与检索中"
+        currentTurn.isRunning -> "思考与检索中"
+        showFatalError -> "异常"
+        isHistoryPreviewOnly || !isLatestPage -> "历史记录"
         else -> "已完成"
+    }
+
+    val dragThresholdPx = with(LocalDensity.current) { 44.dp.toPx() }
+    val swipePagerModifier = if (turns.size > 1) {
+        Modifier.pointerInput(turns.size) {
+            var dragDx = 0f
+            detectHorizontalDragGestures(
+                onDragStart = { dragDx = 0f },
+                onHorizontalDrag = { _, delta -> dragDx += delta },
+                onDragEnd = {
+                    if (dragDx > dragThresholdPx && pageIndex > 0) {
+                        pageIndex -= 1
+                    } else if (dragDx < -dragThresholdPx && pageIndex < turns.lastIndex) {
+                        pageIndex += 1
+                    }
+                    dragDx = 0f
+                }
+            )
+        }
+    } else {
+        Modifier
     }
 
     Column(
@@ -463,144 +558,253 @@ fun AgyBtwCardComposable(
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Header row: /btw badge + live state + Copy + Cancel/Close Esc
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        // Header + Question region supports left/right swipe across Q&A history without blocking table horizontal scroll
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(swipePagerModifier),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .clip(HerdrShapes.Pill)
-                    .background(HerdrColors.AccentSubtle)
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    "/btw",
-                    style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold),
-                    color = HerdrColors.Accent
-                )
-            }
             Row(
-                modifier = Modifier
-                    .clip(HerdrShapes.Pill)
-                    .background(statusBadgeBg)
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                if (card.isRunning) {
-                    StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
+                Box(
+                    modifier = Modifier
+                        .clip(HerdrShapes.Pill)
+                        .background(HerdrColors.AccentSubtle)
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        "/btw",
+                        style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold),
+                        color = HerdrColors.Accent
+                    )
                 }
-                Text(statusBadgeText, style = HerdrType.Caption, color = statusBadgeFg, fontWeight = FontWeight.Medium)
-            }
-            Spacer(Modifier.weight(1f))
-            if (card.answerText.isNotBlank()) {
-                ModalMiniChip(if (copiedOnce) "已复制" else "复制", enabled = true, primary = copiedOnce) {
-                    onCopyText(card.answerText)
-                    copiedOnce = true
+                Row(
+                    modifier = Modifier
+                        .clip(HerdrShapes.Pill)
+                        .background(statusBadgeBg)
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    if (currentTurn.isRunning) {
+                        StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
+                    }
+                    Text(statusBadgeText, style = HerdrType.Caption, color = statusBadgeFg, fontWeight = FontWeight.Medium, maxLines = 1)
+                }
+                if (turns.size > 1) {
+                    Row(
+                        modifier = Modifier
+                            .clip(HerdrShapes.Pill)
+                            .background(HerdrColors.Raised)
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        val canPrev = safePage > 0
+                        val canNext = safePage < turns.lastIndex
+                        Box(
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .clickable(enabled = canPrev) { pageIndex = (safePage - 1).coerceAtLeast(0) },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                                contentDescription = "上一条快问",
+                                tint = if (canPrev) HerdrColors.Foreground else HerdrColors.Dim,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Text(
+                            text = "${safePage + 1}/${turns.size}",
+                            style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium),
+                            color = if (!isLatestPage) HerdrColors.Accent else HerdrColors.Foreground,
+                            modifier = Modifier
+                                .clip(HerdrShapes.Small)
+                                .clickable(enabled = !isLatestPage) { pageIndex = turns.lastIndex }
+                                .padding(horizontal = 4.dp)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .clickable(enabled = canNext) { pageIndex = (safePage + 1).coerceAtMost(turns.lastIndex) },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "下一条快问",
+                                tint = if (canNext) HerdrColors.Foreground else HerdrColors.Dim,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.weight(1f))
+                if (currentTurn.answerText.isNotBlank()) {
+                    ModalMiniChip(if (copiedOnce) "已复制" else "复制", enabled = true, primary = copiedOnce) {
+                        onCopyText(currentTurn.answerText)
+                        copiedOnce = true
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(HerdrShapes.Pill)
+                        .background(if (currentTurn.isRunning && !isHistoryPreviewOnly) HerdrColors.BlockedSubtle else HerdrColors.Raised)
+                        .clickable(enabled = !isBusy, onClick = onDismiss)
+                        .padding(horizontal = 9.dp, vertical = 4.dp)
+                ) {
+                    val closeLabel = when {
+                        isHistoryPreviewOnly -> "关闭"
+                        currentTurn.isRunning -> "取消 Esc"
+                        else -> "关闭 Esc"
+                    }
+                    Text(
+                        text = closeLabel,
+                        style = HerdrType.Caption,
+                        color = if (currentTurn.isRunning && !isHistoryPreviewOnly) HerdrColors.Blocked else HerdrColors.Foreground,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1
+                    )
                 }
             }
-            Box(
-                modifier = Modifier
-                    .clip(HerdrShapes.Pill)
-                    .background(if (card.isRunning) HerdrColors.BlockedSubtle else HerdrColors.Raised)
-                    .clickable(enabled = !isBusy, onClick = onDismiss)
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-            ) {
-                Text(
-                    text = if (card.isRunning) "取消 Esc" else "关闭 Esc",
-                    style = HerdrType.Caption,
-                    color = if (card.isRunning) HerdrColors.Blocked else HerdrColors.Foreground,
-                    fontWeight = FontWeight.Medium
-                )
+
+            if (!isLatestPage && latestRunning) {
+                ModalMiniChip("最新快问正在思考 · 点击查看 ›", enabled = true, primary = true) {
+                    pageIndex = turns.lastIndex
+                }
             }
+
+            Text(
+                text = "Q: ${currentTurn.question}",
+                style = HerdrType.Label.copy(fontWeight = FontWeight.SemiBold),
+                color = HerdrColors.Foreground,
+                maxLines = if (compactViewport) 2 else 3,
+                overflow = TextOverflow.Ellipsis
+            )
         }
 
-        // Question title
-        Text(
-            text = "Q: ${card.question}",
-            style = HerdrType.Label.copy(fontWeight = FontWeight.SemiBold),
-            color = HerdrColors.Foreground,
-            maxLines = 3,
-            overflow = TextOverflow.Ellipsis
-        )
-
-        // Tool steps & live spinner status summary
-        if (card.toolSteps.isNotEmpty() || card.statusSummary.isNotBlank()) {
+        // Tool steps & live spinner status summary (auto-collapsed once answer is present to keep card height compact)
+        if (currentTurn.toolSteps.isNotEmpty() || currentTurn.statusSummary.isNotBlank()) {
+            val collapsibleSteps = currentTurn.toolSteps.isNotEmpty() &&
+                (currentTurn.answerText.isNotBlank() || (!currentTurn.isRunning && currentTurn.toolSteps.size > 3))
+            val showStepsList = currentTurn.toolSteps.isNotEmpty() && (!collapsibleSteps || toolsExpanded)
+            val stepsScroll = rememberScrollState()
+            LaunchedEffect(currentTurn.toolSteps.size, currentTurn.isRunning) {
+                if (currentTurn.isRunning && currentTurn.toolSteps.isNotEmpty()) {
+                    stepsScroll.scrollTo(stepsScroll.maxValue)
+                }
+            }
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(HerdrShapes.Small)
                     .background(HerdrColors.Raised)
-                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
-                if (card.statusSummary.isNotBlank()) {
+                val summaryHeader = currentTurn.statusSummary.ifBlank {
+                    if (currentTurn.toolSteps.isNotEmpty()) "工具检索（${currentTurn.toolSteps.size} 步）" else ""
+                }
+                if (summaryHeader.isNotBlank()) {
                     Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (collapsibleSteps) {
+                                    Modifier
+                                        .clip(HerdrShapes.Small)
+                                        .clickable { toolsExpanded = !toolsExpanded }
+                                } else {
+                                    Modifier
+                                }
+                            ),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        if (card.isRunning) {
+                        if (currentTurn.isRunning) {
                             StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
                         }
                         Text(
-                            text = card.statusSummary,
+                            text = summaryHeader,
                             style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace),
-                            color = if (card.isRunning) HerdrColors.Working else HerdrColors.Muted
+                            color = if (currentTurn.isRunning) HerdrColors.Working else HerdrColors.Muted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
                         )
+                        if (collapsibleSteps) {
+                            Text(
+                                text = if (toolsExpanded) "收起" else "展开 (${currentTurn.toolSteps.size})",
+                                style = HerdrType.Caption,
+                                color = HerdrColors.Accent,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
-                card.toolSteps.forEach { step ->
-                    val stepColor = when {
-                        step.startsWith("✓") -> HerdrColors.Done
-                        step.startsWith("✗") -> HerdrColors.Blocked
-                        else -> HerdrColors.Muted
+                if (showStepsList) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(
+                                max = when {
+                                    compactViewport -> 56.dp
+                                    currentTurn.isRunning -> 104.dp
+                                    else -> 140.dp
+                                }
+                            )
+                            .verticalScroll(stepsScroll),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        currentTurn.toolSteps.forEach { step ->
+                            val stepColor = when {
+                                step.startsWith("✓") -> HerdrColors.Done
+                                step.startsWith("✗") -> HerdrColors.Blocked
+                                else -> HerdrColors.Muted
+                            }
+                            Text(
+                                text = step,
+                                style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace),
+                                color = stepColor,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
-                    Text(
-                        text = step,
-                        style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace),
-                        color = stepColor,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
                 }
             }
         }
 
-        // Answer body or streaming waiting notice
-        if (card.answerText.isNotBlank()) {
-            SelectionContainer {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 220.dp)
-                        .clip(HerdrShapes.Small)
-                        .background(HerdrColors.Raised)
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 10.dp, vertical = 8.dp)
-                ) {
-                    Text(
-                        text = card.answerText,
-                        style = HerdrType.Body,
-                        color = HerdrColors.Foreground
-                    )
-                }
-            }
+        // Rich answer body (tables, code blocks, lists, headings, prose) or waiting notice
+        if (currentTurn.answerText.isNotBlank()) {
+            BtwRichAnswerBody(
+                answerText = currentTurn.answerText,
+                maxHeight = if (compactViewport) 118.dp else 280.dp,
+                onCopyText = onCopyText
+            )
         } else {
             val placeholder = when {
-                card.isRunning -> "正在后台思考与检索，不打断主对话上下文…"
-                card.toolSteps.isNotEmpty() -> "工具检索已完成，等待生成回复…"
+                currentTurn.isRunning -> "正在后台思考与检索，不打断主对话上下文…"
+                currentTurn.toolSteps.isNotEmpty() -> "工具检索已完成，等待生成回复…"
                 else -> "等待回复内容…"
             }
             Text(placeholder, style = HerdrType.Caption, color = HerdrColors.Muted)
         }
 
-        // Completed footer controls: Tab expand + follow-up /btw + explicit dismiss
-        if (!card.isRunning) {
-            val canToggleExpand = "expand" in card.footerHint.lowercase() ||
-                "collapse" in card.footerHint.lowercase() ||
-                card.toolSteps.isNotEmpty()
+        // Footer controls: follow-up input (enabled whenever latest turn is not running) + optional Tab expand
+        if (!latestRunning) {
+            val canToggleExpand = !isHistoryPreviewOnly && isLatestPage && liveCard != null && (
+                "expand" in liveCard.footerHint.lowercase() ||
+                    "collapse" in liveCard.footerHint.lowercase() ||
+                    currentTurn.toolSteps.isNotEmpty()
+                )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -609,15 +813,19 @@ fun AgyBtwCardComposable(
                 Box(
                     modifier = Modifier
                         .weight(1f)
-                        .height(34.dp)
+                        .height(36.dp)
                         .clip(HerdrShapes.Small)
                         .background(HerdrColors.Raised)
+                        .clickable(
+                            enabled = !isBusy,
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) {
+                            followUpFocusRequester.requestFocus()
+                        }
                         .padding(horizontal = 10.dp),
                     contentAlignment = Alignment.CenterStart
                 ) {
-                    if (followUpText.isEmpty()) {
-                        OneLine("继续追问 /btw …", HerdrType.Caption, HerdrColors.Dim)
-                    }
                     BasicTextField(
                         value = followUpText,
                         onValueChange = { followUpText = it },
@@ -633,13 +841,27 @@ fun AgyBtwCardComposable(
                                 onFollowUp(q)
                             }
                         }),
-                        modifier = Modifier.fillMaxWidth()
+                        decorationBox = { innerTextField ->
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.CenterStart
+                            ) {
+                                if (followUpText.isEmpty()) {
+                                    OneLine("继续追问 /btw ...", HerdrType.Caption, HerdrColors.Dim)
+                                }
+                                innerTextField()
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusRequester(followUpFocusRequester)
+                            .onFocusChanged { onFollowUpFocusChanged(it.isFocused) }
                     )
                 }
                 val canSendFollowUp = !isBusy && followUpText.isNotBlank()
                 Box(
                     modifier = Modifier
-                        .size(34.dp)
+                        .size(36.dp)
                         .clip(HerdrShapes.Small)
                         .background(if (canSendFollowUp) HerdrColors.Accent else HerdrColors.Raised)
                         .clickable(enabled = canSendFollowUp) {
@@ -657,8 +879,364 @@ fun AgyBtwCardComposable(
                     )
                 }
                 if (canToggleExpand) {
-                    ModalMiniChip(if (card.isExpanded) "收起 Tab" else "详情 Tab", !isBusy, onClick = onToggleExpand)
+                    val liveCardNonNull = liveCard!!
+                    ModalMiniChip(if (liveCardNonNull.isExpanded) "收起 Tab" else "详情 Tab", !isBusy, onClick = onToggleExpand)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BtwRichAnswerBody(
+    answerText: String,
+    maxHeight: Dp = 280.dp,
+    onCopyText: (String) -> Unit
+) {
+    val segments = remember(answerText) { BtwRichContentParser.parse(answerText) }
+    SelectionContainer {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = maxHeight)
+                .clip(HerdrShapes.Small)
+                .background(HerdrColors.Raised)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (segments.isEmpty()) {
+                Text(
+                    text = answerText,
+                    style = HerdrType.Body,
+                    color = HerdrColors.Foreground
+                )
+            } else {
+                segments.forEach { seg ->
+                    when (seg) {
+                        is BtwContentSegment.Table -> BtwGridTableBlock(seg, onCopyText)
+                        is BtwContentSegment.CodeBlock -> BtwCodeSegmentBlock(seg, onCopyText)
+                        is BtwContentSegment.Heading -> Text(
+                            text = formatBtwInline(seg.text),
+                            style = when (seg.level) {
+                                1 -> HerdrType.Heading
+                                else -> HerdrType.Label.copy(fontWeight = FontWeight.Bold)
+                            },
+                            color = HerdrColors.Foreground
+                        )
+                        is BtwContentSegment.BulletList -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            seg.items.forEach { item ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = (item.indentLevel * 12).dp),
+                                    verticalAlignment = Alignment.Top
+                                ) {
+                                    Text(
+                                        text = item.marker,
+                                        style = HerdrType.Body.copy(fontWeight = FontWeight.SemiBold),
+                                        color = HerdrColors.Accent,
+                                        modifier = Modifier.width(18.dp)
+                                    )
+                                    Text(
+                                        text = formatBtwInline(item.text),
+                                        style = HerdrType.Body,
+                                        color = HerdrColors.Foreground,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                        is BtwContentSegment.Paragraph -> Text(
+                            text = formatBtwInline(seg.text),
+                            style = HerdrType.Body,
+                            color = HerdrColors.Foreground
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private class GridDrawCache {
+    var colWidths: IntArray = IntArray(0)
+    var rowHeights: IntArray = IntArray(0)
+}
+
+@Composable
+private fun BtwGridTableBlock(
+    table: BtwContentSegment.Table,
+    onCopyText: (String) -> Unit
+) {
+    var copiedTable by remember(table.rawText) { mutableStateOf(false) }
+    val allRows = remember(table.headers, table.rows) {
+        if (table.headers.isNotEmpty()) listOf(table.headers) + table.rows else table.rows
+    }
+    val colCount = remember(table.headers, table.rows) {
+        maxOf(table.headers.size, table.rows.maxOfOrNull { it.size } ?: 0, 1)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(HerdrShapes.Small)
+            .background(HerdrColors.Canvas)
+            .border(1.dp, HerdrColors.Border.copy(alpha = 0.7f), HerdrShapes.Small)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(HerdrColors.Surface)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "表格 · ${table.rows.size} 行",
+                style = HerdrType.Caption,
+                color = HerdrColors.Muted,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = if (copiedTable) "已复制" else "复制",
+                style = HerdrType.Caption,
+                color = if (copiedTable) HerdrColors.Done else HerdrColors.Accent,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier
+                    .clip(HerdrShapes.Small)
+                    .clickable {
+                        onCopyText(table.rawText)
+                        copiedTable = true
+                    }
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+        }
+        HerdrDivider()
+        if (allRows.isNotEmpty()) {
+            val drawCache = remember(allRows, colCount) { GridDrawCache() }
+            val hasHeader = table.headers.isNotEmpty()
+            val headerBg = HerdrColors.AccentSubtle.copy(alpha = 0.55f)
+            val gridLineColor = HerdrColors.Border.copy(alpha = 0.7f)
+            val density = LocalDensity.current
+            val minColPx = with(density) { 52.dp.roundToPx() }
+            val maxColPx = with(density) { 195.dp.roundToPx() }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+            ) {
+                Layout(
+                    modifier = Modifier.drawBehind {
+                        val cw = drawCache.colWidths
+                        val rh = drawCache.rowHeights
+                        if (cw.isEmpty() || rh.isEmpty()) return@drawBehind
+                        if (hasHeader && rh[0] > 0) {
+                            drawRect(
+                                color = headerBg,
+                                topLeft = Offset.Zero,
+                                size = Size(size.width, rh[0].toFloat())
+                            )
+                        }
+                        val stroke = 1.dp.toPx()
+                        var y = 0f
+                        for (r in 0 until rh.size - 1) {
+                            y += rh[r].toFloat()
+                            drawLine(
+                                color = gridLineColor,
+                                start = Offset(0f, y),
+                                end = Offset(size.width, y),
+                                strokeWidth = stroke
+                            )
+                        }
+                        var x = 0f
+                        for (c in 0 until cw.size - 1) {
+                            x += cw[c].toFloat()
+                            drawLine(
+                                color = gridLineColor,
+                                start = Offset(x, 0f),
+                                end = Offset(x, size.height),
+                                strokeWidth = stroke
+                            )
+                        }
+                    },
+                    content = {
+                        allRows.forEachIndexed { r, rowCells ->
+                            val isHeader = hasHeader && r == 0
+                            for (c in 0 until colCount) {
+                                val cellText = rowCells.getOrElse(c) { "" }
+                                val align = when (table.alignments.getOrElse(c) { BtwTableAlign.START }) {
+                                    BtwTableAlign.START -> TextAlign.Start
+                                    BtwTableAlign.CENTER -> TextAlign.Center
+                                    BtwTableAlign.END -> TextAlign.End
+                                }
+                                Box(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                    contentAlignment = when (align) {
+                                        TextAlign.Center -> Alignment.Center
+                                        TextAlign.End -> Alignment.CenterEnd
+                                        else -> Alignment.CenterStart
+                                    }
+                                ) {
+                                    Text(
+                                        text = formatBtwInline(cellText),
+                                        style = HerdrType.Caption.copy(
+                                            fontWeight = if (isHeader) FontWeight.SemiBold else FontWeight.Normal,
+                                            lineHeight = 17.sp
+                                        ),
+                                        color = if (isHeader) HerdrColors.Accent else HerdrColors.Foreground,
+                                        textAlign = align
+                                    )
+                                }
+                            }
+                        }
+                    }
+                ) { measurables, constraints ->
+                    val rowCount = allRows.size
+                    val cellConstraints = Constraints(minWidth = minColPx, maxWidth = maxColPx)
+                    val placeables = measurables.map { it.measure(cellConstraints) }
+                    val colWidths = IntArray(colCount) { minColPx }
+                    val rowHeights = IntArray(rowCount)
+                    for (r in 0 until rowCount) {
+                        var maxH = 0
+                        for (c in 0 until colCount) {
+                            val idx = r * colCount + c
+                            if (idx < placeables.size) {
+                                val p = placeables[idx]
+                                if (p.width > colWidths[c]) colWidths[c] = p.width
+                                if (p.height > maxH) maxH = p.height
+                            }
+                        }
+                        rowHeights[r] = maxH
+                    }
+                    drawCache.colWidths = colWidths
+                    drawCache.rowHeights = rowHeights
+
+                    val totalW = colWidths.sum().coerceIn(constraints.minWidth, constraints.maxWidth)
+                    val totalH = rowHeights.sum().coerceIn(constraints.minHeight, constraints.maxHeight)
+                    layout(totalW, totalH) {
+                        var y = 0
+                        for (r in 0 until rowCount) {
+                            var x = 0
+                            for (c in 0 until colCount) {
+                                val idx = r * colCount + c
+                                if (idx < placeables.size) {
+                                    val p = placeables[idx]
+                                    val cw = colWidths[c]
+                                    val dx = when (table.alignments.getOrElse(c) { BtwTableAlign.START }) {
+                                        BtwTableAlign.CENTER -> ((cw - p.width) / 2).coerceAtLeast(0)
+                                        BtwTableAlign.END -> (cw - p.width).coerceAtLeast(0)
+                                        BtwTableAlign.START -> 0
+                                    }
+                                    val dy = ((rowHeights[r] - p.height) / 2).coerceAtLeast(0)
+                                    p.placeRelative(x + dx, y + dy)
+                                }
+                                x += colWidths[c]
+                            }
+                            y += rowHeights[r]
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BtwCodeSegmentBlock(
+    segment: BtwContentSegment.CodeBlock,
+    onCopyText: (String) -> Unit
+) {
+    var copiedCode by remember(segment.code) { mutableStateOf(false) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(HerdrShapes.Small)
+            .background(HerdrColors.Canvas)
+            .border(1.dp, HerdrColors.Border.copy(alpha = 0.7f), HerdrShapes.Small)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(HerdrColors.Surface)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = segment.language?.takeIf { it.isNotBlank() } ?: "代码",
+                style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace),
+                color = HerdrColors.Muted,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = if (copiedCode) "已复制" else "复制",
+                style = HerdrType.Caption,
+                color = if (copiedCode) HerdrColors.Done else HerdrColors.Accent,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier
+                    .clip(HerdrShapes.Small)
+                    .clickable {
+                        onCopyText(segment.code)
+                        copiedCode = true
+                    }
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+        }
+        HerdrDivider()
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text = segment.code,
+                style = HerdrType.Mono.copy(fontSize = 12.sp, lineHeight = 18.sp),
+                color = HerdrColors.Foreground,
+                softWrap = false
+            )
+        }
+    }
+}
+
+private val btwInlineTokenRegex = Regex("`([^`]+)`|\\*\\*([^*]+)\\*\\*")
+
+@Composable
+private fun formatBtwInline(text: String): AnnotatedString {
+    val codeBg = HerdrColors.Canvas
+    val codeFg = HerdrColors.Accent
+    return remember(text, codeBg, codeFg) {
+        buildAnnotatedString {
+            var pos = 0
+            for (m in btwInlineTokenRegex.findAll(text)) {
+                if (m.range.first > pos) {
+                    append(text.substring(pos, m.range.first))
+                }
+                val codeContent = m.groups[1]?.value
+                val boldContent = m.groups[2]?.value
+                val start = length
+                when {
+                    codeContent != null -> {
+                        append(codeContent)
+                        addStyle(
+                            SpanStyle(
+                                fontFamily = FontFamily.Monospace,
+                                background = codeBg,
+                                color = codeFg
+                            ),
+                            start,
+                            length
+                        )
+                    }
+                    boldContent != null -> {
+                        append(boldContent)
+                        addStyle(SpanStyle(fontWeight = FontWeight.SemiBold), start, length)
+                    }
+                }
+                pos = m.range.last + 1
+            }
+            if (pos < text.length) {
+                append(text.substring(pos))
             }
         }
     }
@@ -1031,6 +1609,8 @@ fun AgySlashCommandCenterSheet(
     visible: Boolean,
     agyState: AgyTerminalState?,
     isBusy: Boolean,
+    btwHistoryCount: Int = 0,
+    onOpenBtwHistory: () -> Unit = {},
     onDismiss: () -> Unit,
     onCycleModeTo: (AgyAgentMode) -> Unit,
     onRunCommand: (commandText: String, expectModal: AgySlashModalKind?) -> Unit
@@ -1224,6 +1804,12 @@ fun AgySlashCommandCenterSheet(
                         ModalMiniChip("/copy btw", !isBusy) {
                             onRunCommand("/copy btw", null)
                             onDismiss()
+                        }
+                        if (btwHistoryCount > 0) {
+                            ModalMiniChip("快问记录 ($btwHistoryCount)", !isBusy, primary = true) {
+                                onOpenBtwHistory()
+                                onDismiss()
+                            }
                         }
                     }
 

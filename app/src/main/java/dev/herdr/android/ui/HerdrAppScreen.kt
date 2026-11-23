@@ -151,6 +151,8 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val terminalPreviews by viewModel.terminalPreviews.collectAsState()
     val fleetDigests by viewModel.fleetDigests.collectAsState()
     val stagedAttachmentsByAddress by viewModel.stagedAttachmentsByAddress.collectAsState()
+    val btwHistoryByAddress by viewModel.btwHistoryByAddress.collectAsState()
+    val viewingBtwHistoryAddress by viewModel.viewingBtwHistoryAddress.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
     val sequenceStatus by viewModel.sequenceStatus.collectAsState()
     val liveTerminals = remember(allTerminals) { allTerminals.filter { it.state == "live" } }
@@ -302,6 +304,12 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         onSendAgyBtwQuestion = viewModel::sendBtwQuestion,
                         onDismissAgyBtw = viewModel::dismissBtwCard,
                         onToggleAgyBtwExpand = viewModel::toggleBtwExpand,
+                        btwHistory = activeSession?.address?.let { btwHistoryByAddress[it] }.orEmpty(),
+                        isViewingBtwHistory = activeSession?.address != null && viewingBtwHistoryAddress == activeSession?.address,
+                        onSyncLiveBtwCard = { card ->
+                            activeSession?.address?.let { addr -> viewModel.syncLiveBtwCard(addr, card) }
+                        },
+                        onOpenBtwHistory = viewModel::openBtwHistoryViewer,
                         onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                     )
 

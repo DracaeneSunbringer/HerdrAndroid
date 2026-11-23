@@ -108,6 +108,15 @@ data class AgySlashModalState(
     val endRawLineIndex: Int = -1
 )
 
+data class AgyBtwTurn(
+    val question: String,
+    val isRunning: Boolean = false,
+    val statusSummary: String = "",
+    val toolSteps: List<String> = emptyList(),
+    val answerText: String = "",
+    val isError: Boolean = false
+)
+
 data class AgyBtwCardState(
     val question: String,
     val isRunning: Boolean,
@@ -118,7 +127,8 @@ data class AgyBtwCardState(
     val isExpanded: Boolean = false,
     val footerHint: String = "",
     val startRawLineIndex: Int = -1,
-    val endRawLineIndex: Int = -1
+    val endRawLineIndex: Int = -1,
+    val turns: List<AgyBtwTurn> = emptyList()
 )
 
 data class AgyTerminalState(
@@ -684,7 +694,7 @@ internal object AgyInteractiveParser {
         }
         val endIdx = cursor
         var startIdx = cursor
-        val floor = (cursor - 48).coerceAtLeast(0)
+        val floor = (cursor - 240).coerceAtLeast(0)
         while (cursor >= floor) {
             val l = rawLines[cursor]
             if (l.firstChar == '┃') {
@@ -706,22 +716,69 @@ internal object AgyInteractiveParser {
             return null
         }
 
-        // Parse header question (stop at blank line or tool/spinner row)
+        // Split multi-turn ┃ blocks wherever a new `/btw ...` (or `/help ...`) header begins
+        val turnSlices = ArrayList<ArrayList<String>>()
+        for (cardLine in cardLines) {
+            val trimmed = cardLine.trim()
+            val startsNewTurn = trimmed.equals("/btw", ignoreCase = true) ||
+                trimmed.startsWith("/btw ", ignoreCase = true) ||
+                trimmed.startsWith("/help ", ignoreCase = true)
+            if (startsNewTurn || turnSlices.isEmpty()) {
+                turnSlices.add(ArrayList())
+            }
+            turnSlices.last().add(cardLine)
+        }
+
+        var sharedFooterHint = ""
+        var sharedExpanded = false
+        val parsedTurns = turnSlices.map { slice ->
+            val parsed = parseBtwTurnSlice(slice)
+            if (parsed.footerHint.isNotEmpty()) sharedFooterHint = parsed.footerHint
+            if (parsed.isExpanded) sharedExpanded = true
+            parsed.turn
+        }
+        if (parsedTurns.isEmpty()) return null
+        val latest = parsedTurns.last()
+        return AgyBtwCardState(
+            question = latest.question,
+            isRunning = latest.isRunning,
+            statusSummary = latest.statusSummary,
+            toolSteps = latest.toolSteps,
+            answerText = latest.answerText,
+            isError = latest.isError,
+            isExpanded = sharedExpanded,
+            footerHint = sharedFooterHint,
+            startRawLineIndex = startIdx,
+            endRawLineIndex = endIdx,
+            turns = parsedTurns
+        )
+    }
+
+    private data class ParsedBtwSlice(
+        val turn: AgyBtwTurn,
+        val footerHint: String,
+        val isExpanded: Boolean
+    )
+
+    private fun parseBtwTurnSlice(sliceLines: List<String>): ParsedBtwSlice {
         val qParts = ArrayList<String>()
         var idx = 0
-        while (idx < cardLines.size) {
-            val trimmed = cardLines[idx].trim()
+        while (idx < sliceLines.size) {
+            val trimmed = sliceLines[idx].trim()
             if (trimmed.isEmpty()) {
                 idx++
                 break
             }
             val qLine = when {
                 idx == 0 && trimmed.startsWith("/btw ", ignoreCase = true) -> trimmed.drop(5).trim()
+                idx == 0 && trimmed.equals("/btw", ignoreCase = true) -> ""
                 idx == 0 && trimmed.startsWith("/help ", ignoreCase = true) -> trimmed.drop(6).trim()
                 else -> trimmed
             }
-            if (idx > 0 && (trimmed.startsWith("✓") || trimmed.startsWith("●") || trimmed.startsWith("○") ||
-                    btwSpinnerLineRegex.matches(trimmed) || trimmed.startsWith("Called ") || btwFooterLineRegex.containsMatchIn(trimmed))
+            if (idx > 0 && (trimmed.startsWith("✓") || trimmed.startsWith("✗") ||
+                    trimmed.startsWith("●") || trimmed.startsWith("○") ||
+                    btwSpinnerLineRegex.matches(trimmed) || trimmed.startsWith("Called ") ||
+                    btwFooterLineRegex.containsMatchIn(trimmed))
             ) {
                 break
             }
@@ -729,7 +786,7 @@ internal object AgyInteractiveParser {
             idx++
         }
         val question = qParts.joinToString(" ").trim()
-        val tailLines = if (idx < cardLines.size) cardLines.subList(idx, cardLines.size) else emptyList()
+        val tailLines = if (idx < sliceLines.size) sliceLines.subList(idx, sliceLines.size) else emptyList()
 
         var footerHint = ""
         val toolSteps = ArrayList<String>()
@@ -738,6 +795,7 @@ internal object AgyInteractiveParser {
         var running = false
         var errorFlag = false
         var expandedFlag = false
+        var sawCalledSummary = false
 
         for (rawBodyLine in tailLines) {
             val t = rawBodyLine.trim()
@@ -760,40 +818,65 @@ internal object AgyInteractiveParser {
                 continue
             }
             val spinMatch = btwSpinnerLineRegex.find(t)
-            if (spinMatch != null) {
+            if (spinMatch != null && answerLines.isEmpty()) {
                 running = true
                 statusSummary = spinMatch.groupValues[1].trim()
                 continue
             }
-            if (t.startsWith("✓ ") || t.startsWith("✗ ") || t.startsWith("● ") || t.startsWith("○ ")) {
+            if (answerLines.isEmpty() && !sawCalledSummary &&
+                (t.startsWith("✓ ") || t.startsWith("✗ ") || t.startsWith("● ") || t.startsWith("○ "))
+            ) {
                 toolSteps.add(t)
                 if (t.startsWith("✗ ")) errorFlag = true
                 continue
             }
-            if (Regex("^Called \\d+ tools?\\b.*", RegexOption.IGNORE_CASE).matches(t)) {
+            if (answerLines.isEmpty() && Regex("^Called \\d+ tools?\\b.*", RegexOption.IGNORE_CASE).matches(t)) {
                 statusSummary = t
+                sawCalledSummary = true
                 continue
             }
-            if (t.contains("failed", ignoreCase = true) || t.startsWith("Error:", ignoreCase = true)) {
+            if (t.startsWith("Error:", ignoreCase = true) ||
+                t.startsWith("✗ ") ||
+                (answerLines.isEmpty() && t.contains("failed", ignoreCase = true))
+            ) {
                 errorFlag = true
             }
-            answerLines.add(rawBodyLine.trimStart())
+            // Preserve leading indentation so tables, ASCII boxes, and fenced code stay aligned
+            answerLines.add(rawBodyLine)
         }
-        while (answerLines.isNotEmpty() && answerLines.last().isEmpty()) {
+        while (answerLines.isNotEmpty() && answerLines.first().isBlank()) {
+            answerLines.removeAt(0)
+        }
+        while (answerLines.isNotEmpty() && answerLines.last().isBlank()) {
             answerLines.removeAt(answerLines.lastIndex)
         }
-        val answer = answerLines.joinToString("\n").trim()
-        return AgyBtwCardState(
-            question = question.ifBlank { "/btw" },
-            isRunning = running,
-            statusSummary = statusSummary,
-            toolSteps = toolSteps,
-            answerText = answer,
-            isError = errorFlag,
-            isExpanded = expandedFlag,
+        val minIndent = answerLines
+            .filter { it.isNotBlank() }
+            .minOfOrNull { line ->
+                val idxFirst = line.indexOfFirst { it != ' ' }
+                if (idxFirst < 0) 0 else idxFirst
+            } ?: 0
+        val answer = answerLines.joinToString("\n") { line ->
+            if (line.isBlank()) {
+                ""
+            } else {
+                var drop = 0
+                while (drop < minIndent && drop < line.length && line[drop] == ' ') drop++
+                line.substring(drop)
+            }
+        }.trimEnd()
+
+        return ParsedBtwSlice(
+            turn = AgyBtwTurn(
+                question = question.ifBlank { "/btw" },
+                isRunning = running,
+                statusSummary = statusSummary,
+                toolSteps = toolSteps,
+                answerText = answer,
+                isError = errorFlag
+            ),
             footerHint = footerHint,
-            startRawLineIndex = startIdx,
-            endRawLineIndex = endIdx
+            isExpanded = expandedFlag
         )
     }
 

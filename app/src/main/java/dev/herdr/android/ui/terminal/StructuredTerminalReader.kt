@@ -51,6 +51,14 @@ sealed interface TerminalSemanticBlock {
     data class AskCardBlock(
         val card: AgyAskCardState
     ) : TerminalSemanticBlock
+
+    /** Clean session-ready card for newly created agent terminals before conversation starts. */
+    data class SessionHeaderBlock(
+        val agentTitle: String,
+        val modelOrRole: String? = null,
+        val accountOrPlan: String? = null,
+        val details: List<String> = emptyList()
+    ) : TerminalSemanticBlock
 }
 
 /**
@@ -333,6 +341,13 @@ object StructuredTerminalReader {
     private val hcTagStripRegex = Regex("</?hc[^>]*>")
     private val anyWhitespaceRegex = Regex("\\s+")
     private val headlineLeadStripRegex = Regex("^[●⏺•○◦▸▾▼✓✔✗✘>❯›#\\s]+")
+    private val startupTitleKeywordRegex = Regex("(?i)(antigravity|claude code|openai codex|codex|gemini|\\bpi\\b)")
+    private val startupAccountRegex = Regex("(?i)(google ai|claude max|claude pro|chatgpt|api usage|signed in|not signed in)")
+    private val startupCwdRegex = Regex("(?i)^(?:[A-Za-z]:[/\\\\].*|~(?:[/\\\\].*)?|/(?:Users|home|var|tmp|opt|mnt|workspace|root|etc)(?:/.*)?|(?:cwd|directory)\\s*:.*)$")
+    private val startupModelPrefixRegex = Regex("(?i)^model\\s*:\\s*")
+    private val startupModelChangeSuffixRegex = Regex("(?i)\\s+/model to change.*$")
+    private val startupBorderTitleRegex = Regex("^[╭┌─━\\s]+(.+?)[─━╮┐\\s]*$")
+    private val startupBlockArtGlyphRegex = Regex("[\\u2580-\\u259F]+")
 
     // ---------------------------------------------------------------------------------------------
     // Public API
@@ -364,9 +379,12 @@ object StructuredTerminalReader {
                 rawScreen.contains("▸ Thought for ") ||
                 rawScreen.contains("▾ Thought for ") ||
                 rawScreen.contains("○ Thought for ") ||
+                rawScreen.contains("Antigravity CLI") ||
                 rawScreen.contains("/artifact to review") ||
                 rawScreen.contains("Conversation compacted") -> TerminalDialect.ANTIGRAVITY
-            rawScreen.contains('\u23BF') || claudeDotDetectRegex.containsMatchIn(rawScreen) -> TerminalDialect.CLAUDE
+            rawScreen.contains('\u23BF') ||
+                rawScreen.contains("Claude Code") ||
+                claudeDotDetectRegex.containsMatchIn(rawScreen) -> TerminalDialect.CLAUDE
             shellPromptDetectRegex.containsMatchIn(rawScreen) ->
                 TerminalDialect.SHELL
             else -> TerminalDialect.GENERIC
@@ -601,8 +619,11 @@ object StructuredTerminalReader {
     }
 
     private fun parseBlocksFromCleaned(cleaned: CleanedScreen, dialect: TerminalDialect): List<TerminalSemanticBlock> {
-        if (cleaned.lines.isEmpty()) return emptyList()
-        return if (dialect == TerminalDialect.SHELL) {
+        if (cleaned.lines.isEmpty()) {
+            val hdr = cleaned.startupHeader
+            return if (hdr != null && cleaned.agyState?.activeAskCard == null) listOf(hdr) else emptyList()
+        }
+        val parsed = if (dialect == TerminalDialect.SHELL) {
             runCatching { parseShellBlocks(cleaned.lines) }.getOrElse {
                 listOf(TerminalSemanticBlock.CodeOrTableBlock(cleaned.lines.joinToString("\n").trim()))
             }
@@ -612,6 +633,10 @@ object StructuredTerminalReader {
                 if (fallback.isEmpty()) emptyList() else listOf(TerminalSemanticBlock.CodeOrTableBlock(fallback))
             }
         }
+        if (parsed.isEmpty() && cleaned.startupHeader != null && cleaned.agyState?.activeAskCard == null) {
+            return listOf(cleaned.startupHeader)
+        }
+        return parsed
     }
 
     fun extractLatestHeadline(rawScreen: String?, summary: TerminalSummary): String {
@@ -690,7 +715,17 @@ object StructuredTerminalReader {
             it is TerminalSemanticBlock.AgentProseBlock && !it.isHeading && it.text.isNotBlank()
         }?.let { return polishHeadline(firstSentence((it as TerminalSemanticBlock.AgentProseBlock).text)) }
 
-        // 7. Status fallback.
+        // 7. Brand-new session before turn 1.
+        (blocks.singleOrNull() as? TerminalSemanticBlock.SessionHeaderBlock)?.let { hdr ->
+            val label = if (!hdr.modelOrRole.isNullOrBlank()) {
+                "已就绪 · ${hdr.modelOrRole}"
+            } else {
+                "已就绪 · ${hdr.agentTitle}"
+            }
+            return polishHeadline(label)
+        }
+
+        // 8. Status fallback.
         return when (status) {
             AgentStateWord.WORKING -> "运行中…"
             AgentStateWord.BLOCKED -> "等待你的授权或确认"
@@ -763,7 +798,8 @@ object StructuredTerminalReader {
         val hasBoxCorners: BooleanArray,
         val isExpandedMode: Boolean,
         val rawTail: List<String>,
-        val agyState: AgyTerminalState? = null
+        val agyState: AgyTerminalState? = null,
+        val startupHeader: TerminalSemanticBlock.SessionHeaderBlock? = null
     )
 
     internal fun extractAgyRawStyledLines(raw: String): List<AgyRawStyledLine> =
@@ -1108,7 +1144,6 @@ object StructuredTerminalReader {
             }
         }
 
-        stripBottomDock(rawLines, dialect)
         if (dialect == TerminalDialect.PI) {
             stripPiBanners(rawLines)
         } else if (dialect == TerminalDialect.CODEX) {
@@ -1116,6 +1151,8 @@ object StructuredTerminalReader {
         } else if (dialect == TerminalDialect.ANTIGRAVITY) {
             stripAntigravityBanners(rawLines)
         }
+        val startupHeader = extractAndStripStartupHeader(rawLines, dialect, agyState)
+        stripBottomDock(rawLines, dialect)
 
         val cap = rawLines.size
         val outLines = ArrayList<String>(cap)
@@ -1238,7 +1275,8 @@ object StructuredTerminalReader {
             hasBoxCorners = if (count == outBoxCorners.size) outBoxCorners else outBoxCorners.copyOf(count),
             isExpandedMode = isExpandedMode,
             rawTail = rawTail,
-            agyState = agyState
+            agyState = agyState,
+            startupHeader = startupHeader
         )
     }
 
@@ -1493,6 +1531,314 @@ object StructuredTerminalReader {
             }
             i++
         }
+    }
+
+    /**
+     * Extracts & strips startup banners / ASCII block-element logos (`agy` A-logo, Claude Code
+     * mascot or welcome box, Codex session box) at the top of the buffer before noise/code/prose
+     * classification runs. Returns a structured [TerminalSemanticBlock.SessionHeaderBlock] when
+     * found; callers only display it if no conversation blocks exist yet.
+     */
+    private fun extractAndStripStartupHeader(
+        lines: MutableList<StyledLine>,
+        dialect: TerminalDialect,
+        agyState: AgyTerminalState?
+    ): TerminalSemanticBlock.SessionHeaderBlock? {
+        if (lines.isEmpty()) return null
+        val topLimit = minOf(lines.size, 20)
+        var start = -1
+        for (idx in 0 until topLimit) {
+            val s = lines[idx]
+            if (s.indent < 0) continue
+            val t = if (s.indent == 0) s.text else s.text.substring(s.indent)
+            if (fullRuleRegex.matches(t)) continue
+            start = idx
+            break
+        }
+        if (start < 0) return null
+
+        val firstStyled = lines[start]
+        val c0 = firstStyled.firstChar
+        val firstTrim = if (firstStyled.indent == 0) firstStyled.text else firstStyled.text.substring(firstStyled.indent)
+
+        return when {
+            isBlockElementChar(c0) -> extractBlockArtStartupHeader(lines, start, dialect, agyState)
+            c0 == '╭' || c0 == '┌' ||
+                (c0 == '>' && firstTrim.startsWith(">_ OpenAI Codex")) ||
+                (c0 == '✻' && "Welcome to Claude Code" in firstTrim) ->
+                extractFramedStartupHeader(lines, start, dialect, agyState)
+            else -> null
+        }
+    }
+
+    private fun isBlockElementChar(ch: Char): Boolean = ch in '\u2580'..'\u259F'
+
+    private fun extractBlockArtStartupHeader(
+        lines: MutableList<StyledLine>,
+        start: Int,
+        dialect: TerminalDialect,
+        agyState: AgyTerminalState?
+    ): TerminalSemanticBlock.SessionHeaderBlock? {
+        val maxEnd = minOf(lines.size, start + 12)
+        val rightMetas = ArrayList<String>(6)
+        var artRows = 0
+        var endExclusive = start
+        var k = start
+
+        while (k < maxEnd) {
+            val styled = lines[k]
+            if (styled.indent < 0) break
+            if (isBlockElementChar(styled.firstChar)) {
+                val s = styled.text
+                var p = styled.indent
+                var artGlyphCount = 0
+                while (p < s.length) {
+                    val ch = s[p]
+                    if (ch == ' ') {
+                        p++
+                    } else if (isBlockElementChar(ch)) {
+                        artGlyphCount++
+                        p++
+                    } else {
+                        break
+                    }
+                }
+                val rightMeta = if (p < s.length) s.substring(p).trim() else ""
+                if (artRows == 0 && (
+                        "ctx " in rightMeta ||
+                            "tok/s" in rightMeta ||
+                            ('%' in rightMeta && artGlyphCount >= 3 && !rightMeta.contains("CLI"))
+                        )
+                ) {
+                    return null
+                }
+                artRows++
+                if (rightMeta.isNotEmpty()) {
+                    val prev = rightMetas.lastOrNull()
+                    if (prev != null && (prev.endsWith("/") || prev.endsWith("\\"))) {
+                        rightMetas[rightMetas.lastIndex] = prev + rightMeta
+                    } else {
+                        rightMetas.add(rightMeta)
+                    }
+                }
+                endExclusive = k + 1
+                k++
+            } else {
+                val t = styled.text.trim()
+                val prev = rightMetas.lastOrNull()
+                val betweenArtRows = k + 1 < maxEnd && isBlockElementChar(lines[k + 1].firstChar)
+                val pathContinuation = prev != null && (prev.endsWith("/") || prev.endsWith("\\") || styled.indent >= 12)
+                if (t.isNotEmpty() && !t.startsWith(">") && !t.startsWith("›") && !t.startsWith("❯") &&
+                    !fullRuleRegex.matches(t) && (betweenArtRows || pathContinuation)
+                ) {
+                    if (prev != null && (prev.endsWith("/") || prev.endsWith("\\") || styled.indent >= 12)) {
+                        rightMetas[rightMetas.lastIndex] = prev + t
+                    } else {
+                        rightMetas.add(t)
+                    }
+                    endExclusive = k + 1
+                    k++
+                } else {
+                    break
+                }
+            }
+        }
+
+        val recognizedSingle = artRows == 1 && rightMetas.any {
+            "Antigravity" in it || "Claude Code" in it || "Codex" in it || "Gemini" in it
+        }
+        if (artRows < 2 && !recognizedSingle) return null
+
+        lines.subList(start, endExclusive).clear()
+        return buildSessionHeader(rightMetas, dialect, agyState)
+    }
+
+    private fun extractFramedStartupHeader(
+        lines: MutableList<StyledLine>,
+        start: Int,
+        dialect: TerminalDialect,
+        agyState: AgyTerminalState?
+    ): TerminalSemanticBlock.SessionHeaderBlock? {
+        val first = lines[start]
+        val firstTrim = first.text.trim()
+        val isBoxed = first.firstChar == '╭' || first.firstChar == '┌'
+        var endExclusive = start + 1
+        val rawMetas = ArrayList<String>(6)
+
+        if (isBoxed) {
+            val searchLimit = minOf(lines.lastIndex, start + 24)
+            var closeIdx = -1
+            for (idx in (start + 1)..searchLimit) {
+                val c = lines[idx].firstChar
+                val t = lines[idx].text.trim()
+                if ((c == '╰' || c == '└') && t.length >= 4 && (t.endsWith('╯') || t.endsWith('┘') || t.contains('─'))) {
+                    closeIdx = idx
+                    break
+                }
+            }
+            if (closeIdx < 0) return null
+
+            val innerLines = ArrayList<String>(closeIdx - start)
+            for (idx in (start + 1) until closeIdx) {
+                var body = lines[idx].text.trim()
+                if (body.startsWith('│')) body = body.drop(1)
+                if (body.endsWith('│')) body = body.dropLast(1)
+                val midSep = body.indexOf('│')
+                if (midSep >= 0) {
+                    body = body.substring(0, midSep)
+                }
+                val stripped = startupBlockArtGlyphRegex.replace(body, " ").trim().removePrefix("✻").trim()
+                if (stripped.isNotEmpty()) {
+                    innerLines.add(stripped)
+                }
+            }
+
+            val topMatch = startupBorderTitleRegex.find(firstTrim)?.groupValues?.get(1)?.trim().orEmpty()
+            val joinedInner = innerLines.joinToString("\n")
+            val isCodexBox = ">_ OpenAI Codex" in joinedInner &&
+                "limit:" !in joinedInner &&
+                "Server:" !in joinedInner &&
+                "Account:" !in joinedInner
+            val isClaudeBox = "Claude Code" in topMatch ||
+                "Welcome to Claude Code" in joinedInner ||
+                ("Welcome back" in joinedInner && innerLines.any { "Claude" in it || "Opus" in it || "Sonnet" in it || "Haiku" in it })
+            if (!isCodexBox && !isClaudeBox) return null
+
+            if ("Claude Code" in topMatch && topMatch.any { it != '─' && it != '━' }) {
+                rawMetas.add(topMatch.trim('─', '━', ' '))
+            }
+            for (item in innerLines) {
+                if (item.startsWith(">_ OpenAI Codex")) {
+                    rawMetas.add(item.removePrefix(">_ ").trim())
+                } else if (!isStartupTipNoise(item)) {
+                    rawMetas.add(item)
+                }
+            }
+            endExclusive = closeIdx + 1
+        } else if (firstTrim.startsWith(">_ OpenAI Codex")) {
+            val scanLimit = minOf(lines.size, start + 10)
+            var idx = start
+            while (idx < scanLimit) {
+                val t = lines[idx].text.trim()
+                if (t.isEmpty() || t.startsWith("• ") || t.startsWith("› ") || t.startsWith("■")) break
+                if ("limit:" in t || "Server:" in t || "Account:" in t) return null
+                rawMetas.add(if (t.startsWith(">_ ")) t.removePrefix(">_ ").trim() else t)
+                idx++
+            }
+            endExclusive = idx
+        } else if (firstTrim.startsWith("✻") && "Welcome to Claude Code" in firstTrim) {
+            rawMetas.add(firstTrim.removePrefix("✻").trim())
+            val scanLimit = minOf(lines.size, start + 8)
+            var idx = start + 1
+            while (idx < scanLimit) {
+                val t = lines[idx].text.trim()
+                if (t.isEmpty() || t.startsWith("❯ ") || t.startsWith("⏺ ")) break
+                if (!isStartupTipNoise(t)) rawMetas.add(t)
+                idx++
+            }
+            endExclusive = idx
+        } else {
+            return null
+        }
+
+        lines.subList(start, endExclusive).clear()
+        val inferredDialect = when {
+            dialect != TerminalDialect.GENERIC -> dialect
+            rawMetas.any { "OpenAI Codex" in it } -> TerminalDialect.CODEX
+            rawMetas.any { "Claude Code" in it } -> TerminalDialect.CLAUDE
+            else -> dialect
+        }
+        return buildSessionHeader(rawMetas, inferredDialect, agyState)
+    }
+
+    private fun isStartupTipNoise(line: String): Boolean {
+        val t = line.trim()
+        return t.isEmpty() ||
+            t.startsWith("Tips for ", ignoreCase = true) ||
+            t.startsWith("Recent activity", ignoreCase = true) ||
+            t.startsWith("No recent activity", ignoreCase = true) ||
+            t.startsWith("Run /init", ignoreCase = true) ||
+            t.startsWith("/help ", ignoreCase = true) ||
+            t.startsWith("Welcome back", ignoreCase = true) ||
+            fullRuleRegex.matches(t)
+    }
+
+    private fun buildSessionHeader(
+        rawMetas: List<String>,
+        dialect: TerminalDialect,
+        agyState: AgyTerminalState?
+    ): TerminalSemanticBlock.SessionHeaderBlock {
+        val filtered = ArrayList<String>(rawMetas.size)
+        for (raw in rawMetas) {
+            val cleaned = raw.trim()
+            if (cleaned.isEmpty()) continue
+            if (startupCwdRegex.matches(cleaned)) continue
+            if (containsCommonFooterMarker(cleaned)) continue
+            if (cleaned !in filtered) filtered.add(cleaned)
+        }
+
+        var titleIdx = filtered.indexOfFirst { startupTitleKeywordRegex.containsMatchIn(it) }
+        if (titleIdx < 0 && filtered.isNotEmpty() && !filtered[0].contains('@') && !startupModelPrefixRegex.containsMatchIn(filtered[0])) {
+            titleIdx = 0
+        }
+        val agentTitle = if (titleIdx >= 0) {
+            filtered.removeAt(titleIdx).let { t ->
+                if ("Welcome to Claude Code" in t) "Claude Code" else t
+            }
+        } else {
+            when (dialect) {
+                TerminalDialect.ANTIGRAVITY -> "Antigravity CLI"
+                TerminalDialect.CODEX -> "OpenAI Codex"
+                TerminalDialect.CLAUDE -> "Claude Code"
+                TerminalDialect.PI -> "Pi Agent"
+                else -> "Agent 终端"
+            }
+        }
+
+        var accountOrPlan: String? = null
+        var modelOrRole: String? = null
+        val details = ArrayList<String>(2)
+
+        for (item in filtered) {
+            val isExplicitModel = startupModelPrefixRegex.containsMatchIn(item)
+            if (isExplicitModel) {
+                val normalized = startupModelChangeSuffixRegex.replace(
+                    startupModelPrefixRegex.replaceFirst(item, ""),
+                    ""
+                ).trim()
+                if (modelOrRole == null && normalized.isNotEmpty()) {
+                    modelOrRole = normalized
+                    continue
+                }
+            }
+            if ('·' in item && modelOrRole == null && accountOrPlan == null) {
+                val left = item.substringBefore('·').trim()
+                val right = item.substringAfter('·').trim()
+                if (startupAccountRegex.containsMatchIn(right) || '@' in right) {
+                    modelOrRole = left.takeIf { it.isNotEmpty() }
+                    accountOrPlan = right.takeIf { it.isNotEmpty() }
+                    continue
+                }
+            }
+            if (accountOrPlan == null && ('@' in item || startupAccountRegex.containsMatchIn(item))) {
+                accountOrPlan = item
+            } else if (modelOrRole == null) {
+                modelOrRole = startupModelChangeSuffixRegex.replace(item, "").trim()
+            } else if (details.size < 2 && item != agentTitle && item != accountOrPlan && item != modelOrRole) {
+                details.add(item)
+            }
+        }
+
+        if (modelOrRole == null && !agyState?.activeModelSummary.isNullOrBlank()) {
+            modelOrRole = agyState?.activeModelSummary
+        }
+
+        return TerminalSemanticBlock.SessionHeaderBlock(
+            agentTitle = agentTitle,
+            modelOrRole = modelOrRole,
+            accountOrPlan = accountOrPlan,
+            details = details
+        )
     }
 
     /** `│ text │` or `│ text` (a framed message, not a multi-column table) -> `text`, keeping relative indent. */
@@ -2275,8 +2621,16 @@ object StructuredTerminalReader {
                 val t = lines[it].trim()
                 t.startsWith("› ") || t.startsWith("• ")
             }
-            if (isFullStatusCard || !hasLaterConversation) {
+            if (isFullStatusCard) {
                 addCode(joined, kindLabel = "Codex 状态")
+            } else if (!hasLaterConversation) {
+                blocks.add(
+                    buildSessionHeader(
+                        buf.map { it.trim().removePrefix(">_ ").trim() },
+                        TerminalDialect.CODEX,
+                        agyState = null
+                    )
+                )
             }
         }
 
