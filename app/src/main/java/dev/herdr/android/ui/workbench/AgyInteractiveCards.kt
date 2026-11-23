@@ -965,7 +965,7 @@ private class GridDrawCache {
 }
 
 @Composable
-private fun BtwGridTableBlock(
+internal fun BtwGridTableBlock(
     table: BtwContentSegment.Table,
     onCopyText: (String) -> Unit
 ) {
@@ -1202,7 +1202,7 @@ private fun BtwCodeSegmentBlock(
 private val btwInlineTokenRegex = Regex("`([^`]+)`|\\*\\*([^*]+)\\*\\*")
 
 @Composable
-private fun formatBtwInline(text: String): AnnotatedString {
+internal fun formatBtwInline(text: String): AnnotatedString {
     val codeBg = HerdrColors.Canvas
     val codeFg = HerdrColors.Accent
     return remember(text, codeBg, codeFg) {

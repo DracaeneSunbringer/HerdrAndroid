@@ -30,6 +30,7 @@ import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.service.HerdrKeepAliveCoordinator
 import dev.herdr.android.ui.terminal.QuickReplyAction
 import dev.herdr.android.ui.terminal.StructuredTerminalReader
+import dev.herdr.android.ui.terminal.TerminalSemanticBlock
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
 import dev.herdr.android.ui.theme.HerdrThemeTriad
@@ -101,6 +102,23 @@ data class StagedImageAttachment(
     val remotePath: String? = null,
     val uploading: Boolean = false,
     val error: String? = null
+)
+
+enum class QueuedDispatchMode(val label: String, val badgeText: String) {
+    FOLLOW_UP("本轮结束后自动发", "⏳ 待本轮后自动发送"),
+    MANUAL("暂存待发", "📌 暂存队列")
+}
+
+data class QueuedPromptItem(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val address: String,
+    val text: String,
+    val attachmentPaths: List<String> = emptyList(),
+    val attachmentNames: List<String> = emptyList(),
+    val isAgentTui: Boolean = true,
+    val mode: QueuedDispatchMode = QueuedDispatchMode.FOLLOW_UP,
+    val createdAtMs: Long = System.currentTimeMillis(),
+    val enqueuedAtTurn: Int = 0
 )
 
 class HerdrMainViewModel(
@@ -212,6 +230,27 @@ class HerdrMainViewModel(
     private val _viewingBtwHistoryAddress = MutableStateFlow<String?>(null)
     val viewingBtwHistoryAddress: StateFlow<String?> = _viewingBtwHistoryAddress.asStateFlow()
 
+    private val _queuedPromptsByAddress = MutableStateFlow<Map<String, List<QueuedPromptItem>>>(emptyMap())
+    val queuedPromptsByAddress: StateFlow<Map<String, List<QueuedPromptItem>>> = _queuedPromptsByAddress.asStateFlow()
+
+    private val sawWorkingByAddress = ConcurrentHashMap<String, Boolean>()
+    private val latestStatusByAddress = ConcurrentHashMap<String, AgentStateWord>()
+    private val queueDispatchJobs = ConcurrentHashMap<String, Job>()
+    private val readerHistoryByAddress = ConcurrentHashMap<String, List<TerminalSemanticBlock>>()
+
+    fun getCachedReaderBlocks(address: String): List<TerminalSemanticBlock> =
+        readerHistoryByAddress[address].orEmpty()
+
+    fun updateCachedReaderBlocks(address: String, blocks: List<TerminalSemanticBlock>) {
+        if (blocks.any { it is TerminalSemanticBlock.SessionHeaderBlock } &&
+            blocks.none { it is TerminalSemanticBlock.UserPromptBlock }
+        ) {
+            readerHistoryByAddress.remove(address)
+        } else if (blocks.isNotEmpty()) {
+            readerHistoryByAddress[address] = blocks.filterNot { it is TerminalSemanticBlock.SessionHeaderBlock }
+        }
+    }
+
     private data class DigestCacheEntry(
         val cacheKey: String,
         val digest: FleetCardDigest
@@ -281,11 +320,28 @@ class HerdrMainViewModel(
                 val liveAddrs = live.map { it.address }.toSet()
                 previewCacheKeys.keys.retainAll(liveAddrs)
                 previewLastFetchMs.keys.retainAll(liveAddrs)
+                sawWorkingByAddress.keys.retainAll(liveAddrs)
+                latestStatusByAddress.keys.retainAll(liveAddrs)
+                readerHistoryByAddress.keys.retainAll(liveAddrs)
+                val staleQueueJobs = queueDispatchJobs.keys.filter { it !in liveAddrs }
+                for (deadAddr in staleQueueJobs) {
+                    queueDispatchJobs.remove(deadAddr)?.cancel()
+                }
                 if (_terminalPreviews.value.keys.any { it !in liveAddrs }) {
                     _terminalPreviews.value = _terminalPreviews.value.filterKeys { it in liveAddrs }
                 }
                 if (_stagedAttachmentsByAddress.value.keys.any { it !in liveAddrs }) {
                     _stagedAttachmentsByAddress.value = _stagedAttachmentsByAddress.value.filterKeys { it in liveAddrs }
+                }
+                if (_queuedPromptsByAddress.value.keys.any { it !in liveAddrs }) {
+                    _queuedPromptsByAddress.value = _queuedPromptsByAddress.value.filterKeys { it in liveAddrs }
+                }
+                for (t in live) {
+                    if (_queuedPromptsByAddress.value[t.address].orEmpty().isNotEmpty() &&
+                        _activeSession.value?.address != t.address
+                    ) {
+                        syncLiveAgentStatus(t.address, t.agentStatus, t.turn)
+                    }
                 }
                 if (_dispatchedReceipts.value.isNotEmpty()) {
                     val byAddr = live.associateBy { it.address }
@@ -1589,6 +1645,252 @@ class HerdrMainViewModel(
         sequenceCoordinator.cancel()
     }
 
+    fun enqueuePromptForActiveTerminal(
+        text: String,
+        isAgentTui: Boolean,
+        mode: QueuedDispatchMode = QueuedDispatchMode.FOLLOW_UP
+    ) {
+        val session = _activeSession.value ?: return
+        val curSummary = _activeTerminalSummary.value
+        val attachments = _stagedAttachmentsByAddress.value[session.address].orEmpty()
+        if (attachments.any { it.uploading }) {
+            _toastBanner.value = "图片正在上传中，请稍候…"
+            return
+        }
+        val ready = attachments.filter { !it.remotePath.isNullOrBlank() }
+        val cleanText = text.trim()
+        if (cleanText.isEmpty() && ready.isEmpty()) return
+
+        if (ready.isNotEmpty()) {
+            updateAttachmentsForAddress(session.address) { emptyList() }
+        }
+        updateDraftForTerminal(session.address, "")
+        if (curSummary != null) {
+            markTerminalDoneAcknowledged(curSummary)
+        }
+        if (latestStatusByAddress[session.address] == AgentStateWord.WORKING ||
+            curSummary?.agentStatus == AgentStateWord.WORKING
+        ) {
+            sawWorkingByAddress[session.address] = true
+        }
+
+        val item = QueuedPromptItem(
+            address = session.address,
+            text = cleanText,
+            attachmentPaths = ready.mapNotNull { it.remotePath },
+            attachmentNames = ready.map { it.displayName },
+            isAgentTui = isAgentTui,
+            mode = mode,
+            createdAtMs = System.currentTimeMillis(),
+            enqueuedAtTurn = curSummary?.turn ?: 0
+        )
+        val currentMap = _queuedPromptsByAddress.value.toMutableMap()
+        currentMap[session.address] = currentMap[session.address].orEmpty() + item
+        _queuedPromptsByAddress.value = currentMap
+        _toastBanner.value = if (mode == QueuedDispatchMode.FOLLOW_UP) {
+            "⏳ 已加入待发队列，本轮结束后将自动发送"
+        } else {
+            "📌 已放入待发队列"
+        }
+    }
+
+    fun sendQueuedPromptNow(address: String, itemId: String) {
+        val list = _queuedPromptsByAddress.value[address].orEmpty()
+        val item = list.firstOrNull { it.id == itemId } ?: return
+        val remaining = list.filterNot { it.id == itemId }
+        updateQueueForAddress(address, remaining)
+        queueDispatchJobs.remove(address)?.cancel()
+        sawWorkingByAddress[address] = false
+        dispatchQueuedItem(address, item, isSteer = true)
+    }
+
+    fun editQueuedPrompt(address: String, itemId: String) {
+        val list = _queuedPromptsByAddress.value[address].orEmpty()
+        val item = list.firstOrNull { it.id == itemId } ?: return
+        val remaining = list.filterNot { it.id == itemId }
+        updateQueueForAddress(address, remaining)
+        if (item.attachmentPaths.isNotEmpty()) {
+            val restored = item.attachmentPaths.mapIndexed { idx, remotePath ->
+                StagedImageAttachment(
+                    id = java.util.UUID.randomUUID().toString(),
+                    displayName = item.attachmentNames.getOrElse(idx) { "图片 ${idx + 1}" },
+                    remotePath = remotePath,
+                    uploading = false
+                )
+            }
+            updateAttachmentsForAddress(address) { it + restored }
+        }
+        if (item.text.isNotBlank()) {
+            updateDraftForTerminal(address, item.text)
+        }
+        _requestInputFocusSignal.value = android.os.SystemClock.elapsedRealtime()
+    }
+
+    fun removeQueuedPrompt(address: String, itemId: String) {
+        val list = _queuedPromptsByAddress.value[address].orEmpty()
+        if (list.none { it.id == itemId }) return
+        updateQueueForAddress(address, list.filterNot { it.id == itemId })
+    }
+
+    fun moveQueuedPromptToTop(address: String, itemId: String) {
+        val list = _queuedPromptsByAddress.value[address].orEmpty()
+        val target = list.firstOrNull { it.id == itemId } ?: return
+        val reordered = listOf(target) + list.filterNot { it.id == itemId }
+        updateQueueForAddress(address, reordered)
+    }
+
+    fun syncLiveAgentStatus(address: String, liveStatus: AgentStateWord, currentTurn: Int) {
+        latestStatusByAddress[address] = liveStatus
+        if (liveStatus == AgentStateWord.WORKING) {
+            sawWorkingByAddress[address] = true
+            queueDispatchJobs.remove(address)?.cancel()
+            return
+        }
+        if (liveStatus == AgentStateWord.BLOCKED || liveStatus == AgentStateWord.ERROR) {
+            queueDispatchJobs.remove(address)?.cancel()
+            return
+        }
+        maybeScheduleQueueDispatch(address, liveStatus, currentTurn)
+    }
+
+    private fun maybeScheduleQueueDispatch(address: String, status: AgentStateWord, currentTurn: Int) {
+        if (status != AgentStateWord.DONE && status != AgentStateWord.IDLE) return
+        val head = _queuedPromptsByAddress.value[address]
+            .orEmpty()
+            .firstOrNull { it.mode == QueuedDispatchMode.FOLLOW_UP }
+            ?: return
+        val sawWorking = sawWorkingByAddress[address] == true
+        val elapsedSinceEnqueue = System.currentTimeMillis() - head.createdAtMs
+        val turnAdvanced = currentTurn > head.enqueuedAtTurn
+        if (!turnAdvanced && !(sawWorking && elapsedSinceEnqueue >= 650L)) {
+            return
+        }
+        if (sequenceStatus.value?.address == address) return
+        if (queueDispatchJobs[address]?.isActive == true) return
+
+        queueDispatchJobs[address] = HerdrKeepAliveCoordinator.processScope.launch {
+            delay(650)
+            val recheckedStatus = latestStatusByAddress[address]
+                ?: controller.terminals.value.firstOrNull { it.address == address }?.agentStatus
+                ?: status
+            if (recheckedStatus != AgentStateWord.DONE && recheckedStatus != AgentStateWord.IDLE) {
+                queueDispatchJobs.remove(address)
+                return@launch
+            }
+            if (sequenceStatus.value?.address == address) {
+                queueDispatchJobs.remove(address)
+                return@launch
+            }
+            val activeSess = _activeSession.value?.takeIf { it.address == address }
+            val latestScreen = if (activeSess != null) {
+                activeSess.refreshScreenNow(screenOnly = true).getOrNull() ?: activeSess.screenSnapshot.value
+            } else {
+                controller.readTerminalPreview(address).getOrNull()
+            }
+            val termSummary = controller.terminals.value.firstOrNull { it.address == address }
+                ?: _activeTerminalSummary.value?.takeIf { it.address == address }
+            if (!latestScreen.isNullOrBlank() &&
+                StructuredTerminalReader.hasInteractiveDialogOnScreen(latestScreen, termSummary)
+            ) {
+                _toastBanner.value = "终端存在待处理交互面板，已暂停队列自动发送"
+                queueDispatchJobs.remove(address)
+                return@launch
+            }
+            val currentList = _queuedPromptsByAddress.value[address].orEmpty()
+            val toSend = currentList.firstOrNull { it.mode == QueuedDispatchMode.FOLLOW_UP }
+            if (toSend == null) {
+                queueDispatchJobs.remove(address)
+                return@launch
+            }
+            updateQueueForAddress(address, currentList.filterNot { it.id == toSend.id })
+            sawWorkingByAddress[address] = false
+            queueDispatchJobs.remove(address)
+            dispatchQueuedItem(address, toSend, isSteer = false)
+        }
+    }
+
+    private fun updateQueueForAddress(address: String, updatedList: List<QueuedPromptItem>) {
+        val map = _queuedPromptsByAddress.value.toMutableMap()
+        if (updatedList.isEmpty()) {
+            map.remove(address)
+        } else {
+            map[address] = updatedList
+        }
+        _queuedPromptsByAddress.value = map
+    }
+
+    private fun dispatchQueuedItem(address: String, item: QueuedPromptItem, isSteer: Boolean) {
+        val termSummary = controller.terminals.value.firstOrNull { it.address == address }
+            ?: _activeTerminalSummary.value?.takeIf { it.address == address }
+        if (termSummary != null) {
+            markTerminalDoneAcknowledged(termSummary)
+        }
+        val receiptLabel = buildList {
+            if (item.text.isNotBlank()) add(item.text)
+            item.attachmentNames.forEach { add("[📎 $it]") }
+        }.joinToString(" ")
+        if (receiptLabel.isNotBlank()) {
+            _dispatchedReceipts.value = _dispatchedReceipts.value + (
+                address to DispatchedReceipt(
+                    address = address,
+                    text = receiptLabel,
+                    sentAtTurn = termSummary?.turn ?: item.enqueuedAtTurn
+                )
+                )
+        }
+
+        val activeSess = _activeSession.value?.takeIf { it.address == address }
+        HerdrKeepAliveCoordinator.processScope.launch {
+            val sendRes = if (activeSess != null) {
+                if (activeSess.mode.value == AttachMode.OBSERVE) {
+                    runCatching { activeSess.setMode(AttachMode.TAKEOVER) }
+                }
+                if (item.attachmentPaths.isNotEmpty()) {
+                    activeSess.sendSubmission(
+                        text = item.text,
+                        attachmentPaths = item.attachmentPaths,
+                        isAgentTui = item.isAgentTui,
+                        submitWithEnter = true
+                    )
+                } else {
+                    activeSess.sendLine(item.text)
+                }
+            } else {
+                val opened = controller.openTerminalSession(address, AttachMode.TAKEOVER)
+                opened.mapCatching { tempSession ->
+                    try {
+                        if (item.attachmentPaths.isNotEmpty()) {
+                            tempSession.sendSubmission(
+                                text = item.text,
+                                attachmentPaths = item.attachmentPaths,
+                                isAgentTui = item.isAgentTui,
+                                submitWithEnter = true
+                            ).getOrThrow()
+                        } else {
+                            tempSession.sendLine(item.text).getOrThrow()
+                        }
+                        delay(220)
+                    } finally {
+                        runCatching { tempSession.detach() }
+                    }
+                }
+            }
+            sendRes.onSuccess {
+                _toastBanner.value = if (isSteer) {
+                    "⚡ 已立即插话发送给 $address"
+                } else {
+                    "✓ 队列自动续发给 $address"
+                }
+                delay(400)
+                controller.refreshTerminals()
+                delay(1400)
+                controller.refreshTerminals()
+            }.onFailure { err ->
+                _toastBanner.value = "队列发送失败：${err.message}"
+            }
+        }
+    }
+
     fun submitAgyAskAnswer(
         questionIndex: Int,
         selectedNumbers: Set<Int>,
@@ -1646,6 +1948,9 @@ class HerdrMainViewModel(
             return
         }
         val session = _activeSession.value ?: return
+        if (trimmed.equals("/clear", ignoreCase = true)) {
+            readerHistoryByAddress.remove(session.address)
+        }
         lastDesiredAttachMode = AttachMode.TAKEOVER
         sequenceCoordinator.execute(
             address = session.address,

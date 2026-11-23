@@ -64,6 +64,19 @@ object BtwRichContentParser {
     private val boxBottomBorderRegex = Regex("^[└╰][─━═┴]+[┘╯]$")
     private val boxHLineOnlyRegex = Regex("^[─━═┼╋┬┴├┤┌┐└┘╭╮╰╯]+$")
     private val asciiPlusBorderRegex = Regex("^\\+[-=+]{2,}(?:\\+[-=+]{2,})+\\+$")
+    private val codexSpacedRuleRegex = Regex("^\\s*[━─]{3,}(?:\\s{2,}[━─]{3,})+\\s*$")
+
+    /**
+     * Parses a raw table snippet (Markdown, Antigravity `│` + `───┼───`, box-drawn, or Codex
+     * spaced-rule `━━━  ━━━`) into a structured [BtwContentSegment.Table], or null if it is not a
+     * standalone table.
+     */
+    fun parseTableOrNull(rawText: String): BtwContentSegment.Table? {
+        val trimmed = rawText.trim()
+        if (trimmed.isEmpty()) return null
+        val segments = parse(trimmed)
+        return segments.singleOrNull() as? BtwContentSegment.Table
+    }
 
     fun parse(answerText: String): List<BtwContentSegment> {
         if (answerText.isBlank()) return emptyList()
@@ -126,7 +139,15 @@ object BtwRichContentParser {
                 continue
             }
 
-            // 5. Markdown heading (# .. ####)
+            // 5. Codex spaced-rule table (`━━━  ━━━` / `───  ───`)
+            if (isCodexSpacedTableStart(lines, i)) {
+                val (seg, nextIdx) = consumeCodexSpacedTable(lines, i)
+                segments.add(seg)
+                i = nextIdx
+                continue
+            }
+
+            // 6. Markdown heading (# .. ####)
             val hMatch = headingRegex.matchEntire(trimmed)
             if (hMatch != null) {
                 segments.add(
@@ -159,7 +180,8 @@ object BtwRichContentParser {
                     bulletRegex.matches(cur) ||
                     isMarkdownTableStart(lines, i) ||
                     isAgyPipeTableStart(lines, i) ||
-                    isBoxTableStart(lines, i)
+                    isBoxTableStart(lines, i) ||
+                    isCodexSpacedTableStart(lines, i)
                 ) {
                     break
                 }
@@ -422,7 +444,8 @@ object BtwRichContentParser {
                 headingRegex.matches(trimmed) ||
                 isMarkdownTableStart(lines, i) ||
                 isAgyPipeTableStart(lines, i) ||
-                isBoxTableStart(lines, i)
+                isBoxTableStart(lines, i) ||
+                isCodexSpacedTableStart(lines, i)
             ) {
                 break
             }
@@ -449,6 +472,144 @@ object BtwRichContentParser {
 
     private fun isBoxRowLike(t: String): Boolean =
         t.startsWith("│") || t.startsWith("║") || t.startsWith("|") || ('│' in t && !boxHLineOnlyRegex.matches(t))
+
+    private fun isCodexSpacedTableStart(lines: List<String>, idx: Int): Boolean {
+        val cur = lines[idx].trim()
+        if (codexSpacedRuleRegex.matches(lines[idx])) {
+            return idx + 1 < lines.size && lines[idx + 1].isNotBlank()
+        }
+        if (cur.isEmpty() || boxHLineOnlyRegex.matches(cur)) return false
+        return idx + 1 < lines.size && codexSpacedRuleRegex.matches(lines[idx + 1])
+    }
+
+    private fun consumeCodexSpacedTable(lines: List<String>, startIdx: Int): Pair<BtwContentSegment.Table, Int> {
+        val rawLines = ArrayList<String>()
+        var i = startIdx
+        val ruleLine = if (codexSpacedRuleRegex.matches(lines[startIdx])) {
+            lines[startIdx]
+        } else {
+            lines[startIdx + 1]
+        }
+        val colSpans = extractDisplayColSpans(ruleLine)
+        val colCount = colSpans.size.coerceAtLeast(1)
+
+        fun sliceCodexRow(raw: String): List<String> =
+            List(colCount) { colIdx ->
+                val span = colSpans[colIdx]
+                val nextStart = colSpans.getOrNull(colIdx + 1)?.first
+                val isLast = colIdx == colCount - 1
+                sliceByDisplayColumns(raw, span.first, nextStart, isLast).trim()
+            }
+
+        var headerCells = emptyList<String>()
+        if (!codexSpacedRuleRegex.matches(lines[i])) {
+            headerCells = sliceCodexRow(lines[i])
+            rawLines.add(lines[i])
+            i++
+        }
+        if (i < lines.size && codexSpacedRuleRegex.matches(lines[i])) {
+            rawLines.add(lines[i])
+            i++
+        }
+
+        val rows = ArrayList<List<String>>()
+        var hadSepBeforeRow = true
+        while (i < lines.size) {
+            val rawLine = lines[i]
+            val t = rawLine.trim()
+            if (t.isEmpty()) break
+            if (codexSpacedRuleRegex.matches(rawLine)) {
+                rawLines.add(rawLine)
+                hadSepBeforeRow = true
+                i++
+                continue
+            }
+            val cells = sliceCodexRow(rawLine)
+            rawLines.add(rawLine)
+            val nonBlankIndices = cells.indices.filter { cells[it].isNotBlank() }
+            if (!hadSepBeforeRow &&
+                rows.isNotEmpty() &&
+                cells.firstOrNull()?.isBlank() == true &&
+                nonBlankIndices.size == 1
+            ) {
+                val prev = rows.last().toMutableList()
+                val mergeCol = nonBlankIndices[0]
+                while (prev.size <= mergeCol) prev.add("")
+                if (prev[mergeCol].isNotBlank()) {
+                    prev[mergeCol] = joinWrappedLines(listOf(prev[mergeCol], cells[mergeCol]))
+                    rows[rows.lastIndex] = prev
+                    hadSepBeforeRow = false
+                    i++
+                    continue
+                }
+            }
+            rows.add(cells)
+            hadSepBeforeRow = false
+            i++
+        }
+
+        return BtwContentSegment.Table(
+            headers = if (headerCells.isNotEmpty()) normalizeRow(headerCells, colCount) else emptyList(),
+            rows = rows.map { normalizeRow(it, colCount) },
+            alignments = List(colCount) { BtwTableAlign.START },
+            rawText = rawLines.joinToString("\n")
+        ) to i
+    }
+
+    private fun extractDisplayColSpans(ruleLine: String): List<IntRange> {
+        val spans = ArrayList<IntRange>()
+        var spanStart = -1
+        var col = 0
+        var idx = 0
+        while (idx < ruleLine.length) {
+            val cp = ruleLine.codePointAt(idx)
+            val w = codePointDisplayWidth(cp)
+            val isRuleChar = cp == '━'.code || cp == '─'.code || cp == '═'.code
+            if (isRuleChar) {
+                if (spanStart < 0) spanStart = col
+            } else if (spanStart >= 0) {
+                spans.add(spanStart until col)
+                spanStart = -1
+            }
+            col += w
+            idx += Character.charCount(cp)
+        }
+        if (spanStart >= 0) {
+            spans.add(spanStart until col)
+        }
+        return spans
+    }
+
+    private fun sliceByDisplayColumns(
+        line: String,
+        startCol: Int,
+        nextSpanStart: Int?,
+        isLast: Boolean
+    ): String {
+        val sb = StringBuilder()
+        val endCol = if (isLast || nextSpanStart == null) Int.MAX_VALUE else (nextSpanStart - 1).coerceAtLeast(startCol)
+        var col = 0
+        var idx = 0
+        while (idx < line.length) {
+            val cp = line.codePointAt(idx)
+            val w = codePointDisplayWidth(cp)
+            val nextCol = col + w
+            if (col >= startCol && (isLast || nextCol <= endCol || (col < endCol && nextCol > endCol))) {
+                sb.appendCodePoint(cp)
+            } else if (!isLast && col >= endCol) {
+                break
+            }
+            col = nextCol
+            idx += Character.charCount(cp)
+        }
+        return sb.toString()
+    }
+
+    private fun codePointDisplayWidth(cp: Int): Int =
+        if (cp in 0x1100..0x115F || cp in 0x2E80..0xA4CF || cp in 0xAC00..0xD7A3 ||
+            cp in 0xF900..0xFAFF || cp in 0xFE30..0xFE4F || cp in 0xFF00..0xFF60 ||
+            cp in 0xFFE0..0xFFE6 || cp >= 0x1F300
+        ) 2 else 1
 
     private fun splitMarkdownRow(line: String): List<String> {
         var trimmed = line.trim()

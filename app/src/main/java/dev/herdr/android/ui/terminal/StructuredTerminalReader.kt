@@ -14,6 +14,49 @@ import dev.herdr.android.protocol.TerminalSummary
  * [StructuredTerminalReader] dispatches to per-agent [TerminalDialect] rules so each agent's
  * terminal output is faithfully parsed into mobile-native blocks.
  */
+enum class ToolActionCategory(val label: String, val badgeText: String) {
+    THOUGHT("思考", "思考"),
+    READ("读取", "读取"),
+    EDIT("编辑", "编辑"),
+    COMMAND("命令", "命令"),
+    SEARCH("检索", "检索"),
+    SUBAGENT("子代理", "代理"),
+    OTHER("工具", "工具")
+}
+
+data class ToolStepEntry(
+    val title: String,
+    val category: ToolActionCategory,
+    val detailLines: List<String> = emptyList(),
+    val durationText: String? = null,
+    val changedFiles: List<String> = emptyList(),
+    val isRunning: Boolean = false,
+    val hasError: Boolean = false
+)
+
+data class LiveWorkingActivity(
+    val title: String,
+    val category: ToolActionCategory = ToolActionCategory.OTHER,
+    val tailLines: List<String> = emptyList(),
+    val elapsedHint: String? = null,
+    val totalStepsInTurn: Int = 0
+)
+
+data class ConversationTurn(
+    val turnIndex: Int,
+    val userPrompt: TerminalSemanticBlock.UserPromptBlock?,
+    val responseBlocks: List<TerminalSemanticBlock>,
+    val toolOperationCount: Int = 0,
+    val thoughtSummaryLabel: String? = null,
+    val durationLabel: String? = null,
+    val actionBreakdownLabel: String? = null,
+    val changedFiles: List<String> = emptyList(),
+    val answerPreview: String = "",
+    val hasError: Boolean = false,
+    val isRunning: Boolean = false,
+    val hasInteractiveCard: Boolean = false
+)
+
 sealed interface TerminalSemanticBlock {
     /** A user instruction (`> ` / `❯ ` / `› ` / `[click to jump]` / shell command), including `<hc ...>...</hc>`. */
     data class UserPromptBlock(val text: String) : TerminalSemanticBlock
@@ -23,7 +66,17 @@ sealed interface TerminalSemanticBlock {
         val summaryLabel: String,
         val steps: List<String>,
         val hasError: Boolean = false,
-        val defaultExpanded: Boolean = false
+        val defaultExpanded: Boolean = false,
+        val entries: List<ToolStepEntry> = emptyList(),
+        val isPureThought: Boolean = false,
+        val thoughtSummaryLabel: String? = null,
+        val thoughtPreview: String? = null,
+        val actionBreakdownLabel: String? = null,
+        val changedFiles: List<String> = emptyList(),
+        val isRunning: Boolean = false,
+        val activeStepTitle: String? = null,
+        val activeStepTailLines: List<String> = emptyList(),
+        val durationLabel: String? = null
     ) : TerminalSemanticBlock
 
     /** Monospace content that must keep its layout: fenced/indented code, tables, diffs, JSON, shell output. */
@@ -96,7 +149,9 @@ data class WorkbenchSnapshot(
     val liveStatus: AgentStateWord,
     val isExpandedMode: Boolean,
     val dialect: TerminalDialect = TerminalDialect.GENERIC,
-    val agyState: AgyTerminalState? = null
+    val agyState: AgyTerminalState? = null,
+    val turns: List<ConversationTurn> = emptyList(),
+    val liveWorkingActivity: LiveWorkingActivity? = null
 )
 
 object StructuredTerminalReader {
@@ -115,6 +170,7 @@ object StructuredTerminalReader {
     private const val COMPACT_STEP_LINE_CHARS = 120
     private const val EXPANDED_STEP_LINE_CHARS = 240
     private const val HEADLINE_MAX_WIDTH = 96
+    private const val MAX_CACHED_HISTORY_BLOCKS = 800
 
     // ---------------------------------------------------------------------------------------------
     // Control-sequence stripping
@@ -348,6 +404,8 @@ object StructuredTerminalReader {
     private val startupModelChangeSuffixRegex = Regex("(?i)\\s+/model to change.*$")
     private val startupBorderTitleRegex = Regex("^[╭┌─━\\s]+(.+?)[─━╮┐\\s]*$")
     private val startupBlockArtGlyphRegex = Regex("[\\u2580-\\u259F]+")
+    private val boldThoughtHeadingRegex = Regex("(?:^|\\s)\\*\\*([^*\\n]{2,80})\\*\\*")
+    private val thoughtLeadMarkdownStripRegex = Regex("^(?:#+\\s+|[-*•]\\s+)")
 
     // ---------------------------------------------------------------------------------------------
     // Public API
@@ -393,9 +451,14 @@ object StructuredTerminalReader {
 
     /**
      * Single-pass analysis for `AgentWorkbenchPane`: cleans the screen once, parses semantic blocks
-     * once, resolves live status once, and builds quick actions once.
+     * once, optionally splices onto cached history blocks beyond the 260-line window, resolves live
+     * status once, and builds turns & quick actions once.
      */
-    fun analyzeWorkbench(rawScreen: String?, summary: TerminalSummary?): WorkbenchSnapshot {
+    fun analyzeWorkbench(
+        rawScreen: String?,
+        summary: TerminalSummary? = null,
+        cachedBlocks: List<TerminalSemanticBlock> = emptyList()
+    ): WorkbenchSnapshot {
         val raw = rawScreen.orEmpty()
         val dialect = detectDialect(summary?.agentApp, raw)
         if (raw.isBlank()) {
@@ -407,11 +470,20 @@ object StructuredTerminalReader {
                 menuOptions = emptyList(),
                 hasYesNo = false
             )
+            val liveActivity = if (fallbackStatus == AgentStateWord.WORKING) {
+                LiveWorkingActivity(
+                    title = summary?.agentMessage?.takeIf { it.isNotBlank() } ?: "正在执行…"
+                )
+            } else {
+                null
+            }
             return WorkbenchSnapshot(
                 blocks = emptyList(),
                 quickActions = actions,
                 liveStatus = fallbackStatus,
-                isExpandedMode = false
+                isExpandedMode = false,
+                dialect = dialect,
+                liveWorkingActivity = liveActivity
             )
         }
         val cleaned = cleanScreen(raw, dialect)
@@ -419,18 +491,29 @@ object StructuredTerminalReader {
         val activeAsk = cleaned.agyState?.activeAskCard
         val activeModal = cleaned.agyState?.activeSlashModal
         val activeBtw = cleaned.agyState?.activeBtwCard
-        val blocks = if (activeAsk != null) {
+        val currentScreenBlocks = if (activeAsk != null) {
             parsedBlocks + TerminalSemanticBlock.AskCardBlock(activeAsk)
         } else {
             parsedBlocks
+        }
+        val finalBlocks = if (cachedBlocks.isNotEmpty()) {
+            spliceHistory(cachedBlocks, currentScreenBlocks)
+        } else {
+            currentScreenBlocks
         }
         val cleanTail = cleaned.trimmedLines.asReversed().asSequence().filter { it.isNotEmpty() }.take(16).toList().asReversed()
         val menuOptions = findMenuOptions(cleanTail)
         val hasYesNo = cleanTail.any { ('/' in it) && yesNoRegex.containsMatchIn(it) }
         val hasNavModal = (cleaned.agyState?.phase == AgyUiPhase.SLASH_MODAL) ||
             cleaned.rawTail.takeLast(8).any { AntigravityTranscriptSpec.hasInteractiveNavigationHint(it) }
-        val baseStatus = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, blocks)
+        val baseStatus = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, currentScreenBlocks)
         val status = if (activeAsk != null) AgentStateWord.BLOCKED else baseStatus
+        val (turns, liveWorkingActivity) = buildTurnsAndLiveActivity(
+            blocks = finalBlocks,
+            liveStatus = status,
+            rawTail = cleaned.rawTail,
+            summary = summary
+        )
         val actions = buildQuickActionsForStatus(
             status = status,
             dialect = dialect,
@@ -443,13 +526,132 @@ object StructuredTerminalReader {
             activeBtw = activeBtw
         )
         return WorkbenchSnapshot(
-            blocks = blocks,
+            blocks = finalBlocks,
             quickActions = actions,
             liveStatus = status,
             isExpandedMode = cleaned.isExpandedMode,
             dialect = dialect,
-            agyState = cleaned.agyState
+            agyState = cleaned.agyState,
+            turns = turns,
+            liveWorkingActivity = liveWorkingActivity
         )
+    }
+
+    /**
+     * Checks whether the raw terminal screen currently displays an active modal, question card,
+     * permission prompt, or `/btw` overlay so queued prompts wait safely before auto-dispatching.
+     */
+    fun hasInteractiveDialogOnScreen(rawScreen: String?, summary: TerminalSummary? = null): Boolean {
+        val raw = rawScreen.orEmpty()
+        if (raw.isBlank()) return false
+        val agy = AgyInteractiveParser.inspectRaw(raw)
+        if (agy.phase == AgyUiPhase.ASK_QUESTION_MODAL ||
+            agy.phase == AgyUiPhase.PERMISSION_MODAL ||
+            agy.phase == AgyUiPhase.SLASH_MODAL ||
+            agy.activeBtwCard != null
+        ) {
+            return true
+        }
+        val dialect = detectDialect(summary?.agentApp, raw)
+        val cleaned = cleanScreen(raw, dialect)
+        if (cleaned.agyState?.activeSlashModal != null || cleaned.agyState?.activeBtwCard != null) {
+            return true
+        }
+        val cleanTail = cleaned.trimmedLines.asReversed().asSequence().filter { it.isNotEmpty() }.take(16).toList().asReversed()
+        val menuOptions = findMenuOptions(cleanTail)
+        val hasYesNo = cleanTail.any { ('/' in it) && yesNoRegex.containsMatchIn(it) }
+        val hasNavModal = (cleaned.agyState?.phase == AgyUiPhase.SLASH_MODAL) ||
+            cleaned.rawTail.takeLast(8).any { AntigravityTranscriptSpec.hasInteractiveNavigationHint(it) }
+        if (hasNavModal) return true
+        val parsedBlocks = parseBlocksFromCleaned(cleaned, dialect)
+        val resolved = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, parsedBlocks)
+        return resolved == AgentStateWord.BLOCKED || resolved == AgentStateWord.ERROR
+    }
+
+    /**
+     * Splices newly parsed screen-window blocks onto cached earlier blocks, matching the first
+     * visible [TerminalSemanticBlock.UserPromptBlock] back onto its cached anchor so earlier turns
+     * that scrolled above the 260-line window stay intact without duplicating overlapping turns.
+     */
+    internal fun spliceHistory(
+        cached: List<TerminalSemanticBlock>,
+        parsed: List<TerminalSemanticBlock>
+    ): List<TerminalSemanticBlock> {
+        val cleanCached = cached.filterNot { it is TerminalSemanticBlock.SessionHeaderBlock }
+        if (cleanCached.isEmpty()) return parsed
+        if (parsed.isEmpty()) return cleanCached.filterNot { it is TerminalSemanticBlock.AskCardBlock }
+
+        // Fresh session / `/clear` screen with startup header and no prompts resets cached history.
+        if (parsed.any { it is TerminalSemanticBlock.SessionHeaderBlock } &&
+            parsed.none { it is TerminalSemanticBlock.UserPromptBlock }
+        ) {
+            return parsed
+        }
+
+        fun normalizePromptAnchor(raw: String): String =
+            stripHcWrapper(raw).replace(anyWhitespaceRegex, " ").trim()
+
+        fun promptsMatchAnchor(a: String, b: String): Boolean {
+            if (a.isEmpty() || b.isEmpty()) return false
+            if (a == b) return true
+            val prefixLen = minOf(30, a.length, b.length)
+            return prefixLen >= 12 && a.regionMatches(0, b, 0, prefixLen)
+        }
+
+        val firstUserIdx = parsed.indexOfFirst { it is TerminalSemanticBlock.UserPromptBlock }
+        var merged: List<TerminalSemanticBlock> = if (firstUserIdx >= 0) {
+            val firstUserNorm = normalizePromptAnchor(
+                (parsed[firstUserIdx] as TerminalSemanticBlock.UserPromptBlock).text
+            )
+            var matchIdx = -1
+            for (i in cleanCached.lastIndex downTo 0) {
+                val b = cleanCached[i]
+                if (b is TerminalSemanticBlock.UserPromptBlock &&
+                    promptsMatchAnchor(normalizePromptAnchor(b.text), firstUserNorm)
+                ) {
+                    matchIdx = i
+                    break
+                }
+            }
+            when {
+                matchIdx > 0 -> {
+                    val keptPrefix = cleanCached.subList(0, matchIdx)
+                        .filterNot { it is TerminalSemanticBlock.AskCardBlock }
+                    keptPrefix + parsed.subList(firstUserIdx, parsed.size)
+                }
+                matchIdx == 0 -> parsed
+                else -> {
+                    val keptAll = cleanCached.filterNot { it is TerminalSemanticBlock.AskCardBlock }
+                    keptAll + parsed.subList(firstUserIdx, parsed.size)
+                }
+            }
+        } else {
+            val lastCachedUserIdx = cleanCached.indexOfLast { it is TerminalSemanticBlock.UserPromptBlock }
+            if (lastCachedUserIdx >= 0) {
+                val keptThroughPrompt = cleanCached.subList(0, lastCachedUserIdx + 1)
+                    .filterNot { it is TerminalSemanticBlock.AskCardBlock }
+                keptThroughPrompt + parsed
+            } else {
+                parsed
+            }
+        }
+
+        if (merged.size > MAX_CACHED_HISTORY_BLOCKS) {
+            val minKeepStart = merged.size - MAX_CACHED_HISTORY_BLOCKS
+            var cutIdx = -1
+            for (i in minKeepStart until merged.size) {
+                if (merged[i] is TerminalSemanticBlock.UserPromptBlock) {
+                    cutIdx = i
+                    break
+                }
+            }
+            merged = if (cutIdx >= 0) {
+                merged.subList(cutIdx, merged.size)
+            } else {
+                merged.takeLast(MAX_CACHED_HISTORY_BLOCKS)
+            }
+        }
+        return merged
     }
 
     fun parseBlocks(rawScreen: String, agentApp: String? = null): List<TerminalSemanticBlock> {
@@ -2233,17 +2435,20 @@ object StructuredTerminalReader {
             }
             flushParagraph()
             val merged = mergeAdjacentToolGroups(blocks)
-            if (!isExpandedMode || merged.isEmpty()) return merged
+            val enriched = merged.map { blk ->
+                if (blk is TerminalSemanticBlock.ToolGroupBlock) enrichToolGroup(blk) else blk
+            }
+            if (!isExpandedMode || enriched.isEmpty()) return enriched
 
             // When Ctrl+O / Ctrl+T expanded view is active, auto-expand ToolGroupBlocks in the latest turn
             // (or the last ToolGroupBlock if no user prompt is visible) so details are immediately visible.
-            val lastPromptIdx = merged.indexOfLast { it is TerminalSemanticBlock.UserPromptBlock }
-            val lastToolIdx = merged.indexOfLast {
+            val lastPromptIdx = enriched.indexOfLast { it is TerminalSemanticBlock.UserPromptBlock }
+            val lastToolIdx = enriched.indexOfLast {
                 it is TerminalSemanticBlock.ToolGroupBlock && !isDedicatedSummaryGroup(it)
             }
-            if (lastToolIdx < 0) return merged
+            if (lastToolIdx < 0) return enriched
             val autoExpandFrom = if (lastPromptIdx >= 0 && lastToolIdx > lastPromptIdx) lastPromptIdx + 1 else lastToolIdx
-            return merged.mapIndexed { idx, blk ->
+            return enriched.mapIndexed { idx, blk ->
                 if (idx >= autoExpandFrom && blk is TerminalSemanticBlock.ToolGroupBlock && !isDedicatedSummaryGroup(blk)) {
                     blk.copy(defaultExpanded = true)
                 } else {
@@ -3617,9 +3822,6 @@ object StructuredTerminalReader {
             return s.trim()
         }
 
-        private fun zeroFailures(text: String): Boolean =
-            zeroFailPosRegex.containsMatchIn(text) &&
-                !zeroFailNegRegex.containsMatchIn(text)
 
         // ---- alerts ----
 
@@ -4412,6 +4614,528 @@ object StructuredTerminalReader {
             }
         }
         return cleaned
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Semantic Tool Group Enrichment, Turn Grouping & Live Working Activity
+    // ---------------------------------------------------------------------------------------------
+
+    private val thoughtDetailRegex = Regex(
+        "^Thought(?:\\s+for)?\\s+([^(\\n]+?)(?:\\s*\\((.+)\\))?\\s*$",
+        RegexOption.IGNORE_CASE
+    )
+    private val rollupCountPhraseRegex = Regex(
+        "(\\d+)\\s+(reads?|edits?|commands?|writes?|searches?|files?)",
+        RegexOption.IGNORE_CASE
+    )
+    private val fileTokenInTitleRegex = Regex(
+        "([A-Za-z0-9_./\\\\-]+\\.(?:kt|kts|java|rs|ts|tsx|js|jsx|py|go|md|json|xml|ya?ml|toml|gradle|sh|ps1|css|html|txt|c|cc|cpp|h|hpp|sql|proto|pbxproj|plist))"
+    )
+    private val editPrefixVerbRegex = Regex(
+        "^(?:Edit|Edited|Editing|Write|Wrote|Writing|Added|Deleted|Updated|Created|Patched|Applied|MultiEdit|NotebookEdit|replace_file_content|write_to_file|edit_file)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val readPrefixVerbRegex = Regex(
+        "^(?:Read|Reading|Explored|Exploring|Viewed|Viewing|Listed|Listing|Opened|Opening|Inspected|read_file|view_file|list_dir)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val commandPrefixVerbRegex = Regex(
+        "^(?:Ran|Run|Running|Bash|Exec|Shell|Exited|Killed|Scheduled|Checked|You ran|Background output|Interacted with|run_command)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val searchPrefixVerbRegex = Regex(
+        "^(?:Searched|Search|Searching|Grep|Grepped|Glob|Globbed|Find|WebFetch|WebSearch|Fetch|Fetched|Browsed|Browsing|grep_search|find_by_name|search_web)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val subagentPrefixVerbRegex = Regex(
+        "^(?:Spawned|Messaged|Sent input|Invoked|Defined|Waiting for|Finished waiting|Asked|Answered|invoke_subagent|send_message)\\b",
+        RegexOption.IGNORE_CASE
+    )
+    private val runningStepTitleRegex = Regex(
+        "^(?:Running|Thinking|Generating|Loading|Waiting|Working|Searching|Browsing|Calling|Model unavailable)\\b.*|.*…\\s*$",
+        RegexOption.IGNORE_CASE
+    )
+    private val liveStatusTimerParenRegex = Regex("\\(([^)]*?)\\s*[•·]\\s*esc to interrupt[^)]*\\)", RegexOption.IGNORE_CASE)
+
+    private fun zeroFailures(text: String): Boolean =
+        zeroFailPosRegex.containsMatchIn(text) &&
+            !zeroFailNegRegex.containsMatchIn(text)
+
+    internal fun extractLiveThoughtLine(title: String, detailLines: List<String>): String? {
+        val parenPreview = thoughtDetailRegex.matchEntire(title)?.groupValues?.get(2)?.trim()
+        val candidates = buildList {
+            if (!parenPreview.isNullOrBlank()) add(parenPreview)
+            for (d in detailLines) {
+                val t = d.trim()
+                if (t.isNotEmpty() && !t.startsWith("… (")) add(t)
+            }
+            if (title.startsWith("思考：")) {
+                val t = title.removePrefix("思考：").trim()
+                if (t.isNotEmpty()) add(t)
+            }
+        }
+        if (candidates.isEmpty()) return null
+        for (line in candidates) {
+            val m = boldThoughtHeadingRegex.find(line)
+            if (m != null) {
+                val bold = m.groupValues[1].trim()
+                if (bold.isNotEmpty()) return truncateWidth(bold, 76)
+            }
+        }
+        val raw = candidates.first()
+        val cleaned = raw
+            .replace(thoughtLeadMarkdownStripRegex, "")
+            .replace("**", "")
+            .replace("`", "")
+            .trim()
+        if (cleaned.isEmpty()) return null
+        return truncateWidth(firstSentence(cleaned), 76)
+    }
+
+    private fun enrichToolGroup(block: TerminalSemanticBlock.ToolGroupBlock): TerminalSemanticBlock.ToolGroupBlock {
+        if (block.summaryLabel.startsWith("任务清单") ||
+            block.summaryLabel.startsWith("任务计划") ||
+            block.summaryLabel.startsWith("问答确认")
+        ) {
+            return block
+        }
+        val steps = block.steps
+        if (steps.isEmpty()) return block
+
+        val entries = ArrayList<ToolStepEntry>()
+        var curTitle: String? = null
+        var curDetails = ArrayList<String>()
+
+        fun classifyTitle(title: String): ToolActionCategory = when {
+            title.startsWith("Thought", ignoreCase = true) ||
+                title.startsWith("Thinking", ignoreCase = true) ||
+                title.startsWith("思考：") -> ToolActionCategory.THOUGHT
+            editPrefixVerbRegex.containsMatchIn(title) -> ToolActionCategory.EDIT
+            commandPrefixVerbRegex.containsMatchIn(title) -> ToolActionCategory.COMMAND
+            searchPrefixVerbRegex.containsMatchIn(title) -> ToolActionCategory.SEARCH
+            readPrefixVerbRegex.containsMatchIn(title) -> ToolActionCategory.READ
+            subagentPrefixVerbRegex.containsMatchIn(title) -> ToolActionCategory.SUBAGENT
+            else -> ToolActionCategory.OTHER
+        }
+
+        fun extractFilesForEdit(title: String, details: List<String>): List<String> {
+            val out = LinkedHashSet<String>()
+            for (m in fileTokenInTitleRegex.findAll(title)) {
+                val base = m.groupValues[1].substringAfterLast('/').substringAfterLast('\\')
+                if (base.isNotEmpty()) out.add(base)
+            }
+            for (d in details) {
+                for (m in fileTokenInTitleRegex.findAll(d)) {
+                    val base = m.groupValues[1].substringAfterLast('/').substringAfterLast('\\')
+                    if (base.isNotEmpty()) out.add(base)
+                }
+            }
+            return out.toList()
+        }
+
+        fun flushCurrentEntry() {
+            val t = curTitle ?: return
+            val cat = classifyTitle(t)
+            var durationTxt: String? = null
+            if (cat == ToolActionCategory.THOUGHT) {
+                val tm = thoughtDetailRegex.matchEntire(t)
+                if (tm != null) {
+                    durationTxt = tm.groupValues[1].trim().replace(", ", " · ")
+                }
+            }
+            val files = if (cat == ToolActionCategory.EDIT) extractFilesForEdit(t, curDetails) else emptyList()
+            val running = runningStepTitleRegex.matches(t)
+            val err = (AntigravityTranscriptSpec.hasRealStepFailure(t) || stepErrorRegex.containsMatchIn(t)) && !zeroFailures(t)
+            entries.add(
+                ToolStepEntry(
+                    title = t,
+                    category = cat,
+                    detailLines = curDetails.toList(),
+                    durationText = durationTxt,
+                    changedFiles = files,
+                    isRunning = running,
+                    hasError = err
+                )
+            )
+            curTitle = null
+            curDetails = ArrayList()
+        }
+
+        for (line in steps) {
+            if (line.startsWith("  ")) {
+                if (curTitle == null) {
+                    curTitle = "输出"
+                }
+                val cleanDetail = line.trim()
+                if (cleanDetail.isNotEmpty()) {
+                    curDetails.add(cleanDetail)
+                }
+            } else {
+                flushCurrentEntry()
+                curTitle = line.trim()
+            }
+        }
+        flushCurrentEntry()
+
+        if (entries.isEmpty()) return block
+
+        val counts = LinkedHashMap<ToolActionCategory, Int>()
+        val firstSeenOrder = LinkedHashMap<ToolActionCategory, Int>()
+        val editChangedFiles = LinkedHashSet<String>()
+        var editsWithoutFileDetails = 0
+        val allChangedFiles = LinkedHashSet<String>()
+        var thoughtDur: String? = null
+        var thoughtPreview: String? = null
+        var thoughtCount = 0
+
+        fun recordCount(cat: ToolActionCategory, delta: Int) {
+            if (delta <= 0) return
+            firstSeenOrder.putIfAbsent(cat, firstSeenOrder.size)
+            counts[cat] = (counts[cat] ?: 0) + delta
+        }
+
+        for (entry in entries) {
+            if (entry.title.startsWith("折叠的 ") && entry.title.contains("项操作")) {
+                var parsedRollup = false
+                for (m in rollupCountPhraseRegex.findAll(entry.title)) {
+                    val n = m.groupValues[1].toIntOrNull() ?: 0
+                    val kindWord = m.groupValues[2].lowercase()
+                    val cat = when {
+                        kindWord.startsWith("read") -> ToolActionCategory.READ
+                        kindWord.startsWith("edit") || kindWord.startsWith("write") -> ToolActionCategory.EDIT
+                        kindWord.startsWith("command") -> ToolActionCategory.COMMAND
+                        kindWord.startsWith("search") -> ToolActionCategory.SEARCH
+                        else -> ToolActionCategory.OTHER
+                    }
+                    if (n > 0) {
+                        if (cat == ToolActionCategory.EDIT) {
+                            firstSeenOrder.putIfAbsent(ToolActionCategory.EDIT, firstSeenOrder.size)
+                            editsWithoutFileDetails += n
+                        } else {
+                            recordCount(cat, n)
+                        }
+                        parsedRollup = true
+                    }
+                }
+                if (!parsedRollup) {
+                    recordCount(ToolActionCategory.OTHER, 1)
+                }
+                continue
+            }
+
+            if (entry.category == ToolActionCategory.THOUGHT) {
+                thoughtCount++
+                if (entry.durationText != null) thoughtDur = entry.durationText
+                if (thoughtPreview == null) {
+                    thoughtPreview = extractLiveThoughtLine(entry.title, entry.detailLines)
+                }
+            } else if (entry.category == ToolActionCategory.EDIT) {
+                firstSeenOrder.putIfAbsent(ToolActionCategory.EDIT, firstSeenOrder.size)
+                if (entry.changedFiles.isNotEmpty()) {
+                    editChangedFiles.addAll(entry.changedFiles)
+                } else {
+                    val headPart = entry.title.substringBefore('(').trim()
+                    var addedEditClause = false
+                    for (m in rollupCountPhraseRegex.findAll(headPart)) {
+                        val n = m.groupValues[1].toIntOrNull() ?: 0
+                        if (n > 0) {
+                            editsWithoutFileDetails += n
+                            addedEditClause = true
+                        }
+                    }
+                    if (!addedEditClause) {
+                        editsWithoutFileDetails++
+                    }
+                }
+            } else {
+                val headPart = entry.title.substringBefore('(').trim()
+                var addedByClause = false
+                for (m in rollupCountPhraseRegex.findAll(headPart)) {
+                    val n = m.groupValues[1].toIntOrNull() ?: 0
+                    val kw = m.groupValues[2].lowercase()
+                    val clauseCat = when {
+                        kw.startsWith("read") || kw.startsWith("file") -> entry.category
+                        kw.startsWith("edit") || kw.startsWith("write") -> ToolActionCategory.EDIT
+                        kw.startsWith("command") -> ToolActionCategory.COMMAND
+                        kw.startsWith("search") || kw.startsWith("quer") -> ToolActionCategory.SEARCH
+                        else -> entry.category
+                    }
+                    if (n > 0) {
+                        if (clauseCat == ToolActionCategory.EDIT) {
+                            firstSeenOrder.putIfAbsent(ToolActionCategory.EDIT, firstSeenOrder.size)
+                            editsWithoutFileDetails += n
+                        } else {
+                            recordCount(clauseCat, n)
+                        }
+                        addedByClause = true
+                    }
+                }
+                if (!addedByClause) {
+                    recordCount(entry.category, 1)
+                }
+            }
+            allChangedFiles.addAll(entry.changedFiles)
+        }
+
+        val totalEdits = editChangedFiles.size + editsWithoutFileDetails
+        if (totalEdits > 0) {
+            firstSeenOrder.putIfAbsent(ToolActionCategory.EDIT, firstSeenOrder.size)
+            counts[ToolActionCategory.EDIT] = totalEdits
+        }
+
+        val isPureThought = thoughtCount > 0 && counts.isEmpty()
+        val thoughtSummaryLabel = if (thoughtCount > 0) {
+            when {
+                !thoughtDur.isNullOrBlank() -> "思考 $thoughtDur"
+                thoughtCount > 1 -> "思考过程 ($thoughtCount 段)"
+                else -> "思考过程"
+            }
+        } else {
+            null
+        }
+
+        fun summaryPriority(cat: ToolActionCategory): Int = when (cat) {
+            ToolActionCategory.COMMAND, ToolActionCategory.EDIT -> 0
+            ToolActionCategory.READ, ToolActionCategory.SEARCH, ToolActionCategory.SUBAGENT -> 1
+            ToolActionCategory.OTHER, ToolActionCategory.THOUGHT -> 2
+        }
+
+        fun formatCategoryCount(cat: ToolActionCategory, count: Int): String = when (cat) {
+            ToolActionCategory.EDIT -> if (editChangedFiles.isNotEmpty()) "修改 $count 个文件" else "编辑 $count 处"
+            ToolActionCategory.COMMAND -> "运行 $count 条命令"
+            ToolActionCategory.READ -> "读取 $count 个文件"
+            ToolActionCategory.SEARCH -> "检索 $count 次"
+            ToolActionCategory.SUBAGENT -> "调用 $count 个子代理"
+            ToolActionCategory.OTHER -> "执行 $count 项工具"
+            ToolActionCategory.THOUGHT -> "思考 $count"
+        }
+
+        val nonZeroCats = counts.entries
+            .asSequence()
+            .filter { it.value > 0 }
+            .map { it.key }
+            .toList()
+        val prioritized = nonZeroCats.sortedWith(
+            compareBy<ToolActionCategory> { summaryPriority(it) }
+                .thenBy { firstSeenOrder[it] ?: Int.MAX_VALUE }
+        )
+        val topTwo = prioritized.take(2).sortedBy { firstSeenOrder[it] ?: Int.MAX_VALUE }
+        val otherActionsCount = prioritized.drop(2).sumOf { counts[it] ?: 0 }
+        val breakdownParts = topTwo.map { cat -> formatCategoryCount(cat, counts[cat] ?: 0) }
+
+        val groupDur = groupDurExtractRegex.find(block.summaryLabel)?.groupValues?.get(1)?.trim()
+            ?: thoughtDur?.takeIf { isPureThought }
+        val isRunning = block.summaryLabel.contains("· 进行中") || entries.last().isRunning
+        val actionBreakdownLabel = when {
+            isPureThought -> thoughtSummaryLabel
+            breakdownParts.isNotEmpty() -> buildString {
+                append(breakdownParts.joinToString(" · "))
+                if (otherActionsCount > 0) {
+                    append(" · 另执行 $otherActionsCount 项操作")
+                }
+                if (block.hasError) append(" · 含失败")
+                if (isRunning) append(" · 进行中")
+                if (groupDur != null && !isRunning) append(" · $groupDur")
+            }
+            else -> block.summaryLabel
+        }
+
+        val lastEntry = entries.last()
+        return block.copy(
+            entries = entries,
+            isPureThought = isPureThought,
+            thoughtSummaryLabel = thoughtSummaryLabel,
+            thoughtPreview = thoughtPreview,
+            actionBreakdownLabel = actionBreakdownLabel,
+            changedFiles = allChangedFiles.toList(),
+            isRunning = isRunning,
+            activeStepTitle = lastEntry.title,
+            activeStepTailLines = lastEntry.detailLines.takeLast(6),
+            durationLabel = groupDur
+        )
+    }
+
+    private fun buildTurnsAndLiveActivity(
+        blocks: List<TerminalSemanticBlock>,
+        liveStatus: AgentStateWord,
+        rawTail: List<String>,
+        summary: TerminalSummary?
+    ): Pair<List<ConversationTurn>, LiveWorkingActivity?> {
+        val conversationBlocks = blocks.filterNot { it is TerminalSemanticBlock.SessionHeaderBlock }
+        val turns = ArrayList<ConversationTurn>()
+
+        var currentPrompt: TerminalSemanticBlock.UserPromptBlock? = null
+        var currentBody = ArrayList<TerminalSemanticBlock>()
+
+        fun buildTurn(
+            idx: Int,
+            prompt: TerminalSemanticBlock.UserPromptBlock?,
+            body: List<TerminalSemanticBlock>,
+            isLatestTurn: Boolean
+        ): ConversationTurn {
+            var toolOps = 0
+            var thoughtLabel: String? = null
+            var durationLabel: String? = null
+            var breakdownLabel: String? = null
+            val files = LinkedHashSet<String>()
+            var hasErr = false
+            var running = false
+            var hasAsk = false
+            val proseCandidates = ArrayList<String>()
+            var codeOrTableHint: String? = null
+            var alertHint: String? = null
+
+            for (b in body) {
+                when (b) {
+                    is TerminalSemanticBlock.ToolGroupBlock -> {
+                        val cnt = groupCountExtractRegex.find(b.summaryLabel)?.groupValues?.get(1)?.toIntOrNull()
+                            ?: b.entries.size.coerceAtLeast(1)
+                        toolOps += cnt
+                        if (b.thoughtSummaryLabel != null) thoughtLabel = b.thoughtSummaryLabel
+                        if (b.durationLabel != null) durationLabel = b.durationLabel
+                        if (!b.isPureThought && !b.actionBreakdownLabel.isNullOrBlank()) {
+                            breakdownLabel = b.actionBreakdownLabel
+                        }
+                        files.addAll(b.changedFiles)
+                        if (b.hasError) hasErr = true
+                        if (b.isRunning) running = true
+                    }
+                    is TerminalSemanticBlock.AgentProseBlock -> {
+                        if (!b.isHeading && b.text.isNotBlank()) {
+                            proseCandidates.add(b.text)
+                        }
+                    }
+                    is TerminalSemanticBlock.CodeOrTableBlock -> {
+                        if (codeOrTableHint == null) {
+                            codeOrTableHint = "[${b.kindLabel ?: "代码"}] ${b.content.lineSequence().firstOrNull().orEmpty().trim()}"
+                        }
+                    }
+                    is TerminalSemanticBlock.UrgentAlertBlock -> {
+                        if (b.isError) hasErr = true
+                        if (alertHint == null) alertHint = "${b.title}: ${b.detail}"
+                    }
+                    is TerminalSemanticBlock.AskCardBlock -> {
+                        hasAsk = true
+                    }
+                    is TerminalSemanticBlock.UserPromptBlock,
+                    is TerminalSemanticBlock.SessionHeaderBlock -> Unit
+                }
+            }
+            if (isLatestTurn && liveStatus == AgentStateWord.WORKING) {
+                running = true
+            }
+            val rawAnswerPreview = proseCandidates.lastOrNull { it.isNotBlank() }
+                ?: alertHint
+                ?: codeOrTableHint
+                ?: body.filterIsInstance<TerminalSemanticBlock.AgentProseBlock>().lastOrNull()?.text
+                ?: ""
+            return ConversationTurn(
+                turnIndex = idx,
+                userPrompt = prompt,
+                responseBlocks = body,
+                toolOperationCount = toolOps,
+                thoughtSummaryLabel = thoughtLabel,
+                durationLabel = durationLabel,
+                actionBreakdownLabel = breakdownLabel,
+                changedFiles = files.toList(),
+                answerPreview = polishHeadline(rawAnswerPreview),
+                hasError = hasErr,
+                isRunning = running,
+                hasInteractiveCard = hasAsk
+            )
+        }
+
+        val sections = ArrayList<Pair<TerminalSemanticBlock.UserPromptBlock?, List<TerminalSemanticBlock>>>()
+        for (blk in conversationBlocks) {
+            if (blk is TerminalSemanticBlock.UserPromptBlock) {
+                if (currentPrompt != null || currentBody.isNotEmpty()) {
+                    sections.add(currentPrompt to currentBody)
+                    currentBody = ArrayList()
+                }
+                currentPrompt = blk
+            } else {
+                currentBody.add(blk)
+            }
+        }
+        if (currentPrompt != null || currentBody.isNotEmpty()) {
+            sections.add(currentPrompt to currentBody)
+        }
+        sections.forEachIndexed { idx, (prompt, body) ->
+            turns.add(buildTurn(idx + 1, prompt, body, isLatestTurn = idx == sections.lastIndex))
+        }
+
+        var liveActivity: LiveWorkingActivity? = null
+        if (liveStatus == AgentStateWord.WORKING) {
+            val latestTurn = turns.lastOrNull()
+            val lastToolBlock = (latestTurn?.responseBlocks ?: blocks)
+                .lastOrNull { it is TerminalSemanticBlock.ToolGroupBlock } as? TerminalSemanticBlock.ToolGroupBlock
+            val lastRunningEntry = lastToolBlock?.entries?.lastOrNull { it.isRunning }
+                ?: lastToolBlock?.entries?.lastOrNull()
+            val tailSpinner = rawTail.asReversed().firstOrNull { line ->
+                val t = line.trim()
+                t.isNotEmpty() && (spinnerRegex.matches(t) ||
+                    brailleWorkingRegex.containsMatchIn(t) ||
+                    CodexTranscriptSpec.liveStatusIndicatorRegex.matches(t) ||
+                    AntigravityTranscriptSpec.modelRetryStatusRegex.matches(t))
+            }?.trim()
+
+            val elapsedHint = tailSpinner?.let { s ->
+                liveStatusTimerParenRegex.find(s)?.groupValues?.get(1)?.trim()
+            } ?: lastRunningEntry?.durationText
+
+            val cleanSpinnerTitle = tailSpinner?.let { s ->
+                s.replace(cleanHeadBulletRegex, "")
+                    .replace(liveStatusTimerParenRegex, "")
+                    .trim()
+            }
+
+            val thoughtLivePreview = if (lastRunningEntry?.category == ToolActionCategory.THOUGHT) {
+                extractLiveThoughtLine(lastRunningEntry.title, lastRunningEntry.detailLines)
+                    ?: lastToolBlock?.thoughtPreview
+            } else {
+                null
+            }
+
+            val rawTitle = cleanSpinnerTitle?.takeIf { it.isNotBlank() }
+                ?: lastRunningEntry?.title?.takeIf { it.isNotBlank() }
+                ?: lastToolBlock?.activeStepTitle?.takeIf { it.isNotBlank() }
+                ?: summary?.agentMessage?.takeIf { it.isNotBlank() }
+                ?: "Agent 正在思考与执行…"
+
+            val title = if (!thoughtLivePreview.isNullOrBlank() &&
+                (rawTitle.equals("Thinking...", ignoreCase = true) ||
+                    rawTitle.equals("Thinking", ignoreCase = true) ||
+                    rawTitle.startsWith("Thought", ignoreCase = true) ||
+                    rawTitle == "思考过程" ||
+                    rawTitle == "Agent 正在思考与执行…")
+            ) {
+                "思考 · $thoughtLivePreview"
+            } else {
+                rawTitle
+            }
+
+            val tailLines = lastToolBlock?.activeStepTailLines?.takeIf { it.isNotEmpty() }
+                ?: rawTail.asSequence()
+                    .map { it.trim() }
+                    .filter {
+                        it.isNotEmpty() &&
+                            !fullRuleRegex.matches(it) &&
+                            !containsCommonFooterMarker(it) &&
+                            it != tailSpinner
+                    }
+                    .toList()
+                    .takeLast(4)
+
+            liveActivity = LiveWorkingActivity(
+                title = title,
+                category = lastRunningEntry?.category ?: ToolActionCategory.COMMAND,
+                tailLines = tailLines,
+                elapsedHint = elapsedHint,
+                totalStepsInTurn = latestTurn?.toolOperationCount ?: 0
+            )
+        }
+
+        return turns to liveActivity
     }
 
     // ---------------------------------------------------------------------------------------------

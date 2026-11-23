@@ -1223,4 +1223,292 @@ class StructuredTerminalReaderTest {
         assertEquals("Codex 状态", statusCard.kindLabel)
         assertTrue(statusCard.content.contains("5h limit:"))
     }
+
+    @Test
+    fun structuredReRender_separatesPureThoughtsExtractsChangedFilesAndBuildsMultiTurnLiveSnapshot() {
+        val multiTurnScreen = """
+            > 先排查协议层超时
+
+            ○ Thought for 12s (Check timeout handling in HcFramedClient.kt)
+
+            问题定位在 HcFramedClient.kt。
+
+            > 修复并运行测试
+
+            ▸ Thought for 9s, 360 tokens
+            ● Read HcFramedClient.kt
+            ● Edited 2 files
+              └ hc-protocol\src\main\kotlin\dev\herdr\android\protocol\HcFramedClient.kt (+11 -3)
+              └ connection\src\main\kotlin\dev\herdr\android\connection\SshHcConnectionController.kt (+4 -1)
+            ● Running ./gradlew test...
+        """.trimIndent()
+
+        val summary = TerminalSummary(
+            address = "t1q",
+            agentApp = "antigravity",
+            agentStatus = AgentStateWord.WORKING,
+            turn = 2
+        )
+        val snapshot = StructuredTerminalReader.analyzeWorkbench(multiTurnScreen, summary)
+
+        assertEquals(AgentStateWord.WORKING, snapshot.liveStatus)
+        assertEquals(2, snapshot.turns.size)
+
+        val turn1 = snapshot.turns[0]
+        assertEquals(1, turn1.turnIndex)
+        assertEquals("先排查协议层超时", turn1.userPrompt?.text)
+        val turn1Thought = turn1.responseBlocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>().single()
+        assertTrue(turn1Thought.isPureThought)
+        assertTrue(turn1Thought.thoughtSummaryLabel?.contains("12s") == true)
+        assertTrue(turn1Thought.thoughtPreview?.contains("HcFramedClient.kt") == true)
+        assertTrue(turn1.answerPreview.contains("HcFramedClient.kt"))
+
+        val turn2 = snapshot.turns[1]
+        assertEquals(2, turn2.turnIndex)
+        assertEquals("修复并运行测试", turn2.userPrompt?.text)
+        assertTrue(turn2.isRunning)
+        val turn2Group = turn2.responseBlocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>().single()
+        assertFalse(turn2Group.isPureThought)
+        assertTrue(turn2Group.changedFiles.contains("HcFramedClient.kt"))
+        assertTrue(turn2Group.changedFiles.contains("SshHcConnectionController.kt"))
+        assertTrue(turn2Group.entries.any { it.category == ToolActionCategory.READ })
+        assertTrue(turn2Group.entries.any { it.category == ToolActionCategory.EDIT })
+        assertTrue(turn2Group.entries.any { it.category == ToolActionCategory.COMMAND })
+        assertTrue(
+            "Expected actionBreakdownLabel to mention 修改/文件, got: ${turn2Group.actionBreakdownLabel}",
+            turn2Group.actionBreakdownLabel?.contains("修改") == true
+        )
+
+        val live = snapshot.liveWorkingActivity
+        assertTrue(live != null)
+        assertTrue(live!!.title.contains("./gradlew test"))
+        assertTrue(live.totalStepsInTurn >= 3)
+    }
+
+    @Test
+    fun btwRichContentParser_parsesCodexSpacedRuleAndAntigravityPipeTablesViaParseTableOrNull() {
+        val codexTable = """
+               本轮复核项       结果
+              ━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+               1. 取消退出租约  原竞态已修复，新调用正常完成
+              ───────────────  ──────────────────────────────
+               2. 身份隔离      无显式 ID 的不同实例不再同 key
+        """.trimIndent()
+
+        val parsedCodex = BtwRichContentParser.parseTableOrNull(codexTable)
+        assertTrue(parsedCodex != null)
+        assertEquals(listOf("本轮复核项", "结果"), parsedCodex!!.headers)
+        assertEquals(2, parsedCodex.rows.size)
+        assertEquals("1. 取消退出租约", parsedCodex.rows[0][0])
+        assertTrue(parsedCodex.rows[0][1].contains("原竞态已修复"))
+        assertEquals("2. 身份隔离", parsedCodex.rows[1][0])
+
+        val agyTable = """
+             指标   │ 结果
+            ────────┼──────────────
+             零残留 │ 全部通过
+        """.trimIndent()
+        val parsedAgy = BtwRichContentParser.parseTableOrNull(agyTable)
+        assertTrue(parsedAgy != null)
+        assertEquals(listOf("指标", "结果"), parsedAgy!!.headers)
+        assertEquals(1, parsedAgy.rows.size)
+        assertEquals("零残留", parsedAgy.rows[0][0])
+        assertEquals("全部通过", parsedAgy.rows[0][1])
+    }
+
+    @Test
+    fun spliceHistory_retainsScrolledOffEarlierTurnsAndResetsOnFreshSessionHeader() {
+        val summary = TerminalSummary(
+            address = "t1q",
+            agentApp = "antigravity",
+            agentStatus = AgentStateWord.DONE,
+            turn = 3
+        )
+        val window1 = """
+            > 先检查第一个模块
+
+              第一个模块检查完成，无异常。
+
+            > 再查看第二个模块
+
+              正在定位第二个模块的问题。
+        """.trimIndent()
+        val snap1 = StructuredTerminalReader.analyzeWorkbench(window1, summary)
+        assertEquals(2, snap1.turns.size)
+
+        val window2 = """
+            > 再查看第二个模块
+
+              第二个模块已修复。
+
+            > 最后运行单元测试
+
+              ● Ran ./gradlew test
+        """.trimIndent()
+        val snap2 = StructuredTerminalReader.analyzeWorkbench(window2, summary, snap1.blocks)
+        assertEquals(3, snap2.turns.size)
+        assertEquals(
+            listOf("先检查第一个模块", "再查看第二个模块", "最后运行单元测试"),
+            snap2.turns.map { it.userPrompt?.text }
+        )
+        assertEquals("第二个模块已修复。", snap2.turns[1].answerPreview)
+
+        // When Turn 3 grows long and even `> 最后运行单元测试` scrolls above the 260-line window:
+        val window3TailOnly = """
+              ● Ran ./gradlew :app:testDebugUnitTest
+
+              测试已全部通过。
+        """.trimIndent()
+        val snap3 = StructuredTerminalReader.analyzeWorkbench(window3TailOnly, summary, snap2.blocks)
+        assertEquals(3, snap3.turns.size)
+        assertEquals("最后运行单元测试", snap3.turns[2].userPrompt?.text)
+        assertEquals("测试已全部通过。", snap3.turns[2].answerPreview)
+
+        // `/clear` resets cached history cleanly back to the startup session header card
+        val window4Cleared = """
+                  ▄▀▀▄        Antigravity CLI 1.5.14
+                 ▀▀▀▀▀▀       user@example.com (Google AI Ultra)
+                ▀▀▀▀▀▀▀▀      Orchestrator (Carbon)
+               ▄▀▀    ▀▀▄     D:/luoyu/Documents/Code/HerdrAndroid
+              ▄▀▀      ▀▀▄
+
+            ───────────────────────────────────────────────────────────────────────────
+            >
+            ───────────────────────────────────────────────────────────────────────────
+            ? for shortcuts                          auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+        val snap4 = StructuredTerminalReader.analyzeWorkbench(
+            window4Cleared,
+            summary.copy(agentStatus = AgentStateWord.IDLE, turn = 0),
+            snap3.blocks
+        )
+        assertTrue(snap4.turns.isEmpty())
+        assertEquals(1, snap4.blocks.size)
+        assertTrue(snap4.blocks.single() is TerminalSemanticBlock.SessionHeaderBlock)
+    }
+
+    @Test
+    fun toolGroupEnrichment_deduplicatesEditedFilesPrioritizesTopTwoAndExtractsBoldThoughtHeading() {
+        val screen = """
+            > 重构并验证核心模块
+
+              ▾ Thought for 7s (ctrl+o to collapse)
+                **Checking edge cases in parser**
+                Need to verify deduplicated edit counting.
+              ● Read AppConfig.kt
+              ● Searched "analyzeWorkbench"
+              ● Edited Main.kt
+                └ src/Main.kt (+10 -2)
+              ● Edited Main.kt
+                └ src/Main.kt (+3 -1)
+              ● Edited Util.kt
+                └ src/Util.kt (+5 -0)
+              ● Spawned worker-1
+              ● Ran ./gradlew test
+
+              全部修改并验证完成。
+        """.trimIndent()
+
+        val summary = TerminalSummary(
+            address = "t1q",
+            agentApp = "antigravity",
+            agentStatus = AgentStateWord.DONE,
+            turn = 1
+        )
+        val snap = StructuredTerminalReader.analyzeWorkbench(screen, summary)
+        val toolGroup = snap.blocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>().single()
+        assertEquals("Checking edge cases in parser", toolGroup.thoughtPreview)
+        assertEquals(listOf("Main.kt", "Util.kt"), toolGroup.changedFiles)
+        assertTrue(
+            "Expected deduplicated 2 edited files in label, got: ${toolGroup.actionBreakdownLabel}",
+            toolGroup.actionBreakdownLabel?.contains("修改 2 个文件") == true
+        )
+        assertTrue(
+            "Expected command action in label, got: ${toolGroup.actionBreakdownLabel}",
+            toolGroup.actionBreakdownLabel?.contains("运行 1 条命令") == true
+        )
+        assertTrue(
+            "Expected overflow action rollup in label, got: ${toolGroup.actionBreakdownLabel}",
+            toolGroup.actionBreakdownLabel?.contains("另执行 3 项操作") == true
+        )
+
+        val liveThinkingScreen = """
+            > 排查死锁原因
+
+              ▾ Thought for 3s (ctrl+o to collapse)
+                **Analyzing queue race condition**
+                Inspecting dispatcher job cancellation path.
+
+            ───────────────────────────────────────────────────────────────────────────
+            >
+            ───────────────────────────────────────────────────────────────────────────
+              esc to cancel                                        Orchestrator · high
+        """.trimIndent()
+        val liveSnap = StructuredTerminalReader.analyzeWorkbench(
+            liveThinkingScreen,
+            summary.copy(agentStatus = AgentStateWord.WORKING)
+        )
+        assertTrue(
+            "Expected live working title to extract bold thought heading, got: ${liveSnap.liveWorkingActivity?.title}",
+            liveSnap.liveWorkingActivity?.title?.contains("Analyzing queue race condition") == true
+        )
+
+        val compactLiveThinkingScreen = """
+            > 排查死锁原因
+
+              ○ Thought for 4s (**Extracting parenthesized thought stage**)
+
+            ───────────────────────────────────────────────────────────────────────────
+            >
+            ───────────────────────────────────────────────────────────────────────────
+              esc to cancel                                        Orchestrator · high
+        """.trimIndent()
+        val compactLiveSnap = StructuredTerminalReader.analyzeWorkbench(
+            compactLiveThinkingScreen,
+            summary.copy(agentStatus = AgentStateWord.WORKING)
+        )
+        assertTrue(
+            "Expected compact live working title to extract parenthesized bold thought stage, got: ${compactLiveSnap.liveWorkingActivity?.title}",
+            compactLiveSnap.liveWorkingActivity?.title?.contains("Extracting parenthesized thought stage") == true
+        )
+    }
+
+    @Test
+    fun hasInteractiveDialogOnScreen_detectsOpenAgyPermissionAndAskDialogs() {
+        val staleDoneSummary = TerminalSummary(
+            address = "t1q",
+            agentApp = "antigravity",
+            agentStatus = AgentStateWord.DONE,
+            turn = 5
+        )
+        val permissionScreen = """
+            Run this command?
+              ./gradlew :app:assembleRelease
+            1. Yes
+            2. Always allow
+            3. No
+            ↑/↓ Navigate · tab Amend · enter Confirm
+        """.trimIndent()
+        assertTrue(StructuredTerminalReader.hasInteractiveDialogOnScreen(permissionScreen, staleDoneSummary))
+
+        val askScreen = """
+            Choose release mode:  Question 1 of 1
+            › 1. Publish GitHub Release
+              2. Build local APK only
+            ↑/↓ Navigate · enter Confirm · esc Skip
+        """.trimIndent()
+        assertTrue(StructuredTerminalReader.hasInteractiveDialogOnScreen(askScreen, staleDoneSummary))
+
+        val idleScreen = """
+            > 完成了
+
+              已就绪，请继续指示。
+
+            ───────────────────────────────────────────────────────────────────────────
+            >
+            ───────────────────────────────────────────────────────────────────────────
+            ? for shortcuts
+        """.trimIndent()
+        assertFalse(StructuredTerminalReader.hasInteractiveDialogOnScreen(idleScreen, staleDoneSummary))
+    }
 }

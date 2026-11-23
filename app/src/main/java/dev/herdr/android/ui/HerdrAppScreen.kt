@@ -151,6 +151,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val terminalPreviews by viewModel.terminalPreviews.collectAsState()
     val fleetDigests by viewModel.fleetDigests.collectAsState()
     val stagedAttachmentsByAddress by viewModel.stagedAttachmentsByAddress.collectAsState()
+    val queuedPromptsByAddress by viewModel.queuedPromptsByAddress.collectAsState()
     val btwHistoryByAddress by viewModel.btwHistoryByAddress.collectAsState()
     val viewingBtwHistoryAddress by viewModel.viewingBtwHistoryAddress.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
@@ -270,6 +271,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         },
                         dispatchedReceipt = activeSession?.address?.let { dispatchedReceipts[it] },
                         stagedAttachments = activeSession?.address?.let { stagedAttachmentsByAddress[it] }.orEmpty(),
+                        queuedPrompts = activeSession?.address?.let { queuedPromptsByAddress[it] }.orEmpty(),
                         requestInputFocusSignal = requestInputFocusSignal,
                         sequenceStatus = sequenceStatus,
                         appSettings = appSettings,
@@ -285,6 +287,22 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                             activeSession?.address?.let { addr -> viewModel.removeStagedAttachment(addr, attachmentId) }
                         },
                         onSendSubmission = viewModel::sendTerminalSubmission,
+                        onEnqueuePrompt = viewModel::enqueuePromptForActiveTerminal,
+                        onSendQueuedPromptNow = { itemId ->
+                            activeSession?.address?.let { addr -> viewModel.sendQueuedPromptNow(addr, itemId) }
+                        },
+                        onEditQueuedPrompt = { itemId ->
+                            activeSession?.address?.let { addr -> viewModel.editQueuedPrompt(addr, itemId) }
+                        },
+                        onRemoveQueuedPrompt = { itemId ->
+                            activeSession?.address?.let { addr -> viewModel.removeQueuedPrompt(addr, itemId) }
+                        },
+                        onMoveQueuedPromptToTop = { itemId ->
+                            activeSession?.address?.let { addr -> viewModel.moveQueuedPromptToTop(addr, itemId) }
+                        },
+                        onSyncLiveAgentStatus = { status, turn ->
+                            activeSession?.address?.let { addr -> viewModel.syncLiveAgentStatus(addr, status, turn) }
+                        },
                         onTakeoverPtyWidth = viewModel::takeoverPtyWidth,
                         onReleasePtyWidth = viewModel::releasePtyWidth,
                         onSendLine = viewModel::sendTerminalLine,
@@ -310,6 +328,10 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                             activeSession?.address?.let { addr -> viewModel.syncLiveBtwCard(addr, card) }
                         },
                         onOpenBtwHistory = viewModel::openBtwHistoryViewer,
+                        cachedReaderBlocks = activeSession?.address?.let(viewModel::getCachedReaderBlocks).orEmpty(),
+                        onUpdateCachedReaderBlocks = { blocks ->
+                            activeSession?.address?.let { addr -> viewModel.updateCachedReaderBlocks(addr, blocks) }
+                        },
                         onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                     )
 
