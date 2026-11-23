@@ -103,12 +103,23 @@ sealed interface SequenceOperation {
     data object CloseSlashModal : SequenceOperation {
         override val description: String = "退出当前面板"
     }
+
+    /** Dismisses or cancels the active `/btw` side-question card (`Esc`). */
+    data object DismissBtwCard : SequenceOperation {
+        override val description: String = "关闭旁路快问"
+    }
+
+    /** Sends `/btw <question>` cleanly into an Antigravity session. */
+    data class SendBtwQuestion(val question: String) : SequenceOperation {
+        override val description: String = "发起旁路快问"
+    }
 }
 
 internal enum class SequenceStepVerdict {
     ALREADY_DONE,
     EXECUTE_KEY,
     EXECUTE_TEXT,
+    WAIT_MORE,
     ABORT_DIVERGED
 }
 
@@ -158,6 +169,8 @@ internal object AgySequencePlanner {
                 SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
             }
         }
+        is SequenceOperation.DismissBtwCard -> planDismissBtwCard(state)
+        is SequenceOperation.SendBtwQuestion -> planSendBtwQuestion(op, state, sentCommandThisOp)
     }
 
     /**
@@ -209,6 +222,8 @@ internal object AgySequencePlanner {
             !sentCommandBeforeDrop && freshState.activeSlashModal?.kind == op.expectedKind
         }
         is SequenceOperation.CloseSlashModal -> true
+        is SequenceOperation.DismissBtwCard -> true
+        is SequenceOperation.SendBtwQuestion -> !sentCommandBeforeDrop || freshState.activeBtwCard != null
     }
 
     private fun planEnsureComposerReady(state: AgyTerminalState): SequenceStepInstruction = when (state.phase) {
@@ -240,22 +255,33 @@ internal object AgySequencePlanner {
         state: AgyTerminalState,
         sentAlready: Boolean
     ): SequenceStepInstruction {
-        if (op.expectModal != null && state.phase == AgyUiPhase.SLASH_MODAL) {
-            val curKind = state.activeSlashModal?.kind
-            if (curKind == op.expectModal || curKind == AgySlashModalKind.GENERIC) {
+        if (op.expectModal != null && state.phase == AgyUiPhase.SLASH_MODAL && state.activeSlashModal != null) {
+            val curKind = state.activeSlashModal.kind
+            if (sentAlready || curKind == op.expectModal || curKind == AgySlashModalKind.GENERIC) {
                 return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
             }
         }
         if (sentAlready) {
-            // Command already sent and no modal expected -> done
-            return if (op.expectModal == null) {
-                SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
-            } else {
-                SequenceStepInstruction(
-                    verdict = SequenceStepVerdict.ABORT_DIVERGED,
-                    reason = "命令 ${op.command} 已发出，但未检测到目标面板打开"
+            if (op.expectModal == AgySlashModalKind.BTW && state.activeBtwCard != null) {
+                return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
+            }
+            if (state.phase == AgyUiPhase.COMPOSER_HAS_DRAFT) {
+                val cmdHead = op.command.trim().substringBefore(' ')
+                if (state.composerDraft.trimStart().startsWith(cmdHead, ignoreCase = true)) {
+                    return SequenceStepInstruction(
+                        verdict = SequenceStepVerdict.EXECUTE_KEY,
+                        command = SequenceAtomicCommand.SpecialKey("enter"),
+                        settleWaitMs = 600L
+                    )
+                }
+            }
+            if (op.expectModal != null && (state.hasWorkingHint || state.activeSlashModal?.isLoading == true)) {
+                return SequenceStepInstruction(
+                    verdict = SequenceStepVerdict.WAIT_MORE,
+                    settleWaitMs = 350L
                 )
             }
+            return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
         }
         if (state.phase == AgyUiPhase.ASK_QUESTION_MODAL || state.phase == AgyUiPhase.PERMISSION_MODAL) {
             return SequenceStepInstruction(
@@ -267,6 +293,82 @@ internal object AgySequencePlanner {
             verdict = SequenceStepVerdict.EXECUTE_TEXT,
             command = SequenceAtomicCommand.RawText(op.command, pressEnterAfter = true),
             settleWaitMs = 650L,
+            postPauseMs = 55L
+        )
+    }
+
+    private fun planDismissBtwCard(state: AgyTerminalState): SequenceStepInstruction {
+        if (state.activeBtwCard == null) {
+            return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
+        }
+        if (state.phase == AgyUiPhase.ASK_QUESTION_MODAL || state.phase == AgyUiPhase.PERMISSION_MODAL) {
+            return SequenceStepInstruction(
+                verdict = SequenceStepVerdict.ABORT_DIVERGED,
+                reason = "当前处于阻塞确认弹窗，无法关闭 /btw 卡片"
+            )
+        }
+        return SequenceStepInstruction(
+            verdict = SequenceStepVerdict.EXECUTE_KEY,
+            command = SequenceAtomicCommand.SpecialKey("esc"),
+            settleWaitMs = 450L
+        )
+    }
+
+    private fun planSendBtwQuestion(
+        op: SequenceOperation.SendBtwQuestion,
+        state: AgyTerminalState,
+        sentAlready: Boolean
+    ): SequenceStepInstruction {
+        val cleanQuestion = op.question.trim()
+        if (cleanQuestion.isEmpty()) {
+            return SequenceStepInstruction(
+                verdict = SequenceStepVerdict.ABORT_DIVERGED,
+                reason = "请输入 /btw 问题内容"
+            )
+        }
+        if (sentAlready) {
+            if (state.activeBtwCard != null) {
+                return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
+            }
+            if (state.phase == AgyUiPhase.COMPOSER_HAS_DRAFT &&
+                state.composerDraft.trimStart().startsWith("/btw", ignoreCase = true)
+            ) {
+                return SequenceStepInstruction(
+                    verdict = SequenceStepVerdict.EXECUTE_KEY,
+                    command = SequenceAtomicCommand.SpecialKey("enter"),
+                    settleWaitMs = 550L
+                )
+            }
+            if (state.hasWorkingHint) {
+                return SequenceStepInstruction(
+                    verdict = SequenceStepVerdict.WAIT_MORE,
+                    settleWaitMs = 350L
+                )
+            }
+            return SequenceStepInstruction(SequenceStepVerdict.ALREADY_DONE)
+        }
+        if (state.activeBtwCard?.isRunning == true) {
+            return SequenceStepInstruction(
+                verdict = SequenceStepVerdict.ABORT_DIVERGED,
+                reason = "当前仍有 /btw 正在执行，请先等待完成或点击取消"
+            )
+        }
+        if (state.phase == AgyUiPhase.ASK_QUESTION_MODAL || state.phase == AgyUiPhase.PERMISSION_MODAL) {
+            return SequenceStepInstruction(
+                verdict = SequenceStepVerdict.ABORT_DIVERGED,
+                reason = "当前处于阻塞确认弹窗，无法发起 /btw"
+            )
+        }
+        if (state.phase == AgyUiPhase.SLASH_MODAL) {
+            return SequenceStepInstruction(
+                verdict = SequenceStepVerdict.ABORT_DIVERGED,
+                reason = "当前面板尚未关闭，请先关闭后再发起 /btw"
+            )
+        }
+        return SequenceStepInstruction(
+            verdict = SequenceStepVerdict.EXECUTE_TEXT,
+            command = SequenceAtomicCommand.RawText("/btw $cleanQuestion", pressEnterAfter = true),
+            settleWaitMs = 600L,
             postPauseMs = 55L
         )
     }

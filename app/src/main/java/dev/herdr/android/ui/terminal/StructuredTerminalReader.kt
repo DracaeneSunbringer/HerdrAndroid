@@ -399,6 +399,8 @@ object StructuredTerminalReader {
         val cleaned = cleanScreen(raw, dialect)
         val parsedBlocks = parseBlocksFromCleaned(cleaned, dialect)
         val activeAsk = cleaned.agyState?.activeAskCard
+        val activeModal = cleaned.agyState?.activeSlashModal
+        val activeBtw = cleaned.agyState?.activeBtwCard
         val blocks = if (activeAsk != null) {
             parsedBlocks + TerminalSemanticBlock.AskCardBlock(activeAsk)
         } else {
@@ -411,7 +413,17 @@ object StructuredTerminalReader {
             cleaned.rawTail.takeLast(8).any { AntigravityTranscriptSpec.hasInteractiveNavigationHint(it) }
         val baseStatus = resolveStatusInternal(cleaned.rawTail, cleanTail, menuOptions, hasYesNo, summary, blocks)
         val status = if (activeAsk != null) AgentStateWord.BLOCKED else baseStatus
-        val actions = buildQuickActionsForStatus(status, dialect, cleaned.isExpandedMode, menuOptions, hasYesNo, hasNavModal, activeAsk)
+        val actions = buildQuickActionsForStatus(
+            status = status,
+            dialect = dialect,
+            isExpanded = cleaned.isExpandedMode,
+            menuOptions = menuOptions,
+            hasYesNo = hasYesNo,
+            hasNavModal = hasNavModal,
+            activeAsk = activeAsk,
+            activeModal = activeModal,
+            activeBtw = activeBtw
+        )
         return WorkbenchSnapshot(
             blocks = blocks,
             quickActions = actions,
@@ -496,7 +508,9 @@ object StructuredTerminalReader {
         menuOptions: List<Pair<String, String>>,
         hasYesNo: Boolean,
         hasNavModal: Boolean = false,
-        activeAsk: AgyAskCardState? = null
+        activeAsk: AgyAskCardState? = null,
+        activeModal: AgySlashModalState? = null,
+        activeBtw: AgyBtwCardState? = null
     ): List<QuickReplyAction> {
         if (activeAsk != null) {
             return buildList {
@@ -507,6 +521,27 @@ object StructuredTerminalReader {
                     add(QuickReplyAction("→ 下一题", "right", isSpecialKey = true))
                 }
                 add(QuickReplyAction("✕ 取消问答", "esc", isSpecialKey = true))
+            }
+        }
+        if (activeModal != null) {
+            return listOf(
+                QuickReplyAction("←", "left", isSpecialKey = true),
+                QuickReplyAction("↑", "up", isSpecialKey = true),
+                QuickReplyAction("↓", "down", isSpecialKey = true),
+                QuickReplyAction("→", "right", isSpecialKey = true),
+                QuickReplyAction("⏎ 确认", "enter", isSpecialKey = true, isPrimary = true),
+                QuickReplyAction("Tab", "tab", isSpecialKey = true),
+                QuickReplyAction("✕ 退出", "esc", isSpecialKey = true)
+            )
+        }
+        if (activeBtw != null) {
+            return if (activeBtw.isRunning) {
+                listOf(QuickReplyAction("✕ 取消快问 Esc", "esc", isSpecialKey = true, isDanger = true))
+            } else {
+                listOf(
+                    QuickReplyAction("⇄ 展开/收起 Tab", "tab", isSpecialKey = true),
+                    QuickReplyAction("✕ 关闭快问 Esc", "esc", isSpecialKey = true, isPrimary = true)
+                )
             }
         }
         val expandKey = if (dialect == TerminalDialect.CODEX) "ctrl+t" else "ctrl+o"
@@ -1051,9 +1086,26 @@ object StructuredTerminalReader {
             null
         }
 
-        val activeAskStart = agyState?.activeAskCard?.startRawLineIndex ?: -1
-        if (activeAskStart in rawLines.indices) {
-            rawLines.subList(activeAskStart, rawLines.size).clear()
+        // Trim bottom-up so higher indices stay valid when removing multiple active overlays
+        // (Ask card at bottom, Slash modal below/over composer, /btw card above composer).
+        val trimSpans = buildList {
+            val askStart = agyState?.activeAskCard?.startRawLineIndex ?: -1
+            if (askStart in rawLines.indices) add(askStart to rawLines.size)
+            val modal = agyState?.activeSlashModal
+            if (modal != null && modal.startRawLineIndex in rawLines.indices && modal.endRawLineIndex >= modal.startRawLineIndex) {
+                add(modal.startRawLineIndex to (modal.endRawLineIndex + 1).coerceAtMost(rawLines.size))
+            }
+            val btw = agyState?.activeBtwCard
+            if (btw != null && btw.startRawLineIndex in rawLines.indices && btw.endRawLineIndex >= btw.startRawLineIndex) {
+                add(btw.startRawLineIndex to (btw.endRawLineIndex + 1).coerceAtMost(rawLines.size))
+            }
+        }.sortedByDescending { it.first }
+        for ((spanStart, spanEnd) in trimSpans) {
+            val s = spanStart.coerceIn(0, rawLines.size)
+            val e = spanEnd.coerceIn(s, rawLines.size)
+            if (s < e) {
+                rawLines.subList(s, e).clear()
+            }
         }
 
         stripBottomDock(rawLines, dialect)

@@ -81,6 +81,7 @@ class TerminalSequenceCoordinator(
 
                 var sentTerminalMutation = false
                 var atomicAttempts = 0
+                var waitMoreCount = 0
                 val maxAtomicSteps = 18
 
                 while (atomicAttempts < maxAtomicSteps) {
@@ -132,6 +133,12 @@ class TerminalSequenceCoordinator(
                             onToast(instruction.reason.ifBlank { "界面状态已变化，无法继续当前操作" })
                             return Result.failure(IllegalStateException(instruction.reason))
                         }
+                        SequenceStepVerdict.WAIT_MORE -> {
+                            if (waitMoreCount >= 8) break
+                            waitMoreCount++
+                            delay(instruction.settleWaitMs)
+                            atomicAttempts++
+                        }
                         SequenceStepVerdict.EXECUTE_KEY, SequenceStepVerdict.EXECUTE_TEXT -> {
                             val prevEpoch = session.outputEpochCount
                             val cmd = instruction.command ?: break
@@ -156,11 +163,14 @@ class TerminalSequenceCoordinator(
                 }
             }
 
-            // Refresh full stitched view when closing a modal or finishing non-modal command
+            // Refresh full stitched view when closing a modal/card or finishing non-modal/inline command
             val finalOp = operations.lastOrNull()
+            val lastState = lastSession?.screenSnapshot?.value?.let { AgyInteractiveParser.inspectRaw(it) }
             if (finalOp is SequenceOperation.CloseSlashModal ||
+                finalOp is SequenceOperation.DismissBtwCard ||
+                finalOp is SequenceOperation.SendBtwQuestion ||
                 finalOp is SequenceOperation.SubmitAskAnswer ||
-                (finalOp is SequenceOperation.SendSlashCommand && finalOp.expectModal == null)
+                (finalOp is SequenceOperation.SendSlashCommand && lastState?.activeSlashModal == null)
             ) {
                 runCatching { lastSession?.refreshScreenNow(screenOnly = false) }
             }
@@ -194,6 +204,7 @@ class TerminalSequenceCoordinator(
 
     private fun isTerminalMutationForOp(op: SequenceOperation, cmd: SequenceAtomicCommand): Boolean = when (op) {
         is SequenceOperation.SendSlashCommand -> cmd is SequenceAtomicCommand.RawText
+        is SequenceOperation.SendBtwQuestion -> cmd is SequenceAtomicCommand.RawText
         is SequenceOperation.ModalSelectItem -> cmd is SequenceAtomicCommand.SpecialKey && cmd.wireKey == "enter"
         is SequenceOperation.ModalStepItemValue ->
             cmd is SequenceAtomicCommand.SpecialKey && (cmd.wireKey == "left" || cmd.wireKey == "right")

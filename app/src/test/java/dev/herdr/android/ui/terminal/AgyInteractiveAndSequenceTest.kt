@@ -584,6 +584,447 @@ class AgyInteractiveAndSequenceTest {
         }
     }
 
+    @Test(timeout = 15_000)
+    fun btwNuxPromoIsIgnoredWhileRunningAndCompletedBtwCardsParseAndDismissCleanly() {
+        val rule = "─".repeat(120)
+        val nuxPromoScreen = """
+            > /btw
+              ⎿  Usage: /btw <question>
+
+
+             ┃ Introducing Gemini 4 Neon
+             ┃ Our best balance of intelligence, cost, and latency. Get building today with Neon.
+             ┃ esc to dismiss
+            $rule
+            >
+            $rule
+            ? for shortcuts                                                    auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+
+        val nuxState = AgyInteractiveParser.inspectRaw(nuxPromoScreen)
+        assertNull("Promo NUX banner must NOT be treated as activeBtwCard", nuxState.activeBtwCard)
+        val summary = TerminalSummary(address = "t1q", agentApp = "antigravity", agentStatus = AgentStateWord.IDLE, state = "live")
+        val nuxSnapshot = StructuredTerminalReader.analyzeWorkbench(nuxPromoScreen, summary)
+        assertFalse(
+            "Promo NUX text must be stripped from transcript blocks",
+            nuxSnapshot.blocks.any { it is TerminalSemanticBlock.AgentProseBlock && "Introducing Gemini" in it.text }
+        )
+
+        val runningBtwScreen = """
+            > /btw
+              ⎿  Usage: /btw <question>
+
+
+             ┃ /btw 请先读取 app/build.gradle.kts 的 versionName 再用一句话回答
+             ┃
+             ┃   ✓ read_file
+             ┃
+             ┃ ⣯  Reading file... (Enter/Esc to cancel)
+            $rule
+            >
+            $rule
+            ? for shortcuts                                                    auto · Orchestrator · Gemini 4 Carbon · high
+            [hc] incomplete: older output may be missing
+        """.trimIndent()
+
+        val runningState = AgyInteractiveParser.inspectRaw(runningBtwScreen)
+        val runningCard = runningState.activeBtwCard
+        assertNotNull("Running /btw card must be detected", runningCard)
+        requireNotNull(runningCard)
+        assertTrue(runningCard.isRunning)
+        assertTrue(runningCard.question.contains("versionName"))
+        assertTrue(runningCard.toolSteps.any { "✓ read_file" in it })
+        assertTrue(runningCard.statusSummary.contains("Reading file..."))
+
+        val runningSnapshot = StructuredTerminalReader.analyzeWorkbench(runningBtwScreen, summary)
+        assertFalse(
+            "┃ /btw rows must be trimmed out of workbench blocks",
+            runningSnapshot.blocks.any { it is TerminalSemanticBlock.AgentProseBlock && "Reading file" in it.text }
+        )
+        assertTrue(runningSnapshot.quickActions.any { it.label == "✕ 取消快问 Esc" && it.payload == "esc" })
+
+        val completedBtwScreen = """
+             ┃ /btw 请先读取 app/build.gradle.kts 的 versionName 再用一句话回答
+             ┃
+             ┃   Called 1 tool (1 read_file)
+             ┃
+             ┃   app/build.gradle.kts 中的 versionName 当前配置为 "0.4.0"（对应 versionCode = 15）。
+             ┃ Tab to expand · Enter/Esc to dismiss
+            $rule
+            >
+            $rule
+            ? for shortcuts                                                    auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+
+        val completedState = AgyInteractiveParser.inspectRaw(completedBtwScreen)
+        val completedCard = completedState.activeBtwCard
+        assertNotNull("Completed /btw card must be detected", completedCard)
+        requireNotNull(completedCard)
+        assertFalse(completedCard.isRunning)
+        assertEquals("Called 1 tool (1 read_file)", completedCard.statusSummary)
+        assertTrue(completedCard.answerText.contains("0.4.0"))
+
+        val completedSnapshot = StructuredTerminalReader.analyzeWorkbench(completedBtwScreen, summary)
+        assertTrue(completedSnapshot.quickActions.any { it.label == "✕ 关闭快问 Esc" })
+        assertTrue(completedSnapshot.quickActions.any { it.label == "⇄ 展开/收起 Tab" })
+
+        val dismissStep = AgySequencePlanner.nextAction(SequenceOperation.DismissBtwCard, completedState)
+        assertEquals(SequenceStepVerdict.EXECUTE_KEY, dismissStep.verdict)
+        assertEquals("esc", (dismissStep.command as SequenceAtomicCommand.SpecialKey).wireKey)
+
+        val idleScreenAfterEsc = """
+            $rule
+            >
+            $rule
+            ? for shortcuts                                                    auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+        val afterEscState = AgyInteractiveParser.inspectRaw(idleScreenAfterEsc)
+        assertNull(afterEscState.activeBtwCard)
+        assertEquals(
+            SequenceStepVerdict.ALREADY_DONE,
+            AgySequencePlanner.nextAction(SequenceOperation.DismissBtwCard, afterEscState).verdict
+        )
+    }
+
+    @Test(timeout = 15_000)
+    fun sendBtwQuestionValidatesEmptyAndBusyStatesAndDispatchesCleanly() {
+        val idleState = AgyInteractiveParser.inspectRaw(composerScreen(mode = "auto", draft = ""))
+        val emptyVerdict = AgySequencePlanner.nextAction(SequenceOperation.SendBtwQuestion("   "), idleState)
+        assertEquals(SequenceStepVerdict.ABORT_DIVERGED, emptyVerdict.verdict)
+
+        val validStep = AgySequencePlanner.nextAction(
+            SequenceOperation.SendBtwQuestion("目前版本是多少"),
+            idleState
+        )
+        assertEquals(SequenceStepVerdict.EXECUTE_TEXT, validStep.verdict)
+        val rawCmd = validStep.command as SequenceAtomicCommand.RawText
+        assertEquals("/btw 目前版本是多少", rawCmd.text)
+        assertTrue(rawCmd.pressEnterAfter)
+
+        val busyBtwState = idleState.copy(
+            activeBtwCard = AgyBtwCardState(
+                question = "in flight",
+                isRunning = true
+            )
+        )
+        val busyVerdict = AgySequencePlanner.nextAction(SequenceOperation.SendBtwQuestion("next"), busyBtwState)
+        assertEquals(SequenceStepVerdict.ABORT_DIVERGED, busyVerdict.verdict)
+    }
+
+    @Test(timeout = 15_000)
+    fun dockedAndFullscreenAgy1514NoArgSlashModalsParseAccurately() {
+        val rule = "─".repeat(120)
+        val footer = "auto · Orchestrator · Gemini 4 Carbon · high\n[hc] incomplete: older output may be missing"
+
+        // 1. Docked /model
+        val modelScreen = """
+            $rule
+            >
+            $rule
+            Switch Model
+
+              Search:
+                      ────────────────────
+
+              Gemini 4 Neon
+              Gemini 4 Carbon
+            > Orchestrator          (current)
+              Claude Opus 5.5
+
+            ▸ Planner   ◂ [Gemini 4 Carbon] ▸    2 of 4    Effort    ●━━━━━━━━━━━●━━━━━━━━━━━◉    high
+              Executor     Gemini 4 Hydrogen     1 of 2    Effort    ●━━━━━━━●━━━━━━━●━━━━━━━◉    xhigh
+
+            Keyboard: ↑/↓ Navigate  ←/→ Planner  tab Effort  enter Select  esc Go Back
+
+            $footer
+        """.trimIndent()
+        val modelState = AgyInteractiveParser.inspectRaw(modelScreen)
+        assertEquals(AgyUiPhase.SLASH_MODAL, modelState.phase)
+        assertEquals(AgySlashModalKind.MODEL, modelState.activeSlashModal?.kind)
+        assertEquals("high", modelState.activeSlashModal?.effortHint)
+        assertEquals(2, modelState.activeSlashModal?.selectedIndex)
+        assertEquals("Orchestrator", modelState.activeSlashModal?.items?.get(2)?.title)
+
+        // 2. Docked /context (info bodyLines)
+        val contextScreen = """
+            $rule
+            >
+            $rule
+            └ Context Usage
+            □ □ □ □     Orchestrator (Carbon) · 0/1.0M tokens
+            □ □ □ □      (0.0%)
+            □ □ □ □     ◉ User messages: 0 tokens (0.0%)
+
+            System files · auto-loaded
+             └ ~/.gemini/GEMINI.md
+
+            Related: /artifact · /skill · /rewind
+              ↑/↓ Scroll · pgup/pgdown Page · ctrl+end Bottom · ctrl+home Top · esc Close
+            $footer
+        """.trimIndent()
+        val contextModal = AgyInteractiveParser.inspectRaw(contextScreen).activeSlashModal
+        assertNotNull(contextModal)
+        assertEquals(AgySlashModalKind.CONTEXT, contextModal!!.kind)
+        assertTrue(contextModal.bodyLines.any { "Orchestrator (Carbon)" in it })
+        assertTrue(contextModal.bodyLines.any { "GEMINI.md" in it })
+
+        // 3. Docked /usage
+        val usageScreen = """
+            $rule
+            >
+            $rule
+            └ Models & Quota
+
+              Account: user@example.com
+
+            GEMINI MODELS
+              Weekly Limit Remaining
+                [██████████████████░░] 78.79%
+                Refreshes in 125h 57m
+
+              ↑/↓ Scroll · pgup/pgdown Page · ctrl+end Bottom · ctrl+home Top · esc Close
+            $footer
+        """.trimIndent()
+        val usageModal = AgyInteractiveParser.inspectRaw(usageScreen).activeSlashModal
+        assertNotNull(usageModal)
+        assertEquals(AgySlashModalKind.USAGE, usageModal!!.kind)
+        assertTrue(usageModal.bodyLines.any { "78.79%" in it })
+
+        // 4. Docked /credits
+        val creditsScreen = """
+            $rule
+            >
+            $rule
+            Antigravity CLI  credits
+            Model AI Credits
+
+            Remaining AI Credits: AI Credits not enabled (enable in /settings)
+
+            Actions
+
+            > Get More AI Credits
+              See Activity
+
+            Keyboard: ↑/↓ Navigate  enter Select / Toggle  esc Close
+
+            $footer
+        """.trimIndent()
+        val creditsModal = AgyInteractiveParser.inspectRaw(creditsScreen).activeSlashModal
+        assertNotNull(creditsModal)
+        assertEquals(AgySlashModalKind.CREDITS, creditsModal!!.kind)
+        assertTrue(creditsModal.bodyLines.any { "Remaining AI Credits" in it })
+        assertEquals(listOf("Get More AI Credits", "See Activity"), creditsModal.items.map { it.title })
+
+        // 5. Docked /help
+        val helpScreen = """
+            $rule
+            >
+            $rule
+            Antigravity CLI   general    commands    shortcuts   (←/→ or tab to cycle)
+            Antigravity CLI understands your codebase, makes edits with your permission,
+            and executes commands — right from your terminal.
+
+            Version 1.5.14
+            Quick Reference
+              /  Type / to see available commands
+
+            Keyboard: ↑/↓ Navigate  ←/→ Switch View  esc Close
+
+            $footer
+        """.trimIndent()
+        val helpModal = AgyInteractiveParser.inspectRaw(helpScreen).activeSlashModal
+        assertNotNull(helpModal)
+        assertEquals(AgySlashModalKind.HELP, helpModal!!.kind)
+        assertEquals(listOf("general", "commands", "shortcuts"), helpModal.tabs)
+        assertTrue(helpModal.bodyLines.any { "Version 1.5.14" in it })
+        assertTrue(helpModal.bodyLines.any { "Type / to see available commands" in it })
+
+        // 6. Docked /tasks & /artifact empty states & /hooks
+        val tasksScreen = """
+            $rule
+            >
+            $rule
+            Tasks
+              No background tasks.
+
+            Keyboard: ↑/↓ Navigate  ←/→ Page  enter View output  k Kill Task  x Remove Task From List
+
+            $footer
+        """.trimIndent()
+        val tasksModal = AgyInteractiveParser.inspectRaw(tasksScreen).activeSlashModal
+        assertEquals(AgySlashModalKind.TASKS, tasksModal?.kind)
+        assertTrue(tasksModal!!.bodyLines.any { "No background tasks." in it })
+
+        val artifactScreen = """
+            $rule
+            >
+            $rule
+            Artifacts
+              No artifacts
+
+            Keyboard: ↑/↓ Navigate  p preview  enter open  ctrl+g open in editor  esc Dismiss
+
+            $footer
+        """.trimIndent()
+        val artifactModal = AgyInteractiveParser.inspectRaw(artifactScreen).activeSlashModal
+        assertEquals(AgySlashModalKind.ARTIFACT, artifactModal?.kind)
+        assertTrue(artifactModal!!.bodyLines.any { "No artifacts" in it })
+
+        val hooksScreen = """
+            $rule
+            >
+            $rule
+             Hooks
+               5 hook types
+
+             > PreToolUse      Before tool execution
+               PostToolUse     After tool execution
+               Stop            When agent tries to exit
+
+               ↑/↓ Navigate · enter Select
+            $footer
+        """.trimIndent()
+        val hooksModal = AgyInteractiveParser.inspectRaw(hooksScreen).activeSlashModal
+        assertEquals(AgySlashModalKind.HOOKS, hooksModal?.kind)
+        assertEquals(3, hooksModal!!.items.size)
+
+        // 7. Fullscreen /diff & ~120-line /changelog
+        val diffScreen = """
+             Diff (git)  All Changes  Per Turn  Commit Tree
+               4 file(s) changed
+
+             > ? [Untracked] dist/HerdrAndroid-v0.2.0.apk.idsig  binary file
+               ? [Untracked] dist/HerdrAndroid-v0.3.0.apk.idsig  binary file
+
+               ←/→ switch view · ↑/↓/j/k navigate · enter view diff · / search · esc dismiss
+            $footer
+        """.trimIndent()
+        val diffModal = AgyInteractiveParser.inspectRaw(diffScreen).activeSlashModal
+        assertEquals(AgySlashModalKind.DIFF, diffModal?.kind)
+
+        val changelogBody = (1..115).joinToString("\n") { i ->
+            when (i) {
+                2 -> "  • Mentioned /config and Artifacts and MCP Servers inside notes."
+                else -> "  • Changelog bullet entry #$i for Antigravity CLI."
+            }
+        }
+        val changelogScreen = """
+               Antigravity CLI Changelog
+
+              1.5.3
+
+            $changelogBody
+
+              ↑/↓ Navigate · esc Cancel
+                                                                    auto · Orchestrator · Gemini 4 Carbon · high
+        """.trimIndent()
+        val changelogState = AgyInteractiveParser.inspectRaw(changelogScreen)
+        assertEquals(AgySlashModalKind.CHANGELOG, changelogState.activeSlashModal?.kind)
+        val summary = TerminalSummary(address = "t1q", agentApp = "antigravity", agentStatus = AgentStateWord.IDLE, state = "live")
+        val changelogSnap = StructuredTerminalReader.analyzeWorkbench(changelogScreen, summary)
+        assertFalse(
+            "Fullscreen /changelog must not leak raw bullet prose into blocks",
+            changelogSnap.blocks.any { it is TerminalSemanticBlock.AgentProseBlock && "Changelog bullet" in it.text }
+        )
+    }
+
+    @Test(timeout = 15_000)
+    fun coordinatorWaitsThroughLoadingSpinnerForModalAndFinishesCleanlyOnInlineOutcome() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val connState = MutableStateFlow<ConnectionState>(fakeConnectedState())
+            val rule = "─".repeat(80)
+            val loadingScreen = """
+                $rule
+                >
+                $rule
+                ⣽  Loading...
+                esc to cancel   auto · Orchestrator · Gemini 4 Carbon · high
+            """.trimIndent()
+            val usageScreen = """
+                $rule
+                >
+                $rule
+                └ Models & Quota
+
+                  Weekly Limit Remaining
+                    [████████████████████] 78.79%
+
+                  ↑/↓ Scroll · esc Close
+                auto · Orchestrator · Gemini 4 Carbon · high
+            """.trimIndent()
+            val inlineEffortScreen = """
+                > /effort
+                  ⎿  Effort isn't adjustable for Orchestrator (Carbon).
+
+                $rule
+                >
+                $rule
+                ? for shortcuts   auto · Orchestrator · Gemini 4 Carbon · high
+            """.trimIndent()
+
+            val session = FakeAgySession(
+                address = "t1q",
+                initialMode = AttachMode.TAKEOVER,
+                initialScreen = composerScreen(mode = "auto", draft = "")
+            )
+            var transitionJob: kotlinx.coroutines.Job? = null
+            session.onKeyOrText = { event ->
+                when (event) {
+                    "TEXT:/usage" -> session.pushScreen(composerScreen(mode = "auto", draft = "/usage"))
+                    "TEXT:/effort" -> session.pushScreen(composerScreen(mode = "auto", draft = "/effort"))
+                    "RAW_ENTER" -> {
+                        if (session.curDraft == "/usage") {
+                            session.pushScreen(loadingScreen)
+                            transitionJob = scope.launch {
+                                delay(220)
+                                session.pushScreen(usageScreen)
+                            }
+                        } else if (session.curDraft == "/effort") {
+                            session.pushScreen(inlineEffortScreen)
+                        }
+                    }
+                }
+            }
+
+            val toasts = CopyOnWriteArrayList<String>()
+            val coordinator = TerminalSequenceCoordinator(
+                scope = scope,
+                connectionState = connState,
+                sessionProvider = { if (session.isAttached.value) session else null },
+                onToast = { toasts += it }
+            )
+
+            val usageRes = coordinator.executeSuspending(
+                address = "t1q",
+                label = "打开 /usage",
+                operations = listOf(
+                    SequenceOperation.EnsureComposerReady,
+                    SequenceOperation.SendSlashCommand("/usage", expectModal = AgySlashModalKind.USAGE)
+                )
+            )
+            transitionJob?.join()
+            assertTrue("Expected /usage WAIT_MORE to succeed once loaded: ${usageRes.exceptionOrNull()}", usageRes.isSuccess)
+            assertEquals(AgySlashModalKind.USAGE, AgyInteractiveParser.inspectRaw(session.screenSnapshot.value).activeSlashModal?.kind)
+            assertTrue("No error toast expected on Loading transition", toasts.isEmpty())
+
+            // Reset to inline outcome flow for /effort
+            session.pushScreen(composerScreen(mode = "auto", draft = ""))
+            val effortRes = coordinator.executeSuspending(
+                address = "t1q",
+                label = "打开 /effort",
+                operations = listOf(
+                    SequenceOperation.EnsureComposerReady,
+                    SequenceOperation.SendSlashCommand("/effort", expectModal = AgySlashModalKind.EFFORT)
+                )
+            )
+            assertTrue("Expected inline /effort response to settle cleanly: ${effortRes.exceptionOrNull()}", effortRes.isSuccess)
+            assertTrue("No error toast expected on inline response", toasts.isEmpty())
+        } finally {
+            scope.cancel()
+        }
+    }
+
     private fun fakeConnectedState(host: String = "192.168.1.100"): ConnectionState.Connected =
         ConnectionState.Connected(
             profile = ConnectionProfile(host = host),

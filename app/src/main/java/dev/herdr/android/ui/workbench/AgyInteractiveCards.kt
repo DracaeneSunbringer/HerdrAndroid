@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
@@ -60,6 +61,7 @@ import dev.herdr.android.ui.components.OneLine
 import dev.herdr.android.ui.components.StatusDot
 import dev.herdr.android.ui.terminal.AgyAgentMode
 import dev.herdr.android.ui.terminal.AgyAskCardState
+import dev.herdr.android.ui.terminal.AgyBtwCardState
 import dev.herdr.android.ui.terminal.AgySlashCatalog
 import dev.herdr.android.ui.terminal.AgySlashModalKind
 import dev.herdr.android.ui.terminal.AgySlashModalState
@@ -416,6 +418,253 @@ fun AgyAskCardComposable(
 }
 
 /**
+ * Native docked card for Antigravity `/btw` side-questions, showing live thinking/tool progress,
+ * streamed or final answer text, copy & expand actions, follow-up `/btw`, and one-tap Esc cancel/close.
+ */
+@Composable
+fun AgyBtwCardComposable(
+    card: AgyBtwCardState,
+    isBusy: Boolean,
+    onCopyText: (String) -> Unit,
+    onToggleExpand: () -> Unit,
+    onFollowUp: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var followUpText by remember(card.question, card.answerText) { mutableStateOf("") }
+    var copiedOnce by remember(card.answerText) { mutableStateOf(false) }
+
+    val borderTone = when {
+        card.isError -> HerdrColors.Blocked
+        card.isRunning -> HerdrColors.Working
+        else -> HerdrColors.Accent
+    }
+    val statusBadgeBg = when {
+        card.isError -> HerdrColors.BlockedSubtle
+        card.isRunning -> HerdrColors.WorkingSubtle
+        else -> HerdrColors.DoneSubtle
+    }
+    val statusBadgeFg = when {
+        card.isError -> HerdrColors.Blocked
+        card.isRunning -> HerdrColors.Working
+        else -> HerdrColors.Done
+    }
+    val statusBadgeText = when {
+        card.isError -> "异常"
+        card.isRunning -> "思考与检索中"
+        else -> "已完成"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(HerdrShapes.Block)
+            .background(HerdrColors.Surface)
+            .border(1.dp, borderTone.copy(alpha = 0.48f), HerdrShapes.Block)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        // Header row: /btw badge + live state + Copy + Cancel/Close Esc
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .clip(HerdrShapes.Pill)
+                    .background(HerdrColors.AccentSubtle)
+                    .padding(horizontal = 8.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    "/btw",
+                    style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold),
+                    color = HerdrColors.Accent
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .clip(HerdrShapes.Pill)
+                    .background(statusBadgeBg)
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                if (card.isRunning) {
+                    StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
+                }
+                Text(statusBadgeText, style = HerdrType.Caption, color = statusBadgeFg, fontWeight = FontWeight.Medium)
+            }
+            Spacer(Modifier.weight(1f))
+            if (card.answerText.isNotBlank()) {
+                ModalMiniChip(if (copiedOnce) "已复制" else "复制", enabled = true, primary = copiedOnce) {
+                    onCopyText(card.answerText)
+                    copiedOnce = true
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .clip(HerdrShapes.Pill)
+                    .background(if (card.isRunning) HerdrColors.BlockedSubtle else HerdrColors.Raised)
+                    .clickable(enabled = !isBusy, onClick = onDismiss)
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = if (card.isRunning) "取消 Esc" else "关闭 Esc",
+                    style = HerdrType.Caption,
+                    color = if (card.isRunning) HerdrColors.Blocked else HerdrColors.Foreground,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+
+        // Question title
+        Text(
+            text = "Q: ${card.question}",
+            style = HerdrType.Label.copy(fontWeight = FontWeight.SemiBold),
+            color = HerdrColors.Foreground,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        // Tool steps & live spinner status summary
+        if (card.toolSteps.isNotEmpty() || card.statusSummary.isNotBlank()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(HerdrShapes.Small)
+                    .background(HerdrColors.Raised)
+                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                if (card.statusSummary.isNotBlank()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (card.isRunning) {
+                            StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
+                        }
+                        Text(
+                            text = card.statusSummary,
+                            style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace),
+                            color = if (card.isRunning) HerdrColors.Working else HerdrColors.Muted
+                        )
+                    }
+                }
+                card.toolSteps.forEach { step ->
+                    val stepColor = when {
+                        step.startsWith("✓") -> HerdrColors.Done
+                        step.startsWith("✗") -> HerdrColors.Blocked
+                        else -> HerdrColors.Muted
+                    }
+                    Text(
+                        text = step,
+                        style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace),
+                        color = stepColor,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        // Answer body or streaming waiting notice
+        if (card.answerText.isNotBlank()) {
+            SelectionContainer {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 220.dp)
+                        .clip(HerdrShapes.Small)
+                        .background(HerdrColors.Raised)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = card.answerText,
+                        style = HerdrType.Body,
+                        color = HerdrColors.Foreground
+                    )
+                }
+            }
+        } else {
+            val placeholder = when {
+                card.isRunning -> "正在后台思考与检索，不打断主对话上下文…"
+                card.toolSteps.isNotEmpty() -> "工具检索已完成，等待生成回复…"
+                else -> "等待回复内容…"
+            }
+            Text(placeholder, style = HerdrType.Caption, color = HerdrColors.Muted)
+        }
+
+        // Completed footer controls: Tab expand + follow-up /btw + explicit dismiss
+        if (!card.isRunning) {
+            val canToggleExpand = "expand" in card.footerHint.lowercase() ||
+                "collapse" in card.footerHint.lowercase() ||
+                card.toolSteps.isNotEmpty()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(34.dp)
+                        .clip(HerdrShapes.Small)
+                        .background(HerdrColors.Raised)
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    if (followUpText.isEmpty()) {
+                        OneLine("继续追问 /btw …", HerdrType.Caption, HerdrColors.Dim)
+                    }
+                    BasicTextField(
+                        value = followUpText,
+                        onValueChange = { followUpText = it },
+                        singleLine = true,
+                        enabled = !isBusy,
+                        textStyle = HerdrType.Caption.copy(color = HerdrColors.Foreground),
+                        cursorBrush = SolidColor(HerdrColors.Accent),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(onSend = {
+                            val q = followUpText.trim()
+                            if (q.isNotEmpty() && !isBusy) {
+                                followUpText = ""
+                                onFollowUp(q)
+                            }
+                        }),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                val canSendFollowUp = !isBusy && followUpText.isNotBlank()
+                Box(
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(HerdrShapes.Small)
+                        .background(if (canSendFollowUp) HerdrColors.Accent else HerdrColors.Raised)
+                        .clickable(enabled = canSendFollowUp) {
+                            val q = followUpText.trim()
+                            followUpText = ""
+                            onFollowUp(q)
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "发送追问",
+                        tint = if (canSendFollowUp) HerdrColors.OnAccent else HerdrColors.Dim,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                if (canToggleExpand) {
+                    ModalMiniChip(if (card.isExpanded) "收起 Tab" else "详情 Tab", !isBusy, onClick = onToggleExpand)
+                }
+            }
+        }
+    }
+}
+
+/**
  * Hosted interactive control card docked above the workbench composer when `agy` has a slash
  * modal open (`/model`, `/config`, `/resume`, `/tasks`, `/agents`, `/artifact`, `/diff`, etc.).
  */
@@ -487,6 +736,21 @@ fun AgySlashModalHostCard(
             }
         }
 
+        if (modal.isLoading) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(HerdrShapes.Small)
+                    .background(HerdrColors.WorkingSubtle)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                StatusDot(HerdrColors.Working, 6.dp, pulsing = true)
+                Text("正在从终端拉取最新面板数据…", style = HerdrType.Caption, color = HerdrColors.Working)
+            }
+        }
+
         // Tabs bar
         if (modal.tabs.isNotEmpty() || modal.supportsTabSwitch) {
             Row(
@@ -512,7 +776,10 @@ fun AgySlashModalHostCard(
                     }
                 }
                 if (modal.tabs.isEmpty()) {
-                    ModalMiniChip("Tab 切换分页", !isBusy) { onSwitchTab(true) }
+                    ModalMiniChip(
+                        if (modal.kind == AgySlashModalKind.MODEL) "⇄ Tab 切强度" else "Tab 切换分页",
+                        !isBusy
+                    ) { onSwitchTab(true) }
                 }
             }
         }
@@ -587,6 +854,55 @@ fun AgySlashModalHostCard(
             }
         }
 
+        // Informational / quota / empty-state / changelog body lines
+        if (modal.bodyLines.isNotEmpty()) {
+            val useMonoBody = modal.kind in setOf(
+                AgySlashModalKind.CONTEXT,
+                AgySlashModalKind.USAGE,
+                AgySlashModalKind.CREDITS,
+                AgySlashModalKind.DIFF,
+                AgySlashModalKind.HELP,
+                AgySlashModalKind.CHANGELOG
+            )
+            SelectionContainer {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = if (modal.items.isEmpty()) 250.dp else 108.dp)
+                        .clip(HerdrShapes.Small)
+                        .background(HerdrColors.Raised)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    modal.bodyLines.forEach { bodyLine ->
+                        Text(
+                            text = bodyLine,
+                            style = if (useMonoBody) {
+                                HerdrType.Caption.copy(fontFamily = FontFamily.Monospace)
+                            } else {
+                                HerdrType.Caption
+                            },
+                            color = HerdrColors.Foreground
+                        )
+                    }
+                }
+            }
+        }
+
+        // Background Tasks quick action bar
+        if (modal.kind == AgySlashModalKind.TASKS && modal.items.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                ModalMiniChip("⏎ 查看输出", !isBusy, primary = true) { onSendRawKey("enter") }
+                ModalMiniChip("✕ 终止任务 (k)", !isBusy) { onSendRawKey("k") }
+                ModalMiniChip("移除记录 (x)", !isBusy) { onSendRawKey("x") }
+            }
+        }
+
         // Parsed list rows
         if (modal.items.isNotEmpty()) {
             Column(
@@ -635,8 +951,17 @@ fun AgySlashModalHostCard(
                     }
                 }
             }
-        } else {
-            // Contextual directional fallback when view has no rows (e.g. diff file hunk viewer or help text)
+        } else if (modal.bodyLines.isEmpty() || modal.kind in setOf(
+                AgySlashModalKind.DIFF,
+                AgySlashModalKind.HELP,
+                AgySlashModalKind.CHANGELOG,
+                AgySlashModalKind.RESUME,
+                AgySlashModalKind.REWIND,
+                AgySlashModalKind.CONFIG,
+                AgySlashModalKind.GENERIC
+            )
+        ) {
+            // Contextual directional controls when list rows are empty or paging fullscreen views
             Row(
                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -647,6 +972,13 @@ fun AgySlashModalHostCard(
                 ModalMiniChip("→", !isBusy) { onSendRawKey("right") }
                 ModalMiniChip("Space", !isBusy) { onSendRawKey("space") }
                 ModalMiniChip("⏎ 确认", !isBusy, primary = true) { onSendRawKey("enter") }
+            }
+        } else if (modal.dismissWithEnterAllowed) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                ModalMiniChip("⏎ / Esc 关闭面板", !isBusy, primary = true, onClick = onClose)
             }
         }
     }
@@ -821,6 +1153,10 @@ fun AgySlashCommandCenterSheet(
                         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        ModalMiniChip("/effort 面板", !isBusy) {
+                            onRunCommand("/effort", AgySlashModalKind.EFFORT)
+                            onDismiss()
+                        }
                         listOf("low", "medium", "high", "xhigh", "max").forEach { lvl ->
                             val isCur = agyState?.activeEffort?.equals(lvl, ignoreCase = true) == true
                             ModalMiniChip("/effort $lvl", !isBusy, primary = isCur) {
@@ -934,6 +1270,7 @@ fun AgySlashCommandCenterSheet(
                                             modifier = Modifier.fillMaxWidth()
                                         )
                                     }
+                                    val canRunParam = !isBusy && (!activeSpec.cmd.equals("/btw", true) || argText.isNotBlank())
                                     HerdrButton(
                                         text = "执行",
                                         onClick = {
@@ -944,6 +1281,7 @@ fun AgySlashCommandCenterSheet(
                                             selectedParamSpec = null
                                             onDismiss()
                                         },
+                                        enabled = canRunParam,
                                         kind = HerdrButtonKind.Primary,
                                         compact = true
                                     )
@@ -961,7 +1299,7 @@ fun AgySlashCommandCenterSheet(
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         val panelSpecs = AgySlashCatalog.allCommands.filter {
-                            it.modalKind != null && it.modalKind != AgySlashModalKind.EFFORT && it.modalKind != AgySlashModalKind.BTW
+                            it.modalKind != null && it.modalKind != AgySlashModalKind.BTW
                         }
                         panelSpecs.forEach { spec ->
                             Box(

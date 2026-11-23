@@ -61,6 +61,12 @@ enum class AgySlashModalKind(
     MODEL("/model", "模型与推理选择"),
     EFFORT("/effort", "推理强度"),
     CONFIG("/config", "全局与会话设置"),
+    CONTEXT("/context", "上下文占用"),
+    USAGE("/usage", "配额与用量"),
+    CREDITS("/credits", "AI Credits 额度"),
+    HELP("/help", "帮助与快捷键"),
+    CHANGELOG("/changelog", "更新日志"),
+    HOOKS("/hooks", "Hooks 钩子配置"),
     RESUME("/resume", "历史会话切换"),
     REWIND("/rewind", "步骤回滚与分支"),
     TASKS("/tasks", "后台任务管理"),
@@ -71,7 +77,6 @@ enum class AgySlashModalKind(
     MCP("/mcp", "MCP 服务管理"),
     PLUGIN("/plugin", "插件中心"),
     PERMISSIONS("/permissions", "权限规则"),
-    USAGE("/usage", "配额与用量"),
     BTW("/btw", "旁路快问"),
     GENERIC("", "交互面板")
 }
@@ -92,10 +97,28 @@ data class AgySlashModalState(
     val searchQuery: String? = null,
     val items: List<AgyModalItem> = emptyList(),
     val selectedIndex: Int = 0,
+    val bodyLines: List<String> = emptyList(),
+    val isLoading: Boolean = false,
     val effortHint: String? = null,
     val supportsLeftRightAdjust: Boolean = false,
     val supportsTabSwitch: Boolean = false,
-    val rawHintFooter: String = ""
+    val dismissWithEnterAllowed: Boolean = false,
+    val rawHintFooter: String = "",
+    val startRawLineIndex: Int = -1,
+    val endRawLineIndex: Int = -1
+)
+
+data class AgyBtwCardState(
+    val question: String,
+    val isRunning: Boolean,
+    val statusSummary: String = "",
+    val toolSteps: List<String> = emptyList(),
+    val answerText: String = "",
+    val isError: Boolean = false,
+    val isExpanded: Boolean = false,
+    val footerHint: String = "",
+    val startRawLineIndex: Int = -1,
+    val endRawLineIndex: Int = -1
 )
 
 data class AgyTerminalState(
@@ -107,6 +130,7 @@ data class AgyTerminalState(
     val isSlashSuggestionOpen: Boolean = false,
     val activeAskCard: AgyAskCardState? = null,
     val activeSlashModal: AgySlashModalState? = null,
+    val activeBtwCard: AgyBtwCardState? = null,
     val hasWorkingHint: Boolean = false
 )
 
@@ -295,9 +319,50 @@ object AgySlashCatalog {
         SlashCommandSpec(
             cmd = "/usage",
             title = "配额统计",
-            description = "查看各模型配额占用与 G1 Credits",
+            description = "查看各模型配额占用与刷新时间",
             category = Category.PANELS,
             modalKind = AgySlashModalKind.USAGE
+        ),
+        SlashCommandSpec(
+            cmd = "/context",
+            title = "上下文占用",
+            description = "查看当前上下文 Token 分布与系统规则文件",
+            category = Category.PANELS,
+            modalKind = AgySlashModalKind.CONTEXT
+        ),
+        SlashCommandSpec(
+            cmd = "/credits",
+            title = "AI Credits",
+            description = "查看剩余 AI Credits 与配额开关",
+            category = Category.PANELS,
+            modalKind = AgySlashModalKind.CREDITS
+        ),
+        SlashCommandSpec(
+            cmd = "/hooks",
+            title = "Hooks 钩子",
+            description = "查看或管理 PreToolUse / Stop 等生命周期钩子",
+            category = Category.PANELS,
+            modalKind = AgySlashModalKind.HOOKS
+        ),
+        SlashCommandSpec(
+            cmd = "/help",
+            title = "帮助与快捷键",
+            description = "打开通用信息 / 命令列表 / 快捷键面板",
+            category = Category.PANELS,
+            modalKind = AgySlashModalKind.HELP
+        ),
+        SlashCommandSpec(
+            cmd = "/changelog",
+            title = "更新日志",
+            description = "浏览当前版本 Antigravity CLI 变更说明",
+            category = Category.PANELS,
+            modalKind = AgySlashModalKind.CHANGELOG
+        ),
+        SlashCommandSpec(
+            cmd = "/statusline",
+            title = "状态栏开关",
+            description = "切换自定义状态栏显示状态",
+            category = Category.CONTEXT
         )
     )
 }
@@ -315,20 +380,24 @@ internal object AgyInteractiveParser {
     private val yourAnswerRegex = Regex("^Your answer\\s*:\\s*(.*)$", RegexOption.IGNORE_CASE)
     private val longRuleRegex = Regex("^[╭╰]?[─━═]{8,}[╮╯]?$")
     private val modalFooterHintRegex = Regex(
-        "(?i)(?:↑/↓|←/→|\\bNavigate\\b|\\bChange\\b|\\bswitch view\\b|\\bswitch tab\\b|tab\\s+Amend|space\\s+to\\s+toggle|enter\\s+(?:Submit|Select)|esc\\s+(?:to\\s+(?:close|exit|discard|cancel|back|skip)|Back|Skip))"
+        "(?i)(?:↑/↓|←/→|^Keyboard:|\\bNavigate\\b|\\bChange\\b|\\bScroll\\b|\\bswitch view\\b|\\bswitch tab\\b|\\bCycle Tabs\\b|tab\\s+(?:to\\s+cycle|Switch|Effort|Amend)|space\\s+to\\s+toggle|enter\\s+(?:Submit|Select|View|Expand|Actions|Save|open)|esc\\s+(?:to\\s+(?:close|exit|discard|cancel|back|skip)|Close|Exit|Cancel|Dismiss|Go [Bb]ack|Clear)|Enter/Esc\\s+to\\s+(?:dismiss|cancel))"
     )
     private val modalHeaderKnownRegex = Regex(
-        "(?i)^(?:Available\\s+models|Select\\s+Model|Reasoning\\s+Effort|Settings|Conversations|Background\\s+Tasks|Running\\s+Background\\s+Tasks|Available\\s+Agents|Artifacts|Action\\s+required\\s*\\(|Manage\\s+MCP\\s+servers|MCP\\s+Servers|All\\s+Changes|Commit\\s+Tree|Rule\\s+—|Permissions|Rewind|\\d+\\s+skills|Remaining\\s+AI\\s+Credits|Plugins)\\b.*"
+        "(?i)^(?:Available\\s+models|Select\\s+Model|Switch\\s+Model|Reasoning\\s+Effort|Select\\s+Effort|Settings|Conversations|Background\\s+Tasks|Running\\s+Background\\s+Tasks|Available\\s+Agents|Create\\s+New\\s+Agents|Artifacts|Action\\s+required\\s*\\(|Manage\\s+MCP\\s+servers|MCP\\s+Servers|All\\s+Changes|Per\\s+Turn|Commit\\s+Tree|Diff\\s*\\(git\\)|Rule\\s+—|Permission\\s+Config\\s+Editor|Permissions|Rewind(?:\\s+Conversation)?|\\d+\\s+skills|Skills|Remaining\\s+AI\\s+Credits|Model\\s+AI\\s+Credits|Plugins|Hooks|Tasks|└\\s*Context\\s+Usage|Context\\s+Usage|└\\s*Models\\s*&\\s*Quota|Models\\s*&\\s*Quota|Antigravity\\s+CLI\\s+Changelog|Antigravity\\s+CLI\\s+(?:general|credits))\\b.*"
     )
     private val effortTokenRegex = Regex("(?i)\\b(low|medium|high|xhigh|max)\\b")
     private val workingLineRegex = Regex(
         "(?i)(?:^[\\u2800-\\u28FF✻✽✶✳✢]\\s+\\S|^Model unavailable\\s*\\(attempt|^(?:[╭╰]─\\s*|[●◆⚙🔧⏳]\\s+)(?:[●◆⚙🔧⏳]\\s*)?(?:THINKING|WORKING|TOOL)\\b|Compacting conversation\\.{2,3})"
     )
     private val slashSuggestionItemRegex = Regex("^/[a-z][a-z0-9-]{1,24}\\b.*")
-    private val diffHeaderPosRegex = Regex("(?i)\\b(?:change\\s+\\d+/\\d+|file\\s+\\d+/\\d+|All\\s+Changes|Commit\\s+Tree)\\b")
+    private val diffHeaderPosRegex = Regex("(?i)(?:\\bchange\\s+\\d+/\\d+|\\bfile\\s+\\d+/\\d+|All\\s+Changes|Commit\\s+Tree|Diff\\s*\\(git\\))")
     private val searchPromptRegex = Regex("^(?:Search|Filter)\\s*[:：]\\s*(.*)$", RegexOption.IGNORE_CASE)
+    private val searchPlaceholderRegex = Regex("(?i)^Type to search\\b.*$")
+    private val shortRuleRegex = Regex("^[─━═]{4,}$")
     private val splitColumnsRegex = Regex("\\s{2,}")
     private val tabActiveSegmentRegex = Regex("(?:\\[([^\\]]+)]|\\(([^)]+)\\)|●\\s*(\\S[^·|]{1,24}))")
+    private val btwSpinnerLineRegex = Regex("^[\\u2800-\\u28FF✻✽✶✳✢]\\s+(.+)$")
+    private val btwFooterLineRegex = Regex("(?i)(?:Tab to expand|Enter/Esc to (?:cancel|dismiss)|esc to (?:cancel|dismiss))")
 
     fun inspectRaw(rawScreen: String): AgyTerminalState {
         if (rawScreen.isBlank()) {
@@ -357,9 +426,12 @@ internal object AgyInteractiveParser {
                 isSlashSuggestionOpen = false,
                 activeAskCard = askCard,
                 activeSlashModal = null,
+                activeBtwCard = null,
                 hasWorkingHint = footerMeta.hasWorking
             )
         }
+
+        val btwCard = detectBtwCard(rawLines, composerInfo)
 
         if (isPermissionModalVisible(rawLines)) {
             return AgyTerminalState(
@@ -371,11 +443,12 @@ internal object AgyInteractiveParser {
                 isSlashSuggestionOpen = false,
                 activeAskCard = null,
                 activeSlashModal = null,
+                activeBtwCard = btwCard,
                 hasWorkingHint = footerMeta.hasWorking
             )
         }
 
-        val slashModal = if (!composerInfo.hasComposerBox) detectSlashModal(rawLines) else null
+        val slashModal = detectSlashModal(rawLines, composerInfo)
         if (slashModal != null) {
             return AgyTerminalState(
                 phase = AgyUiPhase.SLASH_MODAL,
@@ -386,6 +459,7 @@ internal object AgyInteractiveParser {
                 isSlashSuggestionOpen = false,
                 activeAskCard = null,
                 activeSlashModal = slashModal,
+                activeBtwCard = btwCard,
                 hasWorkingHint = footerMeta.hasWorking
             )
         }
@@ -404,6 +478,7 @@ internal object AgyInteractiveParser {
             isSlashSuggestionOpen = composerInfo.isSlashSuggestionOpen,
             activeAskCard = null,
             activeSlashModal = null,
+            activeBtwCard = btwCard,
             hasWorkingHint = footerMeta.hasWorking
         )
     }
@@ -472,17 +547,37 @@ internal object AgyInteractiveParser {
         val hasComposerBox: Boolean,
         val draft: String,
         val placeholderMode: AgyAgentMode?,
-        val isSlashSuggestionOpen: Boolean
+        val isSlashSuggestionOpen: Boolean,
+        val topRuleIdx: Int = -1,
+        val bottomRuleIdx: Int = -1
     )
 
     private fun extractComposerInfo(rawLines: List<AgyRawStyledLine>): ComposerInfo {
         var bottomRuleIdx = -1
-        val minSearch = (rawLines.size - 14).coerceAtLeast(0)
+        val minSearch = 0
+        // Note: when docked cards like `/config` (~28 rows) or `/usage` (~38 rows) sit BELOW the composer box,
+        // `bottomRuleIdx` can sit near the top of a 45-line screen! Scan upward skipping panel lines.
         for (idx in rawLines.lastIndex downTo minSearch) {
             val t = rawLines[idx].text.trim()
-            if (longRuleRegex.matches(t)) {
-                bottomRuleIdx = idx
-                break
+            if (longRuleRegex.matches(t) && idx > 0) {
+                // Verify the line above looks like a composer prompt `> ...` / `› ...` with another rule within 6 lines above
+                val probeTop = (idx - 6).coerceAtLeast(0)
+                val maybeTop = (idx - 1 downTo probeTop).firstOrNull { longRuleRegex.matches(rawLines[it].text.trim()) }
+                if (maybeTop != null) {
+                    val firstInner = ((maybeTop + 1) until idx)
+                        .firstOrNull { rawLines[it].indent >= 0 && rawLines[it].text.isNotBlank() }
+                        ?.let { rawLines[it].text.trim() }
+                        .orEmpty()
+                    val unwrappedFirst = if (firstInner.startsWith("│") && firstInner.endsWith("│") && firstInner.length >= 2) {
+                        firstInner.substring(1, firstInner.length - 1).trimStart()
+                    } else {
+                        firstInner
+                    }
+                    if (unwrappedFirst.startsWith(">") || unwrappedFirst.startsWith("›") || unwrappedFirst.startsWith("❯")) {
+                        bottomRuleIdx = idx
+                        break
+                    }
+                }
             }
         }
         if (bottomRuleIdx <= 0) {
@@ -532,7 +627,9 @@ internal object AgyInteractiveParser {
                 hasComposerBox = true,
                 draft = "",
                 placeholderMode = parseModeToken(firstAfterChevron),
-                isSlashSuggestionOpen = false
+                isSlashSuggestionOpen = false,
+                topRuleIdx = topRuleIdx,
+                bottomRuleIdx = bottomRuleIdx
             )
         }
 
@@ -558,7 +655,145 @@ internal object AgyInteractiveParser {
             hasComposerBox = true,
             draft = fullDraft,
             placeholderMode = null,
-            isSlashSuggestionOpen = hasSlashPopup
+            isSlashSuggestionOpen = hasSlashPopup,
+            topRuleIdx = topRuleIdx,
+            bottomRuleIdx = bottomRuleIdx
+        )
+    }
+
+    private fun detectBtwCard(rawLines: List<AgyRawStyledLine>, composerInfo: ComposerInfo): AgyBtwCardState? {
+        var cursor = if (composerInfo.hasComposerBox && composerInfo.topRuleIdx > 0) {
+            composerInfo.topRuleIdx - 1
+        } else {
+            rawLines.lastIndex
+        }
+        val skipTrailingFooterAndHc = !(composerInfo.hasComposerBox && composerInfo.topRuleIdx > 0)
+        while (cursor >= 0) {
+            val t = rawLines[cursor].text.trim()
+            val shouldSkip = t.isEmpty() || (
+                skipTrailingFooterAndHc && (
+                    t.startsWith("[hc]") ||
+                        AntigravityTranscriptSpec.isModelStatusFooter(t) ||
+                        AntigravityTranscriptSpec.isCustomStatusLine(t)
+                    )
+                )
+            if (shouldSkip) cursor-- else break
+        }
+        if (cursor < 0 || rawLines[cursor].firstChar != '┃') {
+            return null
+        }
+        val endIdx = cursor
+        var startIdx = cursor
+        val floor = (cursor - 48).coerceAtLeast(0)
+        while (cursor >= floor) {
+            val l = rawLines[cursor]
+            if (l.firstChar == '┃') {
+                startIdx = cursor
+                cursor--
+            } else {
+                break
+            }
+        }
+        val cardLines = rawLines.subList(startIdx, endIdx + 1).map { line ->
+            val trimmed = line.text.trimStart()
+            trimmed.removePrefix("┃").removePrefix(" ").trimEnd()
+        }
+        if (cardLines.isEmpty()) return null
+        val firstNonBlank = cardLines.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+        val isBtwHeader = firstNonBlank.startsWith("/btw", ignoreCase = true) ||
+            firstNonBlank.startsWith("/help ", ignoreCase = true)
+        if (!isBtwHeader) {
+            return null
+        }
+
+        // Parse header question (stop at blank line or tool/spinner row)
+        val qParts = ArrayList<String>()
+        var idx = 0
+        while (idx < cardLines.size) {
+            val trimmed = cardLines[idx].trim()
+            if (trimmed.isEmpty()) {
+                idx++
+                break
+            }
+            val qLine = when {
+                idx == 0 && trimmed.startsWith("/btw ", ignoreCase = true) -> trimmed.drop(5).trim()
+                idx == 0 && trimmed.startsWith("/help ", ignoreCase = true) -> trimmed.drop(6).trim()
+                else -> trimmed
+            }
+            if (idx > 0 && (trimmed.startsWith("✓") || trimmed.startsWith("●") || trimmed.startsWith("○") ||
+                    btwSpinnerLineRegex.matches(trimmed) || trimmed.startsWith("Called ") || btwFooterLineRegex.containsMatchIn(trimmed))
+            ) {
+                break
+            }
+            if (qLine.isNotEmpty()) qParts.add(qLine)
+            idx++
+        }
+        val question = qParts.joinToString(" ").trim()
+        val tailLines = if (idx < cardLines.size) cardLines.subList(idx, cardLines.size) else emptyList()
+
+        var footerHint = ""
+        val toolSteps = ArrayList<String>()
+        var statusSummary = ""
+        val answerLines = ArrayList<String>()
+        var running = false
+        var errorFlag = false
+        var expandedFlag = false
+
+        for (rawBodyLine in tailLines) {
+            val t = rawBodyLine.trim()
+            if (t.isEmpty()) {
+                if (answerLines.isNotEmpty() && answerLines.last().isNotEmpty()) {
+                    answerLines.add("")
+                }
+                continue
+            }
+            if (btwFooterLineRegex.containsMatchIn(t)) {
+                footerHint = t
+                val lower = t.lowercase()
+                if ("to cancel" in lower) running = true
+                if ("to collapse" in lower) expandedFlag = true
+                val spin = btwSpinnerLineRegex.find(t)
+                if (spin != null) {
+                    statusSummary = spin.groupValues[1].replace(Regex("\\s*\\(Enter/Esc to cancel\\)", RegexOption.IGNORE_CASE), "").trim()
+                    running = true
+                }
+                continue
+            }
+            val spinMatch = btwSpinnerLineRegex.find(t)
+            if (spinMatch != null) {
+                running = true
+                statusSummary = spinMatch.groupValues[1].trim()
+                continue
+            }
+            if (t.startsWith("✓ ") || t.startsWith("✗ ") || t.startsWith("● ") || t.startsWith("○ ")) {
+                toolSteps.add(t)
+                if (t.startsWith("✗ ")) errorFlag = true
+                continue
+            }
+            if (Regex("^Called \\d+ tools?\\b.*", RegexOption.IGNORE_CASE).matches(t)) {
+                statusSummary = t
+                continue
+            }
+            if (t.contains("failed", ignoreCase = true) || t.startsWith("Error:", ignoreCase = true)) {
+                errorFlag = true
+            }
+            answerLines.add(rawBodyLine.trimStart())
+        }
+        while (answerLines.isNotEmpty() && answerLines.last().isEmpty()) {
+            answerLines.removeAt(answerLines.lastIndex)
+        }
+        val answer = answerLines.joinToString("\n").trim()
+        return AgyBtwCardState(
+            question = question.ifBlank { "/btw" },
+            isRunning = running,
+            statusSummary = statusSummary,
+            toolSteps = toolSteps,
+            answerText = answer,
+            isError = errorFlag,
+            isExpanded = expandedFlag,
+            footerHint = footerHint,
+            startRawLineIndex = startIdx,
+            endRawLineIndex = endIdx
         )
     }
 
@@ -580,7 +815,8 @@ internal object AgyInteractiveParser {
                 scanEnd = idx - 1
                 continue
             }
-            if (AntigravityTranscriptSpec.isKeyHintFooter(t) ||
+            if (t.startsWith("[hc]") ||
+                AntigravityTranscriptSpec.isKeyHintFooter(t) ||
                 AntigravityTranscriptSpec.isModelStatusFooter(t) ||
                 AntigravityTranscriptSpec.isCustomStatusLine(t) ||
                 modalFooterHintRegex.containsMatchIn(t)
@@ -790,24 +1026,86 @@ internal object AgyInteractiveParser {
         }
     }
 
-    private fun detectSlashModal(rawLines: List<AgyRawStyledLine>): AgySlashModalState? {
-        val window = rawLines.takeLast(46).filter { it.indent >= 0 }
+    private fun detectSlashModal(rawLines: List<AgyRawStyledLine>, composerInfo: ComposerInfo): AgySlashModalState? {
+        if (rawLines.isEmpty()) return null
+
+        val isDockedBelowComposer = composerInfo.hasComposerBox &&
+            composerInfo.bottomRuleIdx in 0 until rawLines.lastIndex
+
+        var startRawIdx: Int
+        var endRawIdx: Int
+        if (isDockedBelowComposer) {
+            startRawIdx = composerInfo.bottomRuleIdx + 1
+            endRawIdx = rawLines.lastIndex
+            while (endRawIdx >= startRawIdx) {
+                val t = rawLines[endRawIdx].text.trim()
+                if (t.isEmpty() ||
+                    t.startsWith("[hc]") ||
+                    AntigravityTranscriptSpec.isModelStatusFooter(t) ||
+                    AntigravityTranscriptSpec.isCustomStatusLine(t) ||
+                    t.equals("? for shortcuts", ignoreCase = true) ||
+                    t.equals("esc to cancel", ignoreCase = true)
+                ) {
+                    endRawIdx--
+                } else {
+                    break
+                }
+            }
+            if (startRawIdx > endRawIdx) return null
+        } else {
+            endRawIdx = rawLines.lastIndex
+            while (endRawIdx >= 0) {
+                val t = rawLines[endRawIdx].text.trim()
+                if (t.isEmpty() ||
+                    t.startsWith("[hc]") ||
+                    AntigravityTranscriptSpec.isModelStatusFooter(t) ||
+                    AntigravityTranscriptSpec.isCustomStatusLine(t)
+                ) {
+                    endRawIdx--
+                } else {
+                    break
+                }
+            }
+            var hdrIdx = -1
+            for (idx in endRawIdx downTo 0) {
+                val t = rawLines[idx].text.trim()
+                if (t.isNotEmpty() && (modalHeaderKnownRegex.matches(t) || diffHeaderPosRegex.containsMatchIn(t))) {
+                    hdrIdx = idx
+                }
+            }
+            startRawIdx = if (hdrIdx >= 0) {
+                if (hdrIdx <= 3) 0 else hdrIdx
+            } else {
+                (endRawIdx - 52).coerceAtLeast(0)
+            }
+            if (startRawIdx > endRawIdx) return null
+        }
+
+        val rawSlice = rawLines.subList(startRawIdx, endRawIdx + 1)
+        val window = rawSlice.filter { it.indent >= 0 }
         if (window.isEmpty()) return null
 
         val nonEmptyTexts = window.map { it.text.trim() }
+        // Strip `/` autocomplete popup if user just typed `/model` in composer (when `draft.startsWith("/")`)
+        if (composerInfo.isSlashSuggestionOpen) return null
+        if (nonEmptyTexts.all { slashSuggestionItemRegex.matches(it) }) return null
+
         val footerLines = nonEmptyTexts.takeLast(4).filter {
             modalFooterHintRegex.containsMatchIn(it) || AntigravityTranscriptSpec.isKeyHintFooter(it)
         }
         val joined = nonEmptyTexts.joinToString("\n")
         val hasKnownHeader = nonEmptyTexts.any { modalHeaderKnownRegex.matches(it) } ||
             diffHeaderPosRegex.containsMatchIn(joined) ||
-            ("Available Models" in joined || "Select Model" in joined || "No models match" in joined)
+            ("Available Models" in joined || "Select Model" in joined || "Switch Model" in joined || "No models match" in joined)
 
         val hasStrongModalFooter = nonEmptyTexts.takeLast(4).any { t ->
-            "↑/↓" in t || "←/→" in t || "Navigate" in t || "Switch Tab" in t || "switch view" in t.lowercase() ||
+            t.startsWith("Keyboard:", ignoreCase = true) ||
+                "↑/↓" in t || "←/→" in t || "Navigate" in t || "Switch Tab" in t || "switch view" in t.lowercase() ||
                 "tab Amend" in t || "space to toggle" in t.lowercase() ||
                 "Enter Select" in t || "Enter Confirm" in t || "Enter Resume" in t ||
-                "Esc to close" in t || "Esc to back" in t || "Esc to exit" in t
+                "esc Close" in t || "esc Exit" in t || "esc Cancel" in t || "esc Dismiss" in t ||
+                "Esc to close" in t || "Esc to back" in t || "Esc to exit" in t || "esc Go Back" in t ||
+                "Kill Task" in t || "Kill Active Subagent" in t
         }
         if (!hasKnownHeader && !hasStrongModalFooter) {
             return null
@@ -827,66 +1125,121 @@ internal object AgyInteractiveParser {
         val tabs = ArrayList<String>()
         var activeTabIdx = 0
 
-        for (line in window.take(8)) {
+        for (line in window.take(10)) {
             val t = line.text.trim()
             searchPromptRegex.find(t)?.let { m ->
                 searchQuery = m.groupValues[1].trim()
             }
-            if (kind == AgySlashModalKind.CONFIG || kind == AgySlashModalKind.DIFF ||
-                kind == AgySlashModalKind.PLUGIN || kind == AgySlashModalKind.PERMISSIONS ||
-                kind == AgySlashModalKind.RESUME
-            ) {
-                if (tabs.isEmpty() && ("All Changes" in t || "Commit Tree" in t ||
-                        "Installed" in t && "Discover" in t ||
-                        "TUI" in t && "Remote Agent" in t ||
-                        "Conversation" in t && "Other" in t)
-                ) {
-                    val parts = splitColumnsRegex.split(t).map { it.trim('[', ']', ' ') }.filter { it.isNotEmpty() }
-                    if (parts.size in 2..4) {
-                        tabs.addAll(parts)
-                        val activePos = parts.indexOfFirst { p ->
-                            "[${p}]" in t || "● $p" in t || (line.hasBgHighlight && t.contains(p))
-                        }
-                        if (activePos >= 0) activeTabIdx = activePos
+            if (searchQuery == null && searchPlaceholderRegex.matches(t)) {
+                searchQuery = ""
+            }
+            if (tabs.isEmpty()) {
+                when {
+                    "All Changes" in t && ("Commit Tree" in t || "Per Turn" in t || "Diff (git)" in t) -> {
+                        val cleanedTabs = t.removePrefix("Diff (git)").trim()
+                        val parts = splitColumnsRegex.split(cleanedTabs).map { it.trim('[', ']', ' ') }.filter { it.isNotEmpty() }
+                        if (parts.size in 2..4) tabs.addAll(parts)
+                    }
+                    "general" in t && "commands" in t && "shortcuts" in t -> {
+                        tabs.addAll(listOf("general", "commands", "shortcuts"))
+                    }
+                    "Installed" in t && "Discover" in t -> {
+                        val cleanedTabs = t.replace(Regex("\\(tab to cycle\\)", RegexOption.IGNORE_CASE), "").trim()
+                        val parts = splitColumnsRegex.split(cleanedTabs).map { it.trim('[', ']', ' ') }.filter { it.isNotEmpty() }
+                        if (parts.size in 2..4) tabs.addAll(parts)
+                    }
+                    ("CLI" in t && "Other" in t && "tab to cycle" in t.lowercase()) ||
+                        ("TUI" in t && "Remote Agent" in t) ||
+                        ("Conversation" in t && "Other" in t) -> {
+                        val cleanedTabs = t.replace(Regex("\\(tab to cycle\\)", RegexOption.IGNORE_CASE), "").trim()
+                        val parts = splitColumnsRegex.split(cleanedTabs).map { it.trim('[', ']', ' ') }.filter { it.isNotEmpty() }
+                        if (parts.size in 2..4) tabs.addAll(parts)
                     }
                 }
+                if (tabs.isNotEmpty()) {
+                    val activePos = tabs.indexOfFirst { p ->
+                        "[${p}]" in t || "● $p" in t || (line.hasBgHighlight && t.contains(p))
+                    }
+                    if (activePos >= 0) activeTabIdx = activePos
+                }
             }
-            if ("Effort" in t && effortTokenRegex.containsMatchIn(t)) {
+            if (effortHint == null && "Effort" in t && effortTokenRegex.containsMatchIn(t)) {
                 effortHint = effortTokenRegex.find(t)?.groupValues?.get(1)?.lowercase()
             }
         }
         if (effortHint == null) {
             for (t in nonEmptyTexts) {
-                if ("Effort:" in t || "  Effort  " in t || (kind == AgySlashModalKind.MODEL && effortTokenRegex.containsMatchIn(t))) {
-                    effortTokenRegex.find(t)?.let {
-                        effortHint = it.groupValues[1].lowercase()
-                    }
+                if (("Effort" in t) && effortTokenRegex.containsMatchIn(t)) {
+                    effortHint = effortTokenRegex.find(t)?.groupValues?.get(1)?.lowercase()
+                    if (effortHint != null) break
                 }
             }
         }
 
+        val isLoading = window.any { btwSpinnerLineRegex.matches(it.text.trim()) && "Loading" in it.text }
+        val isInfoOnlyKind = kind == AgySlashModalKind.CONTEXT ||
+            kind == AgySlashModalKind.USAGE ||
+            kind == AgySlashModalKind.CHANGELOG
+
         val footerSet = footerLines.toSet()
         val items = ArrayList<AgyModalItem>()
+        val bodyLines = ArrayList<String>()
         var selectedIdx = 0
         var foundExplicitCursor = false
 
         for (line in window) {
-            val t = line.text.trim()
-            if (t.isEmpty() || t in footerSet || longRuleRegex.matches(t) ||
+            val rawTrimEnd = line.text.trimEnd()
+            val t = rawTrimEnd.trim()
+            if (t.isEmpty() || t.startsWith("[hc]") || t in footerSet || longRuleRegex.matches(t) || shortRuleRegex.matches(t) ||
                 AntigravityTranscriptSpec.isModelStatusFooter(t) ||
                 AntigravityTranscriptSpec.isCustomStatusLine(t) ||
-                modalHeaderKnownRegex.matches(t) ||
-                searchPromptRegex.matches(t)
+                searchPromptRegex.matches(t) ||
+                searchPlaceholderRegex.matches(t)
             ) {
                 continue
             }
+            if (t == headerTitle || (kind == AgySlashModalKind.CREDITS && t.equals("Model AI Credits", ignoreCase = true))) {
+                continue
+            }
+            if (tabs.isNotEmpty() && tabs.all { it in t } && t.length < 96) continue
             if (t.startsWith("╭") || t.startsWith("╰") || t.startsWith("─")) continue
-            if ("type to filter" in t.lowercase() || "press enter" in t.lowercase() || "tip:" in t.lowercase()) continue
+            if ("type to filter" in t.lowercase() || "tip:" in t.lowercase()) continue
 
-            val hasCursorChar = t.startsWith("> ") || t.startsWith("› ") || t.startsWith("❯ ") || t.startsWith("▸ ") ||
+            if (isInfoOnlyKind) {
+                bodyLines.add(rawTrimEnd.trimStart(' '))
+                continue
+            }
+
+            // Detect descriptive paragraphs, section headers, planner gauges, or empty states vs selectable rows
+            val hasCursorChar = t.startsWith("> ") || t.startsWith("› ") || t.startsWith("▸ ") ||
                 (line.firstChar == '●' && line.hasBgHighlight)
-            val isRowSelected = hasCursorChar || line.hasBgHighlight
+            val isEmptyState = t.equals("No background tasks.", ignoreCase = true) ||
+                t.equals("No artifacts", ignoreCase = true) ||
+                t.startsWith("No models match", ignoreCase = true) ||
+                t.startsWith("No conversations", ignoreCase = true)
+            val isProseOrMeta = !hasCursorChar && (
+                t.startsWith("▸ Planner") || t.startsWith("Executor ") ||
+                    t.startsWith("Workspace:") || t.startsWith("Global:") || t.startsWith("Shared:") ||
+                    t.startsWith("Project Config:") || t.startsWith("Log File:") || t.startsWith("Conversation:") ||
+                    t.startsWith("Remaining AI Credits:") || t.startsWith("Select a config scope") ||
+                    t.startsWith("Related:") || t.startsWith("[") && " of " in t && "items]" in t ||
+                    Regex("^\\d+\\s+(?:skills|hook types|file\\(s\\) changed)\\b", RegexOption.IGNORE_CASE).matches(t) ||
+                    t.equals("Create new skills", true) || t.equals("Create New Agents", true) ||
+                    t.equals("Actions", true) || t.equals("Available Agents", true) ||
+                    t.equals("Quick Reference", true) || t.startsWith("Version ", true) ||
+                    t.startsWith("Account:", true) || t.startsWith("Shared skills ·", true) ||
+                    t.endsWith("· Built-in") || t.startsWith("'") ||
+                    (kind == AgySlashModalKind.HELP && !Regex("^/[a-z]", RegexOption.IGNORE_CASE).containsMatchIn(t)) ||
+                    (kind == AgySlashModalKind.CONFIG && t.length > 76 && !splitColumnsRegex.containsMatchIn(t)) ||
+                    (kind == AgySlashModalKind.PERMISSIONS && t.startsWith("Rules that apply", true))
+                )
 
+            if (isEmptyState || isProseOrMeta) {
+                bodyLines.add(t)
+                continue
+            }
+
+            val isRowSelected = hasCursorChar || line.hasBgHighlight
             val cleanBody = t
                 .removePrefix("> ")
                 .removePrefix("› ")
@@ -896,8 +1249,13 @@ internal object AgyInteractiveParser {
             if (cleanBody.isEmpty()) continue
             if (cleanBody.startsWith("←") || cleanBody.startsWith("↑/↓")) continue
 
-            val isActiveMark = "✓" in cleanBody || "(current)" in cleanBody || "[on]" in cleanBody
-            val cols = splitColumnsRegex.split(cleanBody, limit = 2)
+            val isActiveMark = "✓" in cleanBody || "(current)" in cleanBody || "[on]" in cleanBody || "[enabled]" in cleanBody
+            val cols = when {
+                kind == AgySlashModalKind.SKILLS && ":" in cleanBody -> {
+                    listOf(cleanBody.substringBefore(':').trim(), cleanBody.substringAfter(':').trim())
+                }
+                else -> splitColumnsRegex.split(cleanBody, limit = 2)
+            }
             val rowTitle = cols[0].trim()
             val rowValue = cols.getOrNull(1)?.trim().orEmpty()
 
@@ -919,7 +1277,7 @@ internal object AgyInteractiveParser {
             }
         }
 
-        if (!hasKnownHeader && items.isEmpty()) {
+        if (!hasKnownHeader && items.isEmpty() && bodyLines.isEmpty()) {
             return null
         }
 
@@ -930,12 +1288,16 @@ internal object AgyInteractiveParser {
             AgySlashModalKind.CONFIG,
             AgySlashModalKind.MCP,
             AgySlashModalKind.PERMISSIONS,
-            AgySlashModalKind.DIFF
+            AgySlashModalKind.DIFF,
+            AgySlashModalKind.HELP,
+            AgySlashModalKind.TASKS
         ) || "←/→" in rawFooter
         val supportsTab = tabs.size > 1 ||
             "Switch Tab" in rawFooter ||
+            "Cycle Tabs" in rawFooter ||
             "switch view" in rawFooter.lowercase() ||
-            kind in setOf(AgySlashModalKind.CONFIG, AgySlashModalKind.DIFF, AgySlashModalKind.PLUGIN, AgySlashModalKind.RESUME)
+            "tab Effort" in rawFooter ||
+            kind in setOf(AgySlashModalKind.CONFIG, AgySlashModalKind.DIFF, AgySlashModalKind.PLUGIN, AgySlashModalKind.RESUME, AgySlashModalKind.HELP)
 
         return AgySlashModalState(
             kind = kind,
@@ -945,28 +1307,49 @@ internal object AgyInteractiveParser {
             searchQuery = searchQuery,
             items = items,
             selectedIndex = selectedIdx.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
+            bodyLines = bodyLines.take(60),
+            isLoading = isLoading,
             effortHint = effortHint,
             supportsLeftRightAdjust = supportsLR,
             supportsTabSwitch = supportsTab,
-            rawHintFooter = rawFooter
+            dismissWithEnterAllowed = "enter/esc" in rawFooter.lowercase(),
+            rawHintFooter = rawFooter,
+            startRawLineIndex = startRawIdx,
+            endRawLineIndex = endRawIdx
         )
     }
 
-    private fun classifyModalKind(lines: List<String>, joined: String): AgySlashModalKind = when {
-        "Available models" in joined || "Select Model" in joined || "No models match" in joined -> AgySlashModalKind.MODEL
-        "Reasoning Effort" in joined -> AgySlashModalKind.EFFORT
-        "Settings" in joined || "agentMode" in joined || "artifactReviewPolicy" in joined || "←/→ Change" in joined -> AgySlashModalKind.CONFIG
-        "Conversations" in joined || "Exited /resume" in joined -> AgySlashModalKind.RESUME
-        "Rewind" in joined && "↑/↓" in joined -> AgySlashModalKind.REWIND
-        "Background Tasks" in joined || "Running Background Tasks" in joined -> AgySlashModalKind.TASKS
-        "Available Agents" in joined || "Exited /agents" in joined -> AgySlashModalKind.AGENTS
-        "Action required (" in joined || "Artifacts" in joined || "Artifact Review" in joined -> AgySlashModalKind.ARTIFACT
-        diffHeaderPosRegex.containsMatchIn(joined) -> AgySlashModalKind.DIFF
-        lines.any { Regex("^\\d+\\s+skills\\b", RegexOption.IGNORE_CASE).containsMatchIn(it) } -> AgySlashModalKind.SKILLS
-        "Manage MCP servers" in joined || "MCP Servers" in joined -> AgySlashModalKind.MCP
-        "Plugins" in joined && ("Installed" in joined || "Discover" in joined) -> AgySlashModalKind.PLUGIN
-        "Rule —" in joined || ("Permissions" in joined && "↑/↓" in joined) -> AgySlashModalKind.PERMISSIONS
-        "Remaining AI Credits" in joined || "Usage" in joined && "Quota" in joined -> AgySlashModalKind.USAGE
-        else -> AgySlashModalKind.GENERIC
+    private fun classifyModalKind(lines: List<String>, joined: String): AgySlashModalKind {
+        val topHead = lines.take(4).joinToString("\n")
+        return when {
+            "Antigravity CLI Changelog" in topHead -> AgySlashModalKind.CHANGELOG
+            "Diff (git)" in topHead || diffHeaderPosRegex.containsMatchIn(topHead) -> AgySlashModalKind.DIFF
+            "Switch Model" in topHead || "Available models" in topHead || "Select Model" in topHead -> AgySlashModalKind.MODEL
+            "Settings" in topHead -> AgySlashModalKind.CONFIG
+            "└ Context Usage" in topHead || "Context Usage" in topHead -> AgySlashModalKind.CONTEXT
+            "└ Models & Quota" in topHead || "Models & Quota" in topHead -> AgySlashModalKind.USAGE
+            "Model AI Credits" in topHead || "Antigravity CLI  credits" in topHead -> AgySlashModalKind.CREDITS
+            "Antigravity CLI" in topHead && "general" in topHead -> AgySlashModalKind.HELP
+            "Switch Model" in joined || "Available models" in joined || "Select Model" in joined || "No models match" in joined -> AgySlashModalKind.MODEL
+            "Reasoning Effort" in joined || "Select Effort" in joined -> AgySlashModalKind.EFFORT
+            "Settings" in joined || "agentMode" in joined || "Agent Mode" in joined || "artifactReviewPolicy" in joined || "←/→ Change" in joined -> AgySlashModalKind.CONFIG
+            "└ Context Usage" in joined || "Context Usage" in joined -> AgySlashModalKind.CONTEXT
+            "└ Models & Quota" in joined || "Models & Quota" in joined || "Weekly Limit Remaining" in joined -> AgySlashModalKind.USAGE
+            "Model AI Credits" in joined || "Remaining AI Credits" in joined -> AgySlashModalKind.CREDITS
+            "Antigravity CLI Changelog" in joined -> AgySlashModalKind.CHANGELOG
+            ("Antigravity CLI" in joined && "general" in joined && "commands" in joined) || ("Quick Reference" in joined && "↑/↓ Navigate" in joined) -> AgySlashModalKind.HELP
+            "5 hook types" in joined || ("Hooks" in lines && "PreToolUse" in joined) -> AgySlashModalKind.HOOKS
+            "Conversations" in joined || "Exited /resume" in joined -> AgySlashModalKind.RESUME
+            "Rewind" in joined && "↑/↓" in joined -> AgySlashModalKind.REWIND
+            "No background tasks." in joined || "Running Background Tasks" in joined || "Background Tasks" in joined || ("Tasks" in lines && "Kill Task" in joined) -> AgySlashModalKind.TASKS
+            "Available Agents" in joined || "Create New Agents" in joined || "Exited /agents" in joined -> AgySlashModalKind.AGENTS
+            "Action required (" in joined || "Artifacts" in joined || "Artifact Review" in joined -> AgySlashModalKind.ARTIFACT
+            diffHeaderPosRegex.containsMatchIn(joined) -> AgySlashModalKind.DIFF
+            lines.any { Regex("^\\d+\\s+skills\\b", RegexOption.IGNORE_CASE).containsMatchIn(it) } || ("Skills" in lines && "Create new skills" in joined) -> AgySlashModalKind.SKILLS
+            "Manage MCP servers" in joined || "MCP Servers" in joined -> AgySlashModalKind.MCP
+            "Plugins" in joined && ("Installed" in joined || "Discover" in joined) -> AgySlashModalKind.PLUGIN
+            "Permission Config Editor" in joined || "Rule —" in joined || ("Permissions" in joined && "↑/↓" in joined) -> AgySlashModalKind.PERMISSIONS
+            else -> AgySlashModalKind.GENERIC
+        }
     }
 }

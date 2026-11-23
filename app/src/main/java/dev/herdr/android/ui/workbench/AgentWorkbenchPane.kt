@@ -222,6 +222,9 @@ fun AgentWorkbenchPane(
     onFilterAgyModal: (AgySlashModalKind, String) -> Unit,
     onSendAgyModalKey: (AgySlashModalKind, String, Boolean) -> Unit,
     onCloseAgyModal: () -> Unit,
+    onSendAgyBtwQuestion: (String) -> Unit,
+    onDismissAgyBtw: () -> Unit,
+    onToggleAgyBtwExpand: () -> Unit,
     onPickTerminal: () -> Unit
 ) {
     if (session == null || summary == null) {
@@ -281,6 +284,17 @@ fun AgentWorkbenchPane(
         }
         snapshot = computed
         hasInitialSnapshot = true
+    }
+
+    val isAgyStreamingCard = snapshot.agyState?.activeBtwCard?.isRunning == true ||
+        snapshot.agyState?.activeSlashModal?.isLoading == true
+    LaunchedEffect(session.address, isAgyStreamingCard) {
+        if (isAgyStreamingCard) {
+            while (true) {
+                delay(450)
+                session.refreshScreenNow(screenOnly = true)
+            }
+        }
     }
 
     val blocks = snapshot.blocks
@@ -714,7 +728,8 @@ fun AgentWorkbenchPane(
             summary?.agentApp.equals("agy", ignoreCase = true) ||
             activeAgyState != null
         val activeModal = activeAgyState?.activeSlashModal
-        if (isSequenceBusy || activeModal != null) {
+        val activeBtw = activeAgyState?.activeBtwCard
+        if (isSequenceBusy || activeBtw != null || activeModal != null) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -725,6 +740,24 @@ fun AgentWorkbenchPane(
                     SequenceStatusStrip(
                         status = sequenceStatus,
                         onCancel = onCancelSequence
+                    )
+                }
+                if (activeBtw != null) {
+                    AgyBtwCardComposable(
+                        card = activeBtw,
+                        isBusy = isSequenceBusy,
+                        onCopyText = { text ->
+                            clipboard.setText(AnnotatedString(text))
+                        },
+                        onToggleExpand = {
+                            followBottom = true
+                            onToggleAgyBtwExpand()
+                        },
+                        onFollowUp = { q ->
+                            followBottom = true
+                            onSendAgyBtwQuestion(q)
+                        },
+                        onDismiss = onDismissAgyBtw
                     )
                 }
                 if (activeModal != null) {
@@ -877,6 +910,10 @@ fun AgentWorkbenchPane(
                     followBottom = true
                     onRunAgySlashCommand(cmdText, expectModal)
                 },
+                onSendAgyBtwQuestion = { q ->
+                    followBottom = true
+                    onSendAgyBtwQuestion(q)
+                },
                 onUpdateDraft = onUpdateDraft,
                 onPickImages = {
                     imagePickerLauncher.launch(
@@ -927,6 +964,7 @@ private fun WorkbenchComposer(
     isAgyDialect: Boolean,
     isSequenceBusy: Boolean,
     onRunAgySlashCommand: (String, AgySlashModalKind?) -> Unit,
+    onSendAgyBtwQuestion: (String) -> Unit,
     onUpdateDraft: (String) -> Unit,
     onPickImages: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
@@ -970,6 +1008,19 @@ private fun WorkbenchComposer(
             } else {
                 null
             }
+            if (matchedSpec != null && matchedSpec.cmd.equals("/btw", ignoreCase = true)) {
+                val btwQuestion = trimmed.drop(4).trim()
+                if (btwQuestion.isEmpty()) {
+                    localDraft = "/btw "
+                    onUpdateDraft("/btw ")
+                    onSendAgyBtwQuestion("")
+                } else {
+                    localDraft = ""
+                    onUpdateDraft("")
+                    onSendAgyBtwQuestion(btwQuestion)
+                }
+                return
+            }
             localDraft = ""
             onUpdateDraft("")
             if (matchedSpec != null && !isSequenceBusy) {
@@ -1002,7 +1053,61 @@ private fun WorkbenchComposer(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (exactSpec != null && exactSpec.quickParams.isNotEmpty()) {
+                    if (exactSpec != null && exactSpec.cmd.equals("/btw", ignoreCase = true)) {
+                        Row(
+                            modifier = Modifier
+                                .height(28.dp)
+                                .clip(HerdrShapes.Pill)
+                                .background(HerdrColors.AccentSubtle)
+                                .padding(horizontal = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "/btw <问题> · 补全问题后点击发送",
+                                style = HerdrType.Caption,
+                                color = HerdrColors.Accent
+                            )
+                        }
+                    } else if (exactSpec != null && exactSpec.cmd.equals("/model", ignoreCase = true)) {
+                        Row(
+                            modifier = Modifier
+                                .height(28.dp)
+                                .clip(HerdrShapes.Pill)
+                                .background(HerdrColors.AccentSubtle)
+                                .clickable(enabled = !isSequenceBusy) {
+                                    localDraft = ""
+                                    onUpdateDraft("")
+                                    onRunAgySlashCommand(exactSpec.cmd, exactSpec.modalKind)
+                                }
+                                .padding(horizontal = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "/model 打开模型面板",
+                                style = HerdrType.Caption,
+                                color = HerdrColors.Accent
+                            )
+                        }
+                        Row(
+                            modifier = Modifier
+                                .height(28.dp)
+                                .clip(HerdrShapes.Pill)
+                                .background(HerdrColors.Raised)
+                                .clickable(enabled = !isSequenceBusy) {
+                                    if (!localDraft.startsWith("/model ")) {
+                                        localDraft = "/model "
+                                    }
+                                }
+                                .padding(horizontal = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "/model 指定别名…",
+                                style = HerdrType.Caption,
+                                color = HerdrColors.Foreground
+                            )
+                        }
+                    } else if (exactSpec != null && exactSpec.quickParams.isNotEmpty()) {
                         if (exactSpec.modalKind != null) {
                             Row(
                                 modifier = Modifier
@@ -1049,7 +1154,8 @@ private fun WorkbenchComposer(
                         matchedCommands.forEach { spec ->
                             val directModal = spec.modalKind != null &&
                                 spec.quickParams.isEmpty() &&
-                                !spec.acceptsFreeTextArg &&
+                                spec.cmd != "/btw" &&
+                                (!spec.acceptsFreeTextArg || spec.cmd == "/model") &&
                                 !spec.requiresConfirm
                             Row(
                                 modifier = Modifier

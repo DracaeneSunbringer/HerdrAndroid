@@ -1631,6 +1631,11 @@ class HerdrMainViewModel(
     fun runAgySlashCommand(commandText: String, expectModal: AgySlashModalKind?) {
         val trimmed = commandText.trim()
         if (trimmed.isBlank()) return
+        if (trimmed.equals("/btw", ignoreCase = true) || trimmed.startsWith("/btw ", ignoreCase = true)) {
+            val btwQuestion = trimmed.drop(4).trim()
+            sendBtwQuestion(btwQuestion)
+            return
+        }
         val session = _activeSession.value ?: return
         lastDesiredAttachMode = AttachMode.TAKEOVER
         sequenceCoordinator.execute(
@@ -1641,6 +1646,39 @@ class HerdrMainViewModel(
                 SequenceOperation.SendSlashCommand(command = trimmed, expectModal = expectModal)
             )
         )
+    }
+
+    fun sendBtwQuestion(question: String) {
+        val cleanQuestion = question.trim()
+        if (cleanQuestion.isEmpty()) {
+            _toastBanner.value = "请输入 /btw 问题内容"
+            return
+        }
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "旁路快问 /btw",
+            operations = listOf(
+                SequenceOperation.EnsureComposerReady,
+                SequenceOperation.DismissBtwCard,
+                SequenceOperation.SendBtwQuestion(cleanQuestion)
+            )
+        )
+    }
+
+    fun dismissBtwCard() {
+        val session = _activeSession.value ?: return
+        lastDesiredAttachMode = AttachMode.TAKEOVER
+        sequenceCoordinator.execute(
+            address = session.address,
+            label = "关闭旁路快问",
+            operations = listOf(SequenceOperation.DismissBtwCard)
+        )
+    }
+
+    fun toggleBtwExpand() {
+        sendSpecialKey("tab")
     }
 
     fun selectAgyModalItem(

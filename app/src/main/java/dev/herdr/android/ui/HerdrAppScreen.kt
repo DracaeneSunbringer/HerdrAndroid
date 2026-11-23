@@ -299,6 +299,9 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         onFilterAgyModal = viewModel::filterAgyModal,
                         onSendAgyModalKey = viewModel::sendAgyModalKey,
                         onCloseAgyModal = viewModel::closeAgyModal,
+                        onSendAgyBtwQuestion = viewModel::sendBtwQuestion,
+                        onDismissAgyBtw = viewModel::dismissBtwCard,
+                        onToggleAgyBtwExpand = viewModel::toggleBtwExpand,
                         onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                     )
 
