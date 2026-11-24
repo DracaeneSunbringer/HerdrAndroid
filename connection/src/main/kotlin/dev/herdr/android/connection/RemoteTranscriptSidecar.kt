@@ -43,6 +43,10 @@ class RemoteTranscriptSidecar(
     private val closed = AtomicBoolean(false)
 
     @Volatile private var sftpChannel: SshSftpChannel? = null
+    private val hydratedAgyStepCache = object : LinkedHashMap<String, TranscriptRawEvent>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, TranscriptRawEvent>?): Boolean =
+            size > 512
+    }
 
     suspend fun locate(
         agentKind: TranscriptAgentKind,
@@ -56,9 +60,17 @@ class RemoteTranscriptSidecar(
         agentKind: TranscriptAgentKind,
         path: String,
         offset: Long,
-        windowBytes: Long = DEFAULT_WINDOW_BYTES
+        windowBytes: Long = DEFAULT_WINDOW_BYTES,
+        minInitialTurns: Int = MIN_INITIAL_USER_TURNS
     ): TranscriptChunkResult = withSftp { sftp ->
-        handleTail(sftp, agentKind, path, offset, windowBytes.coerceIn(65_536L, 8_388_608L))
+        handleTail(
+            sftp = sftp,
+            agentKind = agentKind,
+            path = path,
+            offset = offset,
+            windowBytes = windowBytes.coerceIn(65_536L, 8_388_608L),
+            minInitialTurns = minInitialTurns
+        )
     }
 
     suspend fun readHead(
@@ -483,7 +495,8 @@ class RemoteTranscriptSidecar(
         agentKind: TranscriptAgentKind,
         path: String,
         offset: Long,
-        windowBytes: Long
+        windowBytes: Long,
+        minInitialTurns: Int = MIN_INITIAL_USER_TURNS
     ): TranscriptChunkResult {
         if (path.isBlank()) return emptyChunk(path)
         val stat = sftp.statOrNull(path)
@@ -568,9 +581,9 @@ class RemoteTranscriptSidecar(
             val nextOffset = startOffset + lastLf + 1L
             var events = projectLines(sftp, agentKind, path, buf, lastLf + 1, startOffset)
 
-            if (effOffset <= 0L && startOffset > 0L) {
+            if (effOffset <= 0L && startOffset > 0L && minInitialTurns > 0) {
                 var userTurns = events.count { it is TranscriptRawEvent.UserMessage }
-                while (userTurns < MIN_INITIAL_USER_TURNS &&
+                while (userTurns < minInitialTurns &&
                     startOffset > 0L &&
                     (nextOffset - startOffset) < MAX_INITIAL_BACKFILL_BYTES
                 ) {
@@ -830,6 +843,19 @@ class RemoteTranscriptSidecar(
         if (!fullStat.isRegularFile || fullStat.size <= 0L) return
 
         val needed = eventIdxByStep.keys.toHashSet()
+        synchronized(hydratedAgyStepCache) {
+            val iter = needed.iterator()
+            while (iter.hasNext()) {
+                val sidx = iter.next()
+                val cached = hydratedAgyStepCache["${fullStat.path}#$sidx"] ?: continue
+                val idx = eventIdxByStep[sidx]
+                if (idx != null && idx in outEvents.indices) {
+                    outEvents[idx] = cached.withLineOffset(offsetByStep[sidx] ?: 0L)
+                }
+                iter.remove()
+            }
+        }
+        if (needed.isEmpty()) return
         val minNeeded = needed.minOrNull() ?: return
 
         try {
@@ -876,7 +902,17 @@ class RemoteTranscriptSidecar(
                                                 projectAgy(obj, offsetByStep[sidx] ?: 0L, tmp)
                                                 val idx = eventIdxByStep[sidx]
                                                 if (tmp.isNotEmpty() && idx != null && idx in outEvents.indices) {
-                                                    outEvents[idx] = tmp[0]
+                                                    val hydrated = tmp[0]
+                                                    outEvents[idx] = hydrated
+                                                    val isFinalized = hydrated !is TranscriptRawEvent.AssistantStep ||
+                                                        hydrated.status == null ||
+                                                        hydrated.status == "DONE" ||
+                                                        hydrated.status == "ERROR"
+                                                    if (isFinalized) {
+                                                        synchronized(hydratedAgyStepCache) {
+                                                            hydratedAgyStepCache["${fullStat.path}#$sidx"] = hydrated
+                                                        }
+                                                    }
                                                 }
                                                 needed.remove(sidx)
                                             }
@@ -894,6 +930,13 @@ class RemoteTranscriptSidecar(
             }
         } catch (_: Exception) {
         }
+    }
+
+    private fun TranscriptRawEvent.withLineOffset(offset: Long): TranscriptRawEvent = when (this) {
+        is TranscriptRawEvent.UserMessage -> copy(lineByteOffset = offset)
+        is TranscriptRawEvent.AssistantStep -> copy(lineByteOffset = offset)
+        is TranscriptRawEvent.TokenUpdate -> copy(lineByteOffset = offset)
+        is TranscriptRawEvent.ToolStatusUpdate -> copy(lineByteOffset = offset)
     }
 
     private fun projectSingleLine(
@@ -1919,10 +1962,10 @@ class RemoteTranscriptSidecar(
 
     companion object {
         const val DEFAULT_WINDOW_BYTES: Long = 2_097_152L
+        const val MIN_INITIAL_USER_TURNS: Int = 24
         private const val MAX_CHUNK_READ_BYTES: Int = 4_194_304
         private const val MAX_SINGLE_LINE_BYTES: Int = 16_777_216
         private const val MAX_STEP_OUTPUT_BYTES: Int = 32_768
-        private const val MIN_INITIAL_USER_TURNS: Int = 24
         private const val MAX_INITIAL_BACKFILL_BYTES: Long = 10_485_760L
         private const val MAX_FULL_HYDRATE_SCAN_BYTES: Long = 20_971_520L
         private const val HISTORY_TAIL_BYTES: Long = 262_144L

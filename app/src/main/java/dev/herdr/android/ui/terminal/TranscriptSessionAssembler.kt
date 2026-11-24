@@ -25,6 +25,25 @@ data class TerminalTranscriptUiState(
     val lastError: String? = null
 )
 
+/**
+ * Per-session cache of completed [ConversationTurn] objects (and their parsed [MarkdownBlockNode]
+ * ASTs) so streaming updates or live PTY refreshes only re-parse the active last turn instead of
+ * re-parsing hundreds of completed historical turns.
+ */
+class IncrementalTranscriptAssemblyCache {
+    internal var sessionIdentity: String = ""
+    internal var lastSnapshotKey: String = ""
+    internal var lastResult: Pair<List<TerminalSemanticBlock>, List<ConversationTurn>>? = null
+    internal val completedTurnsByKey = HashMap<String, ConversationTurn>()
+
+    fun clear() {
+        sessionIdentity = ""
+        lastSnapshotKey = ""
+        lastResult = null
+        completedTurnsByKey.clear()
+    }
+}
+
 object TranscriptSessionAssembler {
 
     private val boldHeadingRegex = Regex("\\*\\*([^*\\n]{2,64})\\*\\*")
@@ -38,6 +57,61 @@ object TranscriptSessionAssembler {
         agentKind: TranscriptAgentKind,
         isLatestRunning: Boolean,
         initialModel: String? = null
+    ): Pair<List<TerminalSemanticBlock>, List<ConversationTurn>> =
+        assembleWithCache(
+            events = events,
+            isLatestRunning = isLatestRunning,
+            initialModel = initialModel,
+            sessionIdentity = "",
+            cache = null
+        )
+
+    fun assembleIncremental(
+        transcriptState: TerminalTranscriptUiState?,
+        isLatestRunning: Boolean,
+        cache: IncrementalTranscriptAssemblyCache
+    ): Pair<List<TerminalSemanticBlock>, List<ConversationTurn>> {
+        if (transcriptState == null || transcriptState.events.isEmpty()) {
+            cache.clear()
+            return emptyList<TerminalSemanticBlock>() to emptyList()
+        }
+        val sessionIdKey = "${transcriptState.address}#${transcriptState.sessionId}#${transcriptState.path}"
+        if (cache.sessionIdentity != sessionIdKey) {
+            cache.clear()
+            cache.sessionIdentity = sessionIdKey
+        }
+        val evs = transcriptState.events
+        val tailSummary = when (val lastEv = evs.lastOrNull()) {
+            is TranscriptRawEvent.AssistantStep ->
+                "${lastEv.lineByteOffset}:${lastEv.markdownContent.length}:${lastEv.thinking.length}:${lastEv.toolCalls.size}:${lastEv.status.orEmpty()}"
+            is TranscriptRawEvent.UserMessage -> "${lastEv.lineByteOffset}:${lastEv.text.length}"
+            is TranscriptRawEvent.TokenUpdate -> "${lastEv.lineByteOffset}:${lastEv.outputTokens}:${lastEv.model.orEmpty()}"
+            is TranscriptRawEvent.ToolStatusUpdate -> "${lastEv.lineByteOffset}:${lastEv.callId}:${lastEv.hasError}"
+            null -> "empty"
+        }
+        val snapKey = "$sessionIdKey|${transcriptState.headOffset}|${transcriptState.tailOffset}|${evs.size}|$isLatestRunning|${transcriptState.activeModel.orEmpty()}|$tailSummary"
+        val fastCached = cache.lastResult
+        if (fastCached != null && cache.lastSnapshotKey == snapKey) {
+            return fastCached
+        }
+        return assembleWithCache(
+            events = evs,
+            isLatestRunning = isLatestRunning,
+            initialModel = transcriptState.activeModel,
+            sessionIdentity = sessionIdKey,
+            cache = cache
+        ).also { built ->
+            cache.lastSnapshotKey = snapKey
+            cache.lastResult = built
+        }
+    }
+
+    private fun assembleWithCache(
+        events: List<TranscriptRawEvent>,
+        isLatestRunning: Boolean,
+        initialModel: String?,
+        sessionIdentity: String,
+        cache: IncrementalTranscriptAssemblyCache?
     ): Pair<List<TerminalSemanticBlock>, List<ConversationTurn>> {
         if (events.isEmpty()) return emptyList<TerminalSemanticBlock>() to emptyList()
 
@@ -51,6 +125,8 @@ object TranscriptSessionAssembler {
 
         data class MutableTurnSection(
             val userPrompt: TerminalSemanticBlock.UserPromptBlock?,
+            val firstOffset: Long,
+            var lastOffset: Long,
             var startIso: String?,
             var endIso: String?,
             var model: String?,
@@ -73,14 +149,17 @@ object TranscriptSessionAssembler {
                     if (ev.text.isNotBlank()) {
                         val sec = MutableTurnSection(
                             userPrompt = TerminalSemanticBlock.UserPromptBlock(ev.text),
+                            firstOffset = ev.lineByteOffset,
+                            lastOffset = ev.lineByteOffset,
                             startIso = ev.createdAt,
                             endIso = ev.createdAt,
                             model = runningModel
                         )
                         sections.add(sec)
                         current = sec
-                    } else if (current != null && !runningModel.isNullOrBlank()) {
-                        current.model = runningModel
+                    } else if (current != null) {
+                        current.lastOffset = maxOf(current.lastOffset, ev.lineByteOffset)
+                        if (!runningModel.isNullOrBlank()) current.model = runningModel
                     }
                 }
                 is TranscriptRawEvent.TokenUpdate -> {
@@ -94,15 +173,20 @@ object TranscriptSessionAssembler {
                             current.model = runningModel
                         }
                     }
-                    if (current != null && (ev.inputTokens > 0L || ev.outputTokens > 0L || ev.cachedInputTokens > 0L)) {
-                        current.inputTokens = ev.inputTokens
-                        current.cacheReadTokens = ev.cachedInputTokens
-                        current.outputTokens = maxOf(current.outputTokens, ev.outputTokens)
+                    if (current != null) {
+                        current.lastOffset = maxOf(current.lastOffset, ev.lineByteOffset)
+                        if (ev.inputTokens > 0L || ev.outputTokens > 0L || ev.cachedInputTokens > 0L) {
+                            current.inputTokens = ev.inputTokens
+                            current.cacheReadTokens = ev.cachedInputTokens
+                            current.outputTokens = maxOf(current.outputTokens, ev.outputTokens)
+                        }
                     }
                 }
                 is TranscriptRawEvent.AssistantStep -> {
                     val target = current ?: MutableTurnSection(
                         userPrompt = null,
+                        firstOffset = ev.lineByteOffset,
+                        lastOffset = ev.lineByteOffset,
                         startIso = ev.createdAt,
                         endIso = ev.createdAt,
                         model = runningModel
@@ -110,6 +194,7 @@ object TranscriptSessionAssembler {
                         sections.add(it)
                         current = it
                     }
+                    target.lastOffset = maxOf(target.lastOffset, ev.lineByteOffset)
                     if (!ev.model.isNullOrBlank()) {
                         runningModel = ev.model
                         target.model = ev.model
@@ -129,7 +214,11 @@ object TranscriptSessionAssembler {
                     }
                     target.events.add(ev)
                 }
-                is TranscriptRawEvent.ToolStatusUpdate -> Unit
+                is TranscriptRawEvent.ToolStatusUpdate -> {
+                    if (current != null) {
+                        current.lastOffset = maxOf(current.lastOffset, ev.lineByteOffset)
+                    }
+                }
             }
         }
 
@@ -139,27 +228,58 @@ object TranscriptSessionAssembler {
         sections.forEachIndexed { idx, sec ->
             val isLatest = idx == sections.lastIndex
             val turnRunning = isLatest && isLatestRunning
-            val bodyBlocks = buildTurnResponseBlocks(
-                steps = sec.events,
-                errorCallIds = errorCallIds,
-                isTurnRunning = turnRunning
-            )
-            if (sec.userPrompt != null) allBlocks.add(sec.userPrompt)
-            allBlocks.addAll(bodyBlocks)
 
-            val durLabel = formatDurationBetween(sec.startIso, sec.endIso)
-            val tokLabel = formatTokenSummary(sec.inputTokens, sec.cacheReadTokens, sec.outputTokens)
-            val modelLabel = sec.model?.let(::formatCompactModelName)
+            var matchedErrorsHash = 0
+            for (st in sec.events) {
+                for (tc in st.toolCalls) {
+                    if (tc.callId != null && tc.callId in errorCallIds) {
+                        matchedErrorsHash = 31 * matchedErrorsHash + tc.callId.hashCode()
+                    }
+                }
+            }
+            val lastStep = sec.events.lastOrNull()
+            val turnKey = if (cache != null && !isLatest) {
+                "$sessionIdentity|${sec.firstOffset}|${sec.lastOffset}|${sec.userPrompt?.text.hashCode()}|" +
+                    "${sec.events.size}|${lastStep?.lineByteOffset ?: -1}|${lastStep?.markdownContent?.length ?: 0}|" +
+                    "${lastStep?.thinking?.length ?: 0}|${sec.model.orEmpty()}|${sec.inputTokens}|${sec.outputTokens}|$matchedErrorsHash"
+            } else {
+                null
+            }
 
-            val turn = assembleTurnStats(
-                turnIndex = idx + 1,
-                prompt = sec.userPrompt,
-                body = bodyBlocks,
-                isLatestRunning = turnRunning,
-                durationOverride = durLabel,
-                modelLabel = modelLabel,
-                tokenSummaryLabel = tokLabel
-            )
+            val cachedTurn = if (turnKey != null) cache?.completedTurnsByKey?.get(turnKey) else null
+            val turn = if (cachedTurn != null) {
+                if (cachedTurn.turnIndex == idx + 1 && !cachedTurn.isRunning) {
+                    cachedTurn
+                } else {
+                    cachedTurn.copy(turnIndex = idx + 1, isRunning = false)
+                }
+            } else {
+                val bodyBlocks = buildTurnResponseBlocks(
+                    steps = sec.events,
+                    errorCallIds = errorCallIds,
+                    isTurnRunning = turnRunning
+                )
+                val durLabel = formatDurationBetween(sec.startIso, sec.endIso)
+                val tokLabel = formatTokenSummary(sec.inputTokens, sec.cacheReadTokens, sec.outputTokens)
+                val modelLabel = sec.model?.let(::formatCompactModelName)
+
+                assembleTurnStats(
+                    turnIndex = idx + 1,
+                    prompt = sec.userPrompt,
+                    body = bodyBlocks,
+                    isLatestRunning = turnRunning,
+                    durationOverride = durLabel,
+                    modelLabel = modelLabel,
+                    tokenSummaryLabel = tokLabel
+                ).also { built ->
+                    if (turnKey != null && cache != null) {
+                        cache.completedTurnsByKey[turnKey] = built
+                    }
+                }
+            }
+
+            if (turn.userPrompt != null) allBlocks.add(turn.userPrompt)
+            allBlocks.addAll(turn.responseBlocks)
             turns.add(turn)
         }
 
@@ -181,8 +301,26 @@ object TranscriptSessionAssembler {
             isLatestRunning = isWorking,
             initialModel = transcriptState.activeModel
         )
-        if (rawTurns.isEmpty()) return liveSnapshot
+        return fusePreassembledWithLiveWorkbench(
+            rawBlocks = rawBlocks,
+            rawTurns = rawTurns,
+            liveSnapshot = liveSnapshot,
+            summary = summary
+        )
+    }
 
+    /**
+     * Performs O(1) tail fusion of pre-assembled raw Markdown turns with the live PTY workbench
+     * snapshot (merging only unflushed prompt or interactive Ask/Alert cards on the latest turn).
+     */
+    fun fusePreassembledWithLiveWorkbench(
+        rawBlocks: List<TerminalSemanticBlock>,
+        rawTurns: List<ConversationTurn>,
+        liveSnapshot: WorkbenchSnapshot,
+        summary: TerminalSummary?
+    ): WorkbenchSnapshot {
+        if (rawTurns.isEmpty()) return liveSnapshot
+        val isWorking = liveSnapshot.liveStatus == AgentStateWord.WORKING
         val mergedBlocks = rawBlocks.toMutableList()
         val mergedTurns = rawTurns.toMutableList()
         val liveLastTurn = liveSnapshot.turns.lastOrNull()

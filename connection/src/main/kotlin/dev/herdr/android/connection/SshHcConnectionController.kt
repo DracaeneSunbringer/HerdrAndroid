@@ -309,10 +309,11 @@ class SshHcConnectionController(
         agentKind: TranscriptAgentKind,
         path: String,
         offset: Long,
-        windowBytes: Long
+        windowBytes: Long,
+        minInitialTurns: Int
     ): Result<TranscriptChunkResult> {
-        demo?.let { return it.readTranscriptTail(agentKind, path, offset, windowBytes) }
-        return capture { requireSidecar().readTail(agentKind, path, offset, windowBytes) }
+        demo?.let { return it.readTranscriptTail(agentKind, path, offset, windowBytes, minInitialTurns) }
+        return capture { requireSidecar().readTail(agentKind, path, offset, windowBytes, minInitialTurns) }
     }
 
     override suspend fun readTranscriptHead(

@@ -174,7 +174,8 @@ interface HerdrConnectionController {
         agentKind: TranscriptAgentKind,
         path: String,
         offset: Long,
-        windowBytes: Long = RemoteTranscriptSidecar.DEFAULT_WINDOW_BYTES
+        windowBytes: Long = RemoteTranscriptSidecar.DEFAULT_WINDOW_BYTES,
+        minInitialTurns: Int = RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
     ): Result<TranscriptChunkResult>
 
     suspend fun readTranscriptHead(
@@ -309,7 +310,8 @@ class PreviewDemoConnectionController : HerdrConnectionController {
         agentKind: TranscriptAgentKind,
         path: String,
         offset: Long,
-        windowBytes: Long
+        windowBytes: Long,
+        minInitialTurns: Int
     ): Result<TranscriptChunkResult> = Result.success(
         TranscriptChunkResult(
             path = path,

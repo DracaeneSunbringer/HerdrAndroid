@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -58,6 +59,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -117,6 +119,8 @@ import dev.herdr.android.ui.terminal.AgyBtwTurn
 import dev.herdr.android.ui.terminal.AgySlashCatalog
 import dev.herdr.android.ui.terminal.AgySlashModalKind
 import dev.herdr.android.ui.terminal.AskNavDirection
+import dev.herdr.android.ui.terminal.IncrementalTranscriptAssemblyCache
+import dev.herdr.android.ui.terminal.MarkdownBlockNode
 import dev.herdr.android.ui.terminal.TerminalDialect
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
 import dev.herdr.android.ui.terminal.TerminalTranscriptUiState
@@ -315,12 +319,59 @@ fun AgentWorkbenchPane(
     var fusedSnapshot by remember(session.address) {
         mutableStateOf(liveSnapshot)
     }
+    val transcriptAssemblyCache = remember(session.address) { IncrementalTranscriptAssemblyCache() }
+    var assembledTranscript by remember(session.address) {
+        mutableStateOf<Pair<List<TerminalSemanticBlock>, List<ConversationTurn>>?>(null)
+    }
     var preferRawMarkdown by remember(session.address) { mutableStateOf(true) }
     var hasInitialSnapshot by remember(session.address) { mutableStateOf(false) }
 
+    val latestAssembledTranscript by rememberUpdatedState(assembledTranscript)
     val latestTranscriptState by rememberUpdatedState(transcriptState)
     val currentSummary by rememberUpdatedState(summary)
     val latestOnRequestTranscriptSync by rememberUpdatedState(onRequestTranscriptSync)
+
+    val isTranscriptRunningHint = liveSnapshot.liveStatus == AgentStateWord.WORKING ||
+        summary.agentStatus == AgentStateWord.WORKING
+
+    LaunchedEffect(
+        session.address,
+        transcriptState?.sessionId,
+        transcriptState?.path,
+        transcriptState?.headOffset,
+        transcriptState?.tailOffset,
+        transcriptState?.events?.size,
+        transcriptState?.activeModel,
+        isTranscriptRunningHint
+    ) {
+        val state = transcriptState
+        if (state == null || state.events.isEmpty()) {
+            transcriptAssemblyCache.clear()
+            assembledTranscript = null
+            if (hasInitialSnapshot) {
+                fusedSnapshot = liveSnapshot
+            }
+            return@LaunchedEffect
+        }
+        val built = withContext(Dispatchers.Default) {
+            TranscriptSessionAssembler.assembleIncremental(
+                transcriptState = state,
+                isLatestRunning = isTranscriptRunningHint,
+                cache = transcriptAssemblyCache
+            )
+        }
+        assembledTranscript = built
+        if (hasInitialSnapshot) {
+            fusedSnapshot = withContext(Dispatchers.Default) {
+                TranscriptSessionAssembler.fusePreassembledWithLiveWorkbench(
+                    rawBlocks = built.first,
+                    rawTurns = built.second,
+                    liveSnapshot = liveSnapshot,
+                    summary = currentSummary
+                )
+            }
+        }
+    }
 
     LaunchedEffect(session.address, rawScreen, summary) {
         val computed = withContext(Dispatchers.Default) {
@@ -336,20 +387,22 @@ fun AgentWorkbenchPane(
         }
         localHistoryBlocks = nextCache
         onUpdateCachedReaderBlocks(computed.blocks)
-        val fused = withContext(Dispatchers.Default) {
-            TranscriptSessionAssembler.fuseWithLiveWorkbench(latestTranscriptState, computed, summary)
+        val built = latestAssembledTranscript
+        val fused = if (built != null && built.second.isNotEmpty()) {
+            withContext(Dispatchers.Default) {
+                TranscriptSessionAssembler.fusePreassembledWithLiveWorkbench(
+                    rawBlocks = built.first,
+                    rawTurns = built.second,
+                    liveSnapshot = computed,
+                    summary = summary
+                )
+            }
+        } else {
+            computed
         }
         liveSnapshot = computed
         fusedSnapshot = fused
         hasInitialSnapshot = true
-    }
-
-    LaunchedEffect(session.address, transcriptState) {
-        if (hasInitialSnapshot) {
-            fusedSnapshot = withContext(Dispatchers.Default) {
-                TranscriptSessionAssembler.fuseWithLiveWorkbench(transcriptState, liveSnapshot, currentSummary)
-            }
-        }
     }
 
     val snapshot = if (preferRawMarkdown && fusedSnapshot.isRawMarkdownActive) {
@@ -454,16 +507,14 @@ fun AgentWorkbenchPane(
         onSyncLiveAgentStatus(effectiveStatus, summary.turn)
     }
 
-    var workingElapsedSec by remember(session.address) { mutableIntStateOf(0) }
+    var workingStartedAtMs by remember(session.address) { mutableLongStateOf(0L) }
     LaunchedEffect(session.address, effectiveStatus == AgentStateWord.WORKING) {
         if (effectiveStatus == AgentStateWord.WORKING) {
-            workingElapsedSec = 0
-            while (true) {
-                delay(1000)
-                workingElapsedSec++
+            if (workingStartedAtMs == 0L) {
+                workingStartedAtMs = android.os.SystemClock.elapsedRealtime()
             }
         } else {
-            workingElapsedSec = 0
+            workingStartedAtMs = 0L
         }
     }
 
@@ -503,6 +554,8 @@ fun AgentWorkbenchPane(
     var isProgrammaticScroll by remember(session.address) { mutableStateOf(false) }
     var lastProgrammaticTarget by remember(session.address) { mutableIntStateOf(0) }
     var collapsedTurnIndices by remember(session.address) { mutableStateOf(emptySet<Int>()) }
+    var userToggledCollapse by remember(session.address) { mutableStateOf(false) }
+    var hideSecondaryChrome by remember(session.address) { mutableStateOf(false) }
 
     val sessionHeader = blocks.firstOrNull { it is TerminalSemanticBlock.SessionHeaderBlock }
         as? TerminalSemanticBlock.SessionHeaderBlock
@@ -516,12 +569,27 @@ fun AgentWorkbenchPane(
         null
     }
 
+    LaunchedEffect(session.address, turns.size, userToggledCollapse) {
+        if (!userToggledCollapse && turns.size > 6) {
+            collapsedTurnIndices = turns.dropLast(4)
+                .filter { !it.hasInteractiveCard && !it.isRunning }
+                .map { it.turnIndex }
+                .toSet()
+        }
+    }
+
+    val slicedByTurnIndex = remember(turns) {
+        turns.associate { turn ->
+            turn.turnIndex to sliceTurnResponseBlocks(turn.responseBlocks)
+        }
+    }
+
     val (turnStartItemIndices, readerAnchorIndex) = remember(
         hasCwdHeader,
         hasLoadEarlierBanner,
         sessionHeader,
         turns,
-        blocks.size,
+        slicedByTurnIndex,
         collapsedTurnIndices,
         liveWorkingActivity,
         hasPendingReceiptItem,
@@ -546,7 +614,7 @@ fun AgentWorkbenchPane(
                 } else {
                     if (showTurnHeaders) count += 1
                     if (turn.userPrompt != null) count += 1
-                    count += turn.responseBlocks.size
+                    count += slicedByTurnIndex[turn.turnIndex]?.size ?: turn.responseBlocks.size
                 }
             }
         }
@@ -556,14 +624,64 @@ fun AgentWorkbenchPane(
         startMap to count
     }
 
-    LaunchedEffect(readerListState) {
-        snapshotFlow { Pair(readerListState.distanceFromBottomPx(), readerListState.isScrollInProgress) }
-            .collect { (distPx, inProgress) ->
-                if (isProgrammaticScroll) return@collect
-                if (inProgress) {
-                    followBottom = distPx <= 28
+    val visibleTurnIndex by remember(turns, turnStartItemIndices) {
+        derivedStateOf {
+            if (turns.isEmpty()) return@derivedStateOf 1
+            if (followBottom || readerListState.distanceFromBottomPx() <= 32) {
+                return@derivedStateOf turns.last().turnIndex
+            }
+            val vis = readerListState.layoutInfo.visibleItemsInfo
+            val focalItemIdx = if (vis.isNotEmpty()) {
+                val topIdx = vis.first().index
+                val botIdx = vis.last().index
+                topIdx + ((botIdx - topIdx) / 3)
+            } else {
+                readerListState.firstVisibleItemIndex
+            }
+            var matched = turns.first().turnIndex
+            for ((tIdx, startItemIdx) in turnStartItemIndices) {
+                if (startItemIdx <= focalItemIdx) {
+                    matched = tIdx
+                } else {
+                    break
                 }
             }
+            matched
+        }
+    }
+
+    LaunchedEffect(readerListState) {
+        var prevIdx = 0
+        var prevOffset = 0
+        snapshotFlow {
+            Triple(
+                readerListState.firstVisibleItemIndex,
+                readerListState.firstVisibleItemScrollOffset,
+                readerListState.distanceFromBottomPx()
+            ) to readerListState.isScrollInProgress
+        }.collect { (pos, inProgress) ->
+            val (firstIdx, firstOff, distPx) = pos
+            if (isProgrammaticScroll) {
+                prevIdx = firstIdx
+                prevOffset = firstOff
+                return@collect
+            }
+            if (inProgress) {
+                followBottom = distPx <= 28
+                val approxDeltaPx = (firstIdx - prevIdx) * 180 + (firstOff - prevOffset)
+                if (followBottom || firstIdx <= 1) {
+                    hideSecondaryChrome = false
+                } else if (approxDeltaPx > 28 && firstIdx >= 2 && distPx > 32) {
+                    hideSecondaryChrome = true
+                } else if (approxDeltaPx < -20) {
+                    hideSecondaryChrome = false
+                }
+            } else if (followBottom || firstIdx == 0) {
+                hideSecondaryChrome = false
+            }
+            prevIdx = firstIdx
+            prevOffset = firstOff
+        }
     }
 
     LaunchedEffect(rawVScroll) {
@@ -668,13 +786,14 @@ fun AgentWorkbenchPane(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         StatusDot(tone.color, 6.dp, tone.pulsing)
                         Spacer(Modifier.width(6.dp))
+                        val shortSession = transcriptState?.sessionId?.trim()?.takeIf { it.isNotEmpty() }?.take(8)
                         val meta = buildList {
                             add(tone.label)
                             add(summary.address.substringAfterLast('/'))
                             summary.name?.takeIf { it.isNotBlank() && it != workbenchTitleOf(summary) }?.let { add(it) }
                             add(agentAppLabel(summary.agentApp))
                             if (summary.turn > 0) add("${summary.turn} 轮")
-                            if (snapshot.isRawMarkdownActive) add("MD 原生")
+                            if (shortSession != null && snapshot.isRawMarkdownActive) add(shortSession)
                         }.joinToString(" · ")
                         OneLine(meta, HerdrType.Caption, HerdrColors.Muted)
                     }
@@ -686,16 +805,17 @@ fun AgentWorkbenchPane(
                     onSelect = {
                         readerMode = it == 0
                         followBottom = true
+                        hideSecondaryChrome = false
                     }
                 )
             }
 
-            if (switchList.size > 1) {
+            AnimatedVisibility(visible = switchList.size > 1 && (!readerMode || !hideSecondaryChrome)) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     switchList.forEach { t ->
@@ -722,8 +842,9 @@ fun AgentWorkbenchPane(
                         }
                     }
                 }
-            } else {
-                Spacer(Modifier.height(6.dp))
+            }
+            if (switchList.size <= 1 || (readerMode && hideSecondaryChrome)) {
+                Spacer(Modifier.height(4.dp))
             }
 
             AnimatedVisibility(visible = !readerMode) {
@@ -762,19 +883,26 @@ fun AgentWorkbenchPane(
         // ---------------- Content ----------------
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             if (readerMode) {
-                val showStreamStrip = syncAgentKind != null && (
+                val showStreamStrip = (syncAgentKind != null && (
                     fusedSnapshot.isRawMarkdownActive ||
                         transcriptState?.path?.isNotBlank() == true ||
                         transcriptState?.locateAttempted == true
-                    )
+                    )) || turns.size >= 2
                 val activeStreamModel = transcriptState?.activeModel?.takeIf { it.isNotBlank() }
                     ?: turns.lastOrNull()?.modelLabel
                 Column(modifier = Modifier.fillMaxSize()) {
                     if (showStreamStrip) {
-                        ReaderStreamStatusStrip(
+                        WorkbenchContextNavStrip(
+                            showStreamToggle = syncAgentKind != null && (
+                                fusedSnapshot.isRawMarkdownActive ||
+                                    transcriptState?.path?.isNotBlank() == true ||
+                                    transcriptState?.locateAttempted == true
+                                ),
                             isRawMarkdownSupported = fusedSnapshot.isRawMarkdownActive,
                             isShowingRawMarkdown = preferRawMarkdown && fusedSnapshot.isRawMarkdownActive,
-                            turnCount = fusedSnapshot.turns.size,
+                            turns = turns,
+                            activeVisibleTurnIndex = visibleTurnIndex,
+                            collapsedTurnIndices = collapsedTurnIndices,
                             sessionId = transcriptState?.sessionId.orEmpty(),
                             activeModel = activeStreamModel,
                             lastError = transcriptState?.lastError,
@@ -785,38 +913,33 @@ fun AgentWorkbenchPane(
                                 } else {
                                     onRequestTranscriptSync(liveSnapshot.dialect, true)
                                 }
-                            }
-                        )
-                        HerdrDivider()
-                    }
-                    if (turns.size >= 2) {
-                        TurnQuickJumpBar(
-                            turns = turns,
-                            collapsedTurnIndices = collapsedTurnIndices,
-                            isRawMarkdownActive = snapshot.isRawMarkdownActive,
+                            },
                             onJumpToTurn = { turnIdx ->
+                                userToggledCollapse = true
                                 collapsedTurnIndices = collapsedTurnIndices - turnIdx
                                 val targetItem = turnStartItemIndices[turnIdx] ?: 0
-                                followBottom = turnIdx == turns.last().turnIndex
+                                followBottom = turnIdx == turns.lastOrNull()?.turnIndex
                                 scope.launch {
                                     isProgrammaticScroll = true
                                     try {
-                                        readerListState.animateScrollToItem(targetItem)
+                                        if (kotlin.math.abs(targetItem - readerListState.firstVisibleItemIndex) > 16) {
+                                            readerListState.scrollToItem(targetItem)
+                                        } else {
+                                            readerListState.animateScrollToItem(targetItem)
+                                        }
                                     } finally {
                                         isProgrammaticScroll = false
                                     }
                                 }
                             },
                             onToggleCollapseOlder = {
+                                userToggledCollapse = true
                                 val older = turns.dropLast(1)
                                     .filter { !it.hasInteractiveCard && !it.isRunning }
                                     .map { it.turnIndex }
                                     .toSet()
-                                collapsedTurnIndices = if (older.isNotEmpty() && older.all { it in collapsedTurnIndices }) {
-                                    emptySet()
-                                } else {
-                                    older
-                                }
+                                val hasAnyCollapsed = older.any { it in collapsedTurnIndices }
+                                collapsedTurnIndices = if (hasAnyCollapsed) emptySet() else older
                             }
                         )
                         HerdrDivider()
@@ -824,8 +947,8 @@ fun AgentWorkbenchPane(
                     LazyColumn(
                         state = readerListState,
                         modifier = Modifier.weight(1f).fillMaxWidth(),
-                        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                        contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         if (hasCwdHeader) {
                             item(key = "cwd", contentType = "cwd") {
@@ -880,6 +1003,7 @@ fun AgentWorkbenchPane(
                                         TurnSummaryCard(
                                             turn = turn,
                                             onExpand = {
+                                                userToggledCollapse = true
                                                 collapsedTurnIndices = collapsedTurnIndices - turn.turnIndex
                                             }
                                         )
@@ -894,6 +1018,7 @@ fun AgentWorkbenchPane(
                                                 turn = turn,
                                                 canCollapse = !turn.hasInteractiveCard && !turn.isRunning,
                                                 onCollapse = {
+                                                    userToggledCollapse = true
                                                     collapsedTurnIndices = collapsedTurnIndices + turn.turnIndex
                                                 }
                                             )
@@ -914,13 +1039,15 @@ fun AgentWorkbenchPane(
                                             )
                                         }
                                     }
+                                    val slices = slicedByTurnIndex[turn.turnIndex].orEmpty()
                                     itemsIndexed(
-                                        items = turn.responseBlocks,
-                                        key = { bIdx, _ -> "${session.address}#t${turn.turnIndex}#$bIdx" },
-                                        contentType = { _, block -> block::class }
-                                    ) { bIdx, block ->
+                                        items = slices,
+                                        key = { _, slice -> "${session.address}#t${turn.turnIndex}#${slice.subKey}" },
+                                        contentType = { _, slice -> slice.block::class }
+                                    ) { _, slice ->
+                                        val block = slice.block
                                         val showTurnChangedFilesFooter =
-                                            bIdx == turn.responseBlocks.lastIndex &&
+                                            slice.isLastInTurn &&
                                                 turn.changedFiles.isNotEmpty() &&
                                                 !turn.isRunning &&
                                                 block !is TerminalSemanticBlock.ToolGroupBlock &&
@@ -928,7 +1055,7 @@ fun AgentWorkbenchPane(
                                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             ReaderBlock(
                                                 block = block,
-                                                stateKey = "${session.address}#t${turn.turnIndex}#$bIdx",
+                                                stateKey = "${session.address}#t${turn.turnIndex}#${slice.subKey}",
                                                 isSequenceBusy = isSequenceBusy,
                                                 stepOutputs = transcriptState?.stepOutputs.orEmpty(),
                                                 loadingSteps = transcriptState?.loadingSteps.orEmpty(),
@@ -953,7 +1080,7 @@ fun AgentWorkbenchPane(
                                 val expandPayload = if (snapshot.dialect == TerminalDialect.CODEX) "ctrl+t" else "ctrl+o"
                                 LiveWorkingActivityCard(
                                     activity = liveWorkingActivity,
-                                    elapsedSec = workingElapsedSec,
+                                    startedAtMs = workingStartedAtMs,
                                     expandLabel = if (snapshot.dialect == TerminalDialect.CODEX) "展开 ^T" else "详情 ^O",
                                     onExpand = { onSendSpecialKey(expandPayload) }
                                 )
@@ -2479,135 +2606,194 @@ private fun ToolGroupCard(
             ) {
                 if (block.entries.isNotEmpty()) {
                     block.entries.forEachIndexed { entryIdx, entry ->
-                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        if (entry.category == ToolActionCategory.THOUGHT) {
+                            var thoughtExpanded by remember(stateKey, entryIdx) { mutableStateOf(false) }
+                            val fullThoughtText = remember(entry.title, entry.detailLines) {
+                                if (entry.detailLines.isEmpty()) entry.title
+                                else "${entry.title}\n${entry.detailLines.joinToString("\n")}"
+                            }
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(HerdrShapes.Small)
+                                    .clickable {
+                                        if (entry.detailLines.isNotEmpty()) thoughtExpanded = !thoughtExpanded
+                                    }
+                                    .padding(vertical = 2.dp),
+                                verticalArrangement = Arrangement.spacedBy(3.dp)
                             ) {
-                                val (tagBg, tagFg) = when (entry.category) {
-                                    ToolActionCategory.EDIT -> HerdrColors.DoneSubtle to HerdrColors.Done
-                                    ToolActionCategory.COMMAND -> HerdrColors.AccentSubtle to HerdrColors.Accent
-                                    ToolActionCategory.THOUGHT -> HerdrColors.Raised to HerdrColors.Muted
-                                    else -> HerdrColors.Raised to HerdrColors.Dim
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(if (entry.hasError) HerdrColors.BlockedSubtle else tagBg)
-                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                                Row(
+                                    verticalAlignment = Alignment.Top,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Text(
-                                        entry.category.badgeText,
-                                        style = HerdrType.Caption.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
-                                        color = if (entry.hasError) HerdrColors.Blocked else tagFg,
-                                        maxLines = 1
-                                    )
-                                }
-                                Text(
-                                    entry.title,
-                                    style = HerdrType.Mono.copy(fontSize = 11.5.sp, lineHeight = 16.sp),
-                                    color = if (entry.hasError) HerdrColors.Blocked else HerdrColors.Foreground,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                if (!entry.diffPreview.isNullOrBlank()) {
-                                    val isDiffOpen = entryIdx in expandedDiffStepIndices
-                                    Text(
-                                        text = if (isDiffOpen) "收起 Diff ▴" else "Diff ▾",
-                                        style = HerdrType.Caption.copy(fontSize = 10.5.sp),
-                                        color = HerdrColors.Done,
-                                        fontWeight = FontWeight.Medium,
+                                    Box(
                                         modifier = Modifier
-                                            .clip(HerdrShapes.Small)
-                                            .clickable {
-                                                expandedDiffStepIndices = if (isDiffOpen) {
-                                                    expandedDiffStepIndices - entryIdx
-                                                } else {
-                                                    expandedDiffStepIndices + entryIdx
+                                            .padding(top = 1.dp)
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(HerdrColors.Raised)
+                                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                                    ) {
+                                        Text(
+                                            entry.category.badgeText,
+                                            style = HerdrType.Caption.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                                            color = HerdrColors.Muted,
+                                            maxLines = 1
+                                        )
+                                    }
+                                    Text(
+                                        text = if (thoughtExpanded) fullThoughtText else entry.title,
+                                        style = HerdrType.Caption.copy(fontSize = 11.5.sp, lineHeight = 17.sp),
+                                        color = HerdrColors.Muted,
+                                        maxLines = if (thoughtExpanded) Int.MAX_VALUE else 3,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (entry.detailLines.isNotEmpty()) {
+                                        Text(
+                                            text = if (thoughtExpanded) "▴" else "▾",
+                                            style = HerdrType.Caption,
+                                            color = HerdrColors.Dim
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                val displayTitle = remember(entry.title) { smartMiddleEllipsize(entry.title, 44) }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    val (tagBg, tagFg) = when (entry.category) {
+                                        ToolActionCategory.EDIT -> HerdrColors.DoneSubtle to HerdrColors.Done
+                                        ToolActionCategory.COMMAND -> HerdrColors.AccentSubtle to HerdrColors.Accent
+                                        else -> HerdrColors.Raised to HerdrColors.Dim
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(if (entry.hasError) HerdrColors.BlockedSubtle else tagBg)
+                                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                                    ) {
+                                        Text(
+                                            entry.category.badgeText,
+                                            style = HerdrType.Caption.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                                            color = if (entry.hasError) HerdrColors.Blocked else tagFg,
+                                            maxLines = 1
+                                        )
+                                    }
+                                    Text(
+                                        text = displayTitle,
+                                        style = HerdrType.Mono.copy(fontSize = 11.5.sp, lineHeight = 16.sp),
+                                        color = if (entry.hasError) HerdrColors.Blocked else HerdrColors.Foreground,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (!entry.diffPreview.isNullOrBlank()) {
+                                        val isDiffOpen = entryIdx in expandedDiffStepIndices
+                                        Text(
+                                            text = if (isDiffOpen) "收起 ▴" else "Diff ▾",
+                                            style = HerdrType.Caption.copy(fontSize = 10.5.sp),
+                                            color = HerdrColors.Done,
+                                            fontWeight = FontWeight.Medium,
+                                            softWrap = false,
+                                            maxLines = 1,
+                                            modifier = Modifier
+                                                .clip(HerdrShapes.Small)
+                                                .clickable {
+                                                    expandedDiffStepIndices = if (isDiffOpen) {
+                                                        expandedDiffStepIndices - entryIdx
+                                                    } else {
+                                                        expandedDiffStepIndices + entryIdx
+                                                    }
                                                 }
-                                            }
-                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                    val rStep = entry.resultStepIndex
+                                    if (rStep != null) {
+                                        val isStepOpen = rStep in expandedStepIndices
+                                        val isLoading = rStep in loadingSteps
+                                        Text(
+                                            text = when {
+                                                isLoading -> "加载…"
+                                                isStepOpen -> "收起 ▴"
+                                                else -> "输出 ▾"
+                                            },
+                                            style = HerdrType.Caption.copy(fontSize = 10.5.sp),
+                                            color = HerdrColors.Accent,
+                                            fontWeight = FontWeight.Medium,
+                                            softWrap = false,
+                                            maxLines = 1,
+                                            modifier = Modifier
+                                                .clip(HerdrShapes.Small)
+                                                .clickable {
+                                                    if (isStepOpen) {
+                                                        expandedStepIndices = expandedStepIndices - rStep
+                                                    } else {
+                                                        expandedStepIndices = expandedStepIndices + rStep
+                                                        if (rStep !in stepOutputs && rStep !in loadingSteps) {
+                                                            onLoadStepOutput(rStep)
+                                                        }
+                                                    }
+                                                }
+                                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                                if (entry.detailLines.isNotEmpty()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState())
+                                            .padding(start = 8.dp)
+                                    ) {
+                                        Text(
+                                            entry.detailLines.joinToString("\n"),
+                                            style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
+                                            color = HerdrColors.Dim,
+                                            softWrap = false
+                                        )
+                                    }
+                                }
+                                val entryDiff = entry.diffPreview
+                                if (!entryDiff.isNullOrBlank() && entryIdx in expandedDiffStepIndices) {
+                                    InlineUnifiedDiffCard(
+                                        diffText = entryDiff,
+                                        fileLabel = entry.changedFiles.firstOrNull(),
+                                        stateKey = "$stateKey#diff#$entryIdx",
+                                        onCopy = onCopy
                                     )
                                 }
                                 val rStep = entry.resultStepIndex
-                                if (rStep != null) {
-                                    val isStepOpen = rStep in expandedStepIndices
+                                if (rStep != null && rStep in expandedStepIndices) {
+                                    val stepText = stepOutputs[rStep]
                                     val isLoading = rStep in loadingSteps
-                                    Text(
-                                        text = when {
-                                            isLoading -> "加载中…"
-                                            isStepOpen -> "收起输出 ▴"
-                                            else -> "查看输出 ▾"
-                                        },
-                                        style = HerdrType.Caption.copy(fontSize = 10.5.sp),
-                                        color = HerdrColors.Accent,
-                                        fontWeight = FontWeight.Medium,
+                                    Box(
                                         modifier = Modifier
+                                            .fillMaxWidth()
                                             .clip(HerdrShapes.Small)
-                                            .clickable {
-                                                if (isStepOpen) {
-                                                    expandedStepIndices = expandedStepIndices - rStep
-                                                } else {
-                                                    expandedStepIndices = expandedStepIndices + rStep
-                                                    if (rStep !in stepOutputs && rStep !in loadingSteps) {
-                                                        onLoadStepOutput(rStep)
-                                                    }
-                                                }
-                                            }
-                                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                                    )
-                                }
-                            }
-                            if (entry.detailLines.isNotEmpty()) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState())
-                                        .padding(start = 8.dp)
-                                ) {
-                                    Text(
-                                        entry.detailLines.joinToString("\n"),
-                                        style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
-                                        color = HerdrColors.Dim,
-                                        softWrap = false
-                                    )
-                                }
-                            }
-                            val entryDiff = entry.diffPreview
-                            if (!entryDiff.isNullOrBlank() && entryIdx in expandedDiffStepIndices) {
-                                InlineUnifiedDiffCard(
-                                    diffText = entryDiff,
-                                    fileLabel = entry.changedFiles.firstOrNull(),
-                                    stateKey = "$stateKey#diff#$entryIdx",
-                                    onCopy = onCopy
-                                )
-                            }
-                            val rStep = entry.resultStepIndex
-                            if (rStep != null && rStep in expandedStepIndices) {
-                                val stepText = stepOutputs[rStep]
-                                val isLoading = rStep in loadingSteps
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(HerdrShapes.Small)
-                                        .background(HerdrColors.Canvas)
-                                        .border(1.dp, HerdrColors.Border.copy(alpha = 0.5f), HerdrShapes.Small)
-                                        .combinedClickable(
-                                            onClick = {},
-                                            onLongClick = { if (!stepText.isNullOrBlank()) onCopy(stepText) }
+                                            .background(HerdrColors.Canvas)
+                                            .border(1.dp, HerdrColors.Border.copy(alpha = 0.5f), HerdrShapes.Small)
+                                            .combinedClickable(
+                                                onClick = {},
+                                                onLongClick = { if (!stepText.isNullOrBlank()) onCopy(stepText) }
+                                            )
+                                            .horizontalScroll(rememberScrollState())
+                                            .padding(horizontal = 8.dp, vertical = 6.dp)
+                                    ) {
+                                        Text(
+                                            text = when {
+                                                isLoading && stepText == null -> "正在按需拉取第 #$rStep 步输出…"
+                                                stepText != null -> stepText
+                                                else -> "(暂无输出)"
+                                            },
+                                            style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
+                                            color = HerdrColors.Muted,
+                                            softWrap = false
                                         )
-                                        .horizontalScroll(rememberScrollState())
-                                        .padding(horizontal = 8.dp, vertical = 6.dp)
-                                ) {
-                                    Text(
-                                        text = when {
-                                            isLoading && stepText == null -> "正在按需拉取第 #$rStep 步输出…"
-                                            stepText != null -> stepText
-                                            else -> "(暂无输出)"
-                                        },
-                                        style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
-                                        color = HerdrColors.Muted,
-                                        softWrap = false
-                                    )
+                                    }
                                 }
                             }
                         }
@@ -2651,186 +2837,165 @@ private fun LoadEarlierTranscriptBanner(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ReaderStreamStatusStrip(
+private fun WorkbenchContextNavStrip(
+    showStreamToggle: Boolean,
     isRawMarkdownSupported: Boolean,
     isShowingRawMarkdown: Boolean,
-    turnCount: Int,
+    turns: List<ConversationTurn>,
+    activeVisibleTurnIndex: Int,
+    collapsedTurnIndices: Set<Int>,
     sessionId: String,
     activeModel: String?,
     lastError: String?,
     onCopy: (String) -> Unit,
-    onToggleStreamSource: () -> Unit
-) {
-    val (pillBg, pillFg, modeLabel) = when {
-        !isRawMarkdownSupported && !lastError.isNullOrBlank() ->
-            Triple(HerdrColors.BlockedSubtle, HerdrColors.Blocked, "⚠️ 旁路重试")
-        !isRawMarkdownSupported ->
-            Triple(HerdrColors.WorkingSubtle, HerdrColors.Working, "⏳ 挂载 .jsonl 旁路…")
-        isShowingRawMarkdown ->
-            Triple(HerdrColors.DoneSubtle, HerdrColors.Done, "⚡ 原生 MD 流 · ${turnCount} 轮")
-        else ->
-            Triple(HerdrColors.AccentSubtle, HerdrColors.Accent, "🖥️ 屏幕流 · 点击切回 MD")
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(HerdrColors.Chrome.copy(alpha = 0.85f))
-            .padding(horizontal = 12.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .clip(HerdrShapes.Pill)
-                .background(pillBg)
-                .combinedClickable(
-                    onClick = onToggleStreamSource,
-                    onLongClick = { if (!lastError.isNullOrBlank()) onCopy(lastError) }
-                )
-                .padding(horizontal = 9.dp, vertical = 3.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp)
-        ) {
-            Text(
-                text = modeLabel,
-                style = HerdrType.Caption.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
-                color = pillFg,
-                maxLines = 1
-            )
-            if (isRawMarkdownSupported) {
-                Text(
-                    text = "⇄",
-                    style = HerdrType.Caption.copy(fontSize = 11.sp),
-                    color = pillFg.copy(alpha = 0.85f),
-                    maxLines = 1
-                )
-            }
-        }
-        Spacer(Modifier.weight(1f))
-        val shortSession = remember(sessionId) {
-            sessionId.trim().takeIf { it.isNotEmpty() }?.take(8)
-        }
-        if (shortSession != null) {
-            Box(
-                modifier = Modifier
-                    .clip(HerdrShapes.Small)
-                    .background(HerdrColors.Raised)
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = shortSession,
-                    style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontSize = 10.sp),
-                    color = HerdrColors.Dim,
-                    maxLines = 1
-                )
-            }
-        }
-        if (!activeModel.isNullOrBlank()) {
-            OneLine(
-                text = activeModel,
-                style = HerdrType.Caption.copy(fontSize = 10.5.sp),
-                color = HerdrColors.Muted,
-                modifier = Modifier.widthIn(max = 150.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun TurnQuickJumpBar(
-    turns: List<ConversationTurn>,
-    collapsedTurnIndices: Set<Int>,
-    isRawMarkdownActive: Boolean = false,
+    onToggleStreamSource: () -> Unit,
     onJumpToTurn: (Int) -> Unit,
     onToggleCollapseOlder: () -> Unit
 ) {
-    val olderCollapsibleCount = remember(turns) {
-        turns.dropLast(1).count { !it.hasInteractiveCard && !it.isRunning }
+    val olderCollapsible = remember(turns) {
+        turns.dropLast(1).filter { !it.hasInteractiveCard && !it.isRunning }
     }
-    val allOlderCollapsed = remember(turns, collapsedTurnIndices) {
-        val older = turns.dropLast(1).filter { !it.hasInteractiveCard && !it.isRunning }
-        older.isNotEmpty() && older.all { it.turnIndex in collapsedTurnIndices }
+    val collapsedInOlderCount = remember(olderCollapsible, collapsedTurnIndices) {
+        olderCollapsible.count { it.turnIndex in collapsedTurnIndices }
     }
+    val turnRowState = rememberLazyListState()
+    LaunchedEffect(activeVisibleTurnIndex, turns.size) {
+        val targetPos = turns.indexOfFirst { it.turnIndex == activeVisibleTurnIndex }
+        if (targetPos >= 0) {
+            runCatching { turnRowState.animateScrollToItem(targetPos) }
+        }
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(HerdrColors.Surface.copy(alpha = 0.55f))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            .background(HerdrColors.Chrome.copy(alpha = 0.88f))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Text(
-            "共 ${turns.size} 轮",
-            style = HerdrType.Caption,
-            color = HerdrColors.Muted,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1
-        )
-        if (isRawMarkdownActive) {
-            Box(
+        if (showStreamToggle) {
+            val (pillBg, pillFg, modeLabel) = when {
+                !isRawMarkdownSupported && !lastError.isNullOrBlank() ->
+                    Triple(HerdrColors.BlockedSubtle, HerdrColors.Blocked, "⚠️ 重试")
+                !isRawMarkdownSupported ->
+                    Triple(HerdrColors.WorkingSubtle, HerdrColors.Working, "⏳ 旁路…")
+                isShowingRawMarkdown ->
+                    Triple(HerdrColors.DoneSubtle, HerdrColors.Done, "⚡ MD · ${turns.size}轮 ⇄")
+                else ->
+                    Triple(HerdrColors.AccentSubtle, HerdrColors.Accent, "🖥️ 屏幕 · 切MD")
+            }
+            Row(
                 modifier = Modifier
+                    .height(26.dp)
                     .clip(HerdrShapes.Pill)
-                    .background(HerdrColors.DoneSubtle)
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                    .background(pillBg)
+                    .combinedClickable(
+                        onClick = onToggleStreamSource,
+                        onLongClick = {
+                            val clipText = lastError?.takeIf { it.isNotBlank() } ?: sessionId
+                            if (clipText.isNotBlank()) onCopy(clipText)
+                        }
+                    )
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "MD",
-                    style = HerdrType.Caption.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
-                    color = HerdrColors.Done,
+                    text = modeLabel,
+                    style = HerdrType.Caption.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
+                    color = pillFg,
                     maxLines = 1
                 )
             }
         }
-        Row(
-            modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            turns.forEach { turn ->
-                val rawPrompt = turn.userPrompt?.text?.let { splitHcPrompt(it).second }?.trim().orEmpty()
-                val shortPrompt = if (rawPrompt.length > 8) rawPrompt.take(8) + "…" else rawPrompt
-                val pillLabel = if (shortPrompt.isNotEmpty()) "#${turn.turnIndex} $shortPrompt" else "#${turn.turnIndex}"
-                val isCurrent = turn.turnIndex == turns.last().turnIndex
-                Row(
+
+        if (turns.size >= 2) {
+            LazyRow(
+                state = turnRowState,
+                modifier = Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                itemsIndexed(
+                    items = turns,
+                    key = { _, t -> t.turnIndex }
+                ) { _, turn ->
+                    val rawPrompt = turn.userPrompt?.text?.let { splitHcPrompt(it).second }?.trim().orEmpty()
+                    val shortPrompt = if (rawPrompt.length > 7) rawPrompt.take(7) + "…" else rawPrompt
+                    val pillLabel = if (shortPrompt.isNotEmpty()) "#${turn.turnIndex} $shortPrompt" else "#${turn.turnIndex}"
+                    val isActive = turn.turnIndex == activeVisibleTurnIndex
+                    Row(
+                        modifier = Modifier
+                            .height(26.dp)
+                            .clip(HerdrShapes.Pill)
+                            .background(if (isActive) HerdrColors.AccentSubtle else HerdrColors.Raised)
+                            .clickable { onJumpToTurn(turn.turnIndex) }
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (turn.isRunning) {
+                            StatusDot(HerdrColors.Working, 5.dp, pulsing = true)
+                        } else if (turn.hasError) {
+                            StatusDot(HerdrColors.Blocked, 5.dp)
+                        }
+                        Text(
+                            text = pillLabel,
+                            style = HerdrType.Caption.copy(
+                                fontSize = 11.sp,
+                                fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal
+                            ),
+                            color = if (isActive) HerdrColors.Accent else HerdrColors.Foreground,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+            if (olderCollapsible.isNotEmpty()) {
+                Box(
                     modifier = Modifier
                         .height(26.dp)
                         .clip(HerdrShapes.Pill)
-                        .background(if (isCurrent) HerdrColors.AccentSubtle else HerdrColors.Raised)
-                        .clickable { onJumpToTurn(turn.turnIndex) }
+                        .background(HerdrColors.Raised)
+                        .clickable(onClick = onToggleCollapseOlder)
                         .padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    contentAlignment = Alignment.Center
                 ) {
-                    if (turn.isRunning) {
-                        StatusDot(HerdrColors.Working, 5.dp, pulsing = true)
-                    } else if (turn.hasError) {
-                        StatusDot(HerdrColors.Blocked, 5.dp)
-                    }
                     Text(
-                        text = pillLabel,
+                        text = if (collapsedInOlderCount > 0) "展开($collapsedInOlderCount)" else "折叠旧轮",
                         style = HerdrType.Caption.copy(fontSize = 11.sp),
-                        color = if (isCurrent) HerdrColors.Accent else HerdrColors.Foreground,
+                        color = HerdrColors.Accent,
+                        fontWeight = FontWeight.Medium,
                         maxLines = 1
                     )
                 }
             }
-        }
-        if (olderCollapsibleCount > 0) {
-            Box(
-                modifier = Modifier
-                    .height(26.dp)
-                    .clip(HerdrShapes.Pill)
-                    .background(HerdrColors.Raised)
-                    .clickable(onClick = onToggleCollapseOlder)
-                    .padding(horizontal = 9.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    if (allOlderCollapsed) "展开全部" else "折叠旧轮次",
-                    style = HerdrType.Caption.copy(fontSize = 11.sp),
-                    color = HerdrColors.Accent,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1
+        } else {
+            Spacer(Modifier.weight(1f))
+            val shortSession = remember(sessionId) {
+                sessionId.trim().takeIf { it.isNotEmpty() }?.take(8)
+            }
+            if (shortSession != null) {
+                Box(
+                    modifier = Modifier
+                        .clip(HerdrShapes.Small)
+                        .background(HerdrColors.Raised)
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = shortSession,
+                        style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontSize = 10.sp),
+                        color = HerdrColors.Dim,
+                        maxLines = 1
+                    )
+                }
+            }
+            if (!activeModel.isNullOrBlank()) {
+                OneLine(
+                    text = activeModel,
+                    style = HerdrType.Caption.copy(fontSize = 10.5.sp),
+                    color = HerdrColors.Muted,
+                    modifier = Modifier.widthIn(max = 150.dp)
                 )
             }
         }
@@ -2963,10 +3128,25 @@ private fun TurnSummaryCard(
 @Composable
 private fun LiveWorkingActivityCard(
     activity: LiveWorkingActivity,
-    elapsedSec: Int,
+    startedAtMs: Long,
     expandLabel: String,
     onExpand: () -> Unit
 ) {
+    var elapsedSec by remember(startedAtMs) {
+        mutableIntStateOf(
+            if (startedAtMs > 0L) ((android.os.SystemClock.elapsedRealtime() - startedAtMs) / 1000L).toInt().coerceAtLeast(0) else 0
+        )
+    }
+    LaunchedEffect(startedAtMs) {
+        if (startedAtMs <= 0L) {
+            elapsedSec = 0
+            return@LaunchedEffect
+        }
+        while (true) {
+            elapsedSec = ((android.os.SystemClock.elapsedRealtime() - startedAtMs) / 1000L).toInt().coerceAtLeast(0)
+            delay(1000)
+        }
+    }
     val timerText = activity.elapsedHint?.takeIf { it.isNotBlank() } ?: run {
         if (elapsedSec < 60) "${elapsedSec}s" else "${elapsedSec / 60}m ${elapsedSec % 60}s"
     }
@@ -3238,4 +3418,73 @@ private fun TurnChangedFilesFooter(
             )
         }
     }
+}
+
+private data class RenderedResponseSlice(
+    val subKey: String,
+    val block: TerminalSemanticBlock,
+    val isLastInTurn: Boolean = false
+)
+
+private fun sliceTurnResponseBlocks(responseBlocks: List<TerminalSemanticBlock>): List<RenderedResponseSlice> {
+    if (responseBlocks.isEmpty()) return emptyList()
+    val rawSlices = ArrayList<RenderedResponseSlice>(responseBlocks.size)
+    responseBlocks.forEachIndexed { bIdx, block ->
+        if (block is TerminalSemanticBlock.MarkdownDocumentBlock &&
+            (block.nodes.size > 4 || block.nodes.any { it is MarkdownBlockNode.CodeBlock || it is MarkdownBlockNode.TableBlock })
+        ) {
+            var sliceIdx = 0
+            val buf = ArrayList<MarkdownBlockNode>(4)
+            fun flushBuf() {
+                if (buf.isEmpty()) return
+                rawSlices.add(
+                    RenderedResponseSlice(
+                        subKey = "$bIdx#s${sliceIdx++}",
+                        block = TerminalSemanticBlock.MarkdownDocumentBlock(
+                            rawMarkdown = block.rawMarkdown,
+                            nodes = buf.toList()
+                        )
+                    )
+                )
+                buf.clear()
+            }
+            for (node in block.nodes) {
+                if (node is MarkdownBlockNode.CodeBlock || node is MarkdownBlockNode.TableBlock) {
+                    flushBuf()
+                    rawSlices.add(
+                        RenderedResponseSlice(
+                            subKey = "$bIdx#s${sliceIdx++}",
+                            block = TerminalSemanticBlock.MarkdownDocumentBlock(
+                                rawMarkdown = when (node) {
+                                    is MarkdownBlockNode.CodeBlock -> node.code
+                                    is MarkdownBlockNode.TableBlock -> block.rawMarkdown
+                                    else -> block.rawMarkdown
+                                },
+                                nodes = listOf(node)
+                            )
+                        )
+                    )
+                } else {
+                    buf.add(node)
+                    if (buf.size >= 4) flushBuf()
+                }
+            }
+            flushBuf()
+        } else {
+            rawSlices.add(RenderedResponseSlice(subKey = "$bIdx", block = block))
+        }
+    }
+    if (rawSlices.isNotEmpty()) {
+        val last = rawSlices.removeAt(rawSlices.lastIndex)
+        rawSlices.add(last.copy(isLastInTurn = true))
+    }
+    return rawSlices
+}
+
+private fun smartMiddleEllipsize(text: String, maxChars: Int = 44): String {
+    val clean = text.trim()
+    if (clean.length <= maxChars || maxChars < 16) return clean
+    val keepTail = minOf(22, maxChars / 2)
+    val keepHead = maxChars - keepTail - 1
+    return clean.take(keepHead).trimEnd() + "…" + clean.takeLast(keepTail).trimStart()
 }

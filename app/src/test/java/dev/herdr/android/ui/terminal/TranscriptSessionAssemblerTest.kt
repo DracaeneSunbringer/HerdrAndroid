@@ -7,7 +7,13 @@ import dev.herdr.android.protocol.TranscriptRawEvent
 import dev.herdr.android.protocol.TranscriptToolCallSummary
 import dev.herdr.android.ui.workbench.CodeHighlightPalette
 import dev.herdr.android.ui.workbench.CodeSyntaxHighlighter
+import dev.herdr.android.ui.workbench.DiffLineKind
+import dev.herdr.android.ui.workbench.HERDR_LINK_TAG
+import dev.herdr.android.ui.workbench.buildRichMarkdownAnnotatedString
+import dev.herdr.android.ui.workbench.parseUnifiedDiffLines
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -332,5 +338,118 @@ class TranscriptSessionAssemblerTest {
         assertTrue(diffOut.spanStyles.any { it.item.color == palette.diffHunkFg })
         assertTrue(diffOut.spanStyles.any { it.item.color == palette.diffDelFg })
         assertTrue(diffOut.spanStyles.any { it.item.color == palette.diffAddFg })
+    }
+
+    @Test
+    fun incrementalAssemblyReusesCompletedTurnsWithoutReparsing() {
+        val u1 = TranscriptRawEvent.UserMessage(lineByteOffset = 1000L, stepIndex = 2, text = "第一轮任务")
+        val a1 = TranscriptRawEvent.AssistantStep(
+            lineByteOffset = 1100L,
+            stepIndex = 3,
+            status = "DONE",
+            markdownContent = "### 第一轮完成\n\n```kotlin\nval one = 1\n```"
+        )
+        val u2 = TranscriptRawEvent.UserMessage(lineByteOffset = 1250L, stepIndex = 4, text = "第二轮任务")
+        val a2First = TranscriptRawEvent.AssistantStep(
+            lineByteOffset = 1350L,
+            stepIndex = 5,
+            status = "PENDING",
+            markdownContent = "正在处理"
+        )
+        val state1 = TerminalTranscriptUiState(
+            address = "t1q",
+            agentKind = TranscriptAgentKind.ANTIGRAVITY,
+            sessionId = "sess-1",
+            path = "/tmp/transcript.jsonl",
+            headOffset = 1000L,
+            tailOffset = 1450L,
+            events = listOf(u1, a1, u2, a2First)
+        )
+        val cache = IncrementalTranscriptAssemblyCache()
+        val (_, turns1) = TranscriptSessionAssembler.assembleIncremental(state1, isLatestRunning = true, cache = cache)
+        assertEquals(2, turns1.size)
+
+        // Append delta to Turn 2: Turn 1 instance MUST be reused verbatim (zero re-parse)
+        val a2Second = TranscriptRawEvent.AssistantStep(
+            lineByteOffset = 1500L,
+            stepIndex = 6,
+            status = "DONE",
+            markdownContent = "正在处理\n\n已完成全部优化"
+        )
+        val state2 = state1.copy(tailOffset = 1650L, events = listOf(u1, a1, u2, a2First, a2Second))
+        val (_, turns2) = TranscriptSessionAssembler.assembleIncremental(state2, isLatestRunning = false, cache = cache)
+        assertEquals(2, turns2.size)
+        assertSame(turns1[0], turns2[0])
+        assertSame(turns1[0].responseBlocks, turns2[0].responseBlocks)
+
+        // Prepend earlier Turn 0 (shifting turnIndex from 1 -> 2): Turn 1 responseBlocks STILL reused verbatim!
+        val u0 = TranscriptRawEvent.UserMessage(lineByteOffset = 0L, stepIndex = 0, text = "前置历史轮次")
+        val a0 = TranscriptRawEvent.AssistantStep(lineByteOffset = 100L, stepIndex = 1, status = "DONE", markdownContent = "历史结果")
+        val stateShifted = state2.copy(
+            headOffset = 0L,
+            events = listOf(u0, a0, u1, a1, u2, a2First, a2Second)
+        )
+        val (_, turns3) = TranscriptSessionAssembler.assembleIncremental(stateShifted, isLatestRunning = false, cache = cache)
+        assertEquals(3, turns3.size)
+        assertEquals(2, turns3[1].turnIndex)
+        assertSame(turns1[0].responseBlocks, turns3[1].responseBlocks)
+    }
+
+    @Test
+    fun recursiveInlineMarkdownHandlesCodeInsideBoldAndFileLinks() {
+        val codeBg = Color(0xFFEEEEEE)
+        val codeFg = Color(0xFF0055AA)
+        val linkFg = Color(0xFF0077CC)
+        val strikeFg = Color(0xFF888888)
+
+        val input = "已改造为 **SSHJ `SFTPClient` + Kotlin 本地解析**，详见 [RemoteTranscriptSidecar.kt](file:///D:/Code/RemoteTranscriptSidecar.kt#L179)。"
+        val out = buildRichMarkdownAnnotatedString(input, codeBg, codeFg, linkFg, strikeFg)
+        val rendered = out.text
+
+        assertFalse("Raw backticks must not appear: $rendered", rendered.contains('`'))
+        assertFalse("Raw asterisks must not appear: $rendered", rendered.contains("**"))
+        assertTrue(rendered.contains("SSHJ "))
+        assertTrue(rendered.contains("SFTPClient"))
+        assertTrue("File pill with line hint expected in: $rendered", rendered.contains("RemoteTranscriptSidecar.kt:179"))
+
+        val codeStart = rendered.indexOf("SFTPClient")
+        assertTrue(codeStart >= 0)
+        val stylesAtCode = out.spanStyles.filter { it.start <= codeStart && it.end >= codeStart + "SFTPClient".length }
+        assertTrue(stylesAtCode.any { it.item.fontWeight == FontWeight.SemiBold })
+        assertTrue(stylesAtCode.any { it.item.fontFamily == FontFamily.Monospace })
+
+        val links = out.getStringAnnotations(HERDR_LINK_TAG, 0, out.length)
+        assertEquals(1, links.size)
+        assertEquals("D:/Code/RemoteTranscriptSidecar.kt#L179", links.single().item)
+    }
+
+    @Test
+    fun unifiedDiffParserTracksLineNumbersAndIntraLineWordDiff() {
+        val diff = """
+            @@ -10,3 +10,3 @@ fun sync() {
+             val keep = true
+            -val timeout = 1500
+            +val timeout = 12000
+        """.trimIndent()
+
+        val parsed = parseUnifiedDiffLines(diff)
+        assertEquals(4, parsed.size)
+        assertEquals(DiffLineKind.HUNK, parsed[0].kind)
+
+        assertEquals(DiffLineKind.CONTEXT, parsed[1].kind)
+        assertEquals(10, parsed[1].oldLineNo)
+        assertEquals(10, parsed[1].newLineNo)
+
+        val delLine = parsed[2]
+        assertEquals(DiffLineKind.DEL, delLine.kind)
+        assertEquals(11, delLine.oldLineNo)
+        assertNull(delLine.newLineNo)
+        assertEquals("1500", delLine.code.substring(delLine.strongRange!!))
+
+        val addLine = parsed[3]
+        assertEquals(DiffLineKind.ADD, addLine.kind)
+        assertNull(addLine.oldLineNo)
+        assertEquals(11, addLine.newLineNo)
+        assertEquals("12000", addLine.code.substring(addLine.strongRange!!))
     }
 }

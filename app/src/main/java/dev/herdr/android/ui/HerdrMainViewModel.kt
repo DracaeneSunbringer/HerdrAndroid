@@ -11,6 +11,7 @@ import dev.herdr.android.connection.ConnectionState
 import dev.herdr.android.connection.HerdrConnectionController
 import dev.herdr.android.connection.HerdrConnectionControllerFactory
 import dev.herdr.android.connection.HostPlatform
+import dev.herdr.android.connection.RemoteTranscriptSidecar
 import dev.herdr.android.ui.terminal.AgyAgentMode
 import dev.herdr.android.ui.terminal.AgyBtwCardState
 import dev.herdr.android.ui.terminal.AgyBtwTurn
@@ -252,6 +253,7 @@ class HerdrMainViewModel(
     private val transcriptPendingResync = ConcurrentHashMap<String, Boolean>()
     private val transcriptPendingForce = ConcurrentHashMap<String, Boolean>()
     private val transcriptLocateRetryAtMs = ConcurrentHashMap<String, Long>()
+    private val transcriptBackfillJobs = ConcurrentHashMap<String, Job>()
 
     fun getCachedReaderBlocks(address: String): List<TerminalSemanticBlock> =
         readerHistoryByAddress[address].orEmpty()
@@ -342,6 +344,10 @@ class HerdrMainViewModel(
                 transcriptPendingResync.keys.retainAll(liveAddrs)
                 transcriptPendingForce.keys.retainAll(liveAddrs)
                 transcriptLocateRetryAtMs.keys.retainAll(liveAddrs)
+                val staleBackfillJobs = transcriptBackfillJobs.keys.filter { it !in liveAddrs }
+                for (deadAddr in staleBackfillJobs) {
+                    transcriptBackfillJobs.remove(deadAddr)?.cancel()
+                }
                 if (_transcriptStatesByAddress.value.keys.any { it !in liveAddrs }) {
                     _transcriptStatesByAddress.value = _transcriptStatesByAddress.value.filterKeys { it in liveAddrs }
                 }
@@ -1977,6 +1983,7 @@ class HerdrMainViewModel(
         if (trimmed.equals("/clear", ignoreCase = true) || trimmed.equals("/new", ignoreCase = true)) {
             readerHistoryByAddress.remove(session.address)
             transcriptLocateRetryAtMs.remove(session.address)
+            transcriptBackfillJobs.remove(session.address)?.cancel()
             _transcriptStatesByAddress.value = _transcriptStatesByAddress.value - session.address
         }
         lastDesiredAttachMode = AttachMode.TAKEOVER
@@ -2113,11 +2120,17 @@ class HerdrMainViewModel(
 
         val activeState = curState ?: return
         if (activeState.path.isBlank()) return
+        if (forceRelocate) {
+            transcriptBackfillJobs.remove(address)?.cancel()
+        }
 
+        val isInitialTail = activeState.tailOffset == 0L
         val chunk = controller.readTranscriptTail(
             agentKind = activeState.agentKind,
             path = activeState.path,
-            offset = activeState.tailOffset
+            offset = activeState.tailOffset,
+            windowBytes = if (isInitialTail) INITIAL_FIRST_PAINT_WINDOW_BYTES else RemoteTranscriptSidecar.DEFAULT_WINDOW_BYTES,
+            minInitialTurns = if (isInitialTail) 0 else RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
         ).getOrElse { err ->
             Log.w("HerdrTranscript", "tail($address) failed: ${err.message}", err)
             _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
@@ -2136,9 +2149,10 @@ class HerdrMainViewModel(
             mergeTranscriptEvents(prev.events, chunk.events)
         }
         if (isInitialRead || chunk.events.isNotEmpty()) {
+            val tag = if (isInitialRead) "firstPaint" else "tailed"
             Log.i(
                 "HerdrTranscript",
-                "tailed($address) -> +${chunk.events.size} events, total=${mergedEvents.size}, offset=${chunk.startOffset}..${chunk.nextOffset}"
+                "$tag($address) -> +${chunk.events.size} events, total=${mergedEvents.size}, offset=${chunk.startOffset}..${chunk.nextOffset}"
             )
         }
         val nextHead = when {
@@ -2163,6 +2177,86 @@ class HerdrMainViewModel(
             lastError = null
         )
         _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (address to updated)
+
+        if (isInitialRead &&
+            updated.hasEarlier &&
+            updated.headOffset > 0L &&
+            updated.events.count { it is TranscriptRawEvent.UserMessage } < RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
+        ) {
+            scheduleInitialTranscriptBackfill(
+                address = address,
+                sessionId = updated.sessionId,
+                path = updated.path
+            )
+        }
+    }
+
+    private fun scheduleInitialTranscriptBackfill(
+        address: String,
+        sessionId: String,
+        path: String
+    ) {
+        transcriptBackfillJobs.remove(address)?.cancel()
+        transcriptBackfillJobs[address] = viewModelScope.launch(Dispatchers.IO) {
+            val mutex = transcriptSyncMutexes[address]
+                ?: transcriptSyncMutexes.computeIfAbsent(address) { Mutex() }
+            var rounds = 0
+            while (rounds < 6 && isActive) {
+                if (controller.connectionState.value !is ConnectionState.Connected) break
+                val preCheck = _transcriptStatesByAddress.value[address] ?: break
+                if (preCheck.sessionId != sessionId ||
+                    preCheck.path != path ||
+                    !preCheck.hasEarlier ||
+                    preCheck.headOffset <= 0L ||
+                    preCheck.events.count { it is TranscriptRawEvent.UserMessage } >= RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
+                ) {
+                    break
+                }
+                rounds++
+                val progressed = mutex.withLock {
+                    val cur = _transcriptStatesByAddress.value[address] ?: return@withLock false
+                    if (cur.sessionId != sessionId ||
+                        cur.path != path ||
+                        !cur.hasEarlier ||
+                        cur.headOffset <= 0L ||
+                        cur.events.count { it is TranscriptRawEvent.UserMessage } >= RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
+                    ) {
+                        return@withLock false
+                    }
+                    val headChunk = controller.readTranscriptHead(
+                        agentKind = cur.agentKind,
+                        path = cur.path,
+                        beforeOffset = cur.headOffset,
+                        windowBytes = INITIAL_BACKFILL_STEP_BYTES
+                    ).getOrElse { err ->
+                        Log.w("HerdrTranscript", "backfill($address) failed: ${err.message}")
+                        return@withLock false
+                    }
+                    val latest = _transcriptStatesByAddress.value[address] ?: return@withLock false
+                    if (latest.sessionId != sessionId || latest.path != path) return@withLock false
+                    val merged = mergeTranscriptEvents(headChunk.events, latest.events)
+                    val nextHead = minOf(latest.headOffset, headChunk.startOffset)
+                    val stillHasEarlier = headChunk.hasEarlier && nextHead > 0L
+                    _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                        address to latest.copy(
+                            headOffset = nextHead,
+                            hasEarlier = stillHasEarlier,
+                            events = merged,
+                            activeModel = latest.activeModel ?: findLatestModel(merged)
+                        )
+                        )
+                    val userTurns = merged.count { it is TranscriptRawEvent.UserMessage }
+                    Log.i(
+                        "HerdrTranscript",
+                        "backfilled($address) -> total=${merged.size}, turns=$userTurns, headOffset=$nextHead"
+                    )
+                    stillHasEarlier && userTurns < RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
+                }
+                if (!progressed) break
+                // Yield briefly between 1 MB chunks so live tail updates can interleave cleanly.
+                delay(20)
+            }
+        }
     }
 
     fun loadEarlierTranscriptTurns(address: String) {
@@ -2572,5 +2666,10 @@ class HerdrMainViewModel(
                 node
             }
         }
+    }
+
+    companion object {
+        private const val INITIAL_FIRST_PAINT_WINDOW_BYTES: Long = 393_216L
+        private const val INITIAL_BACKFILL_STEP_BYTES: Long = 1_048_576L
     }
 }

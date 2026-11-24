@@ -226,6 +226,29 @@ class RemoteTranscriptSidecarTest {
                 sb.append("""{"step_index":${k * 2},"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\n第${k}轮消息 $pad\n</USER_REQUEST>"}""").append('\n')
             }
             bigLog.writeText(sb.toString(), StandardCharsets.UTF_8)
+            val bigFastLog = File(home, "fast_paint_transcript.jsonl")
+            val fastSb = StringBuilder()
+            val widePad = "y".repeat(3_500)
+            for (k in 0 until 32) {
+                fastSb.append("""{"step_index":${k * 2},"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\n第${k}轮消息 $widePad\n</USER_REQUEST>"}""").append('\n')
+            }
+            bigFastLog.writeText(fastSb.toString(), StandardCharsets.UTF_8)
+            val fastSftpPath = toTestSftpPath(bigFastLog)
+            val bigFastFirstPaint = sidecar.readTail(
+                TranscriptAgentKind.ANTIGRAVITY,
+                fastSftpPath,
+                0L,
+                windowBytes = 65_536L,
+                minInitialTurns = 0
+            )
+            val fastTurns = bigFastFirstPaint.events.count { it is TranscriptRawEvent.UserMessage }
+            assertTrue("Phase 1 fast first paint should return single window (< 24 turns), got $fastTurns", fastTurns in 1 until 24)
+            assertTrue(bigFastFirstPaint.hasEarlier)
+            assertTrue(bigFastFirstPaint.startOffset > 0L)
+
+            val bigFastBackfilled = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, fastSftpPath, 0L, windowBytes = 65_536L)
+            assertTrue(bigFastBackfilled.events.count { it is TranscriptRawEvent.UserMessage } >= 24)
+
             val bigSftpPath = toTestSftpPath(bigLog)
             val bigTail = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, bigSftpPath, 0L, windowBytes = 65_536L)
             assertTrue(bigTail.events.count { it is TranscriptRawEvent.UserMessage } >= 24)

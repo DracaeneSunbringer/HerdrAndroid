@@ -5,15 +5,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -32,10 +32,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -344,9 +348,8 @@ object CodeSyntaxHighlighter {
     }
 }
 
-private val richInlineTokenRegex = Regex(
-    """\[([^\]]+)]\(([^)\s]+)\)|`([^`\n]+)`|\*\*\*([^*\n]+)\*\*\*|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|(?<![*\w])\*([^*\s][^*\n]*?)\*(?![*\w])|(?<![_\w])_([^_\s][^_\n]*?)_(?![_\w])"""
-)
+internal const val HERDR_LINK_TAG = "HERDR_LINK"
+private val fileLineFragmentRegex = Regex("""^([^#]+)#L(\d+(?:-L?\d+)?)""", RegexOption.IGNORE_CASE)
 
 @Composable
 internal fun formatRichMarkdownInline(text: String): AnnotatedString {
@@ -371,78 +374,354 @@ internal fun buildRichMarkdownAnnotatedString(
     linkFg: Color,
     strikeFg: Color
 ): AnnotatedString = buildAnnotatedString {
-    var pos = 0
-    for (m in richInlineTokenRegex.findAll(text)) {
-        if (m.range.first > pos) {
-            append(text.substring(pos, m.range.first))
-        }
-        val linkLabelRaw = m.groups[1]?.value
-        val codeContent = m.groups[3]?.value
-        val boldItalic = m.groups[4]?.value
-        val bold = m.groups[5]?.value
-        val strike = m.groups[6]?.value
-        val italicStar = m.groups[7]?.value
-        val italicUnder = m.groups[8]?.value
+    appendInlineMarkdown(
+        builder = this,
+        text = text,
+        start = 0,
+        end = text.length,
+        codeBg = codeBg,
+        codeFg = codeFg,
+        linkFg = linkFg,
+        strikeFg = strikeFg,
+        depth = 0
+    )
+}
 
-        val start = length
-        when {
-            linkLabelRaw != null -> {
-                val isCode = linkLabelRaw.length >= 2 && linkLabelRaw.startsWith("`") && linkLabelRaw.endsWith("`")
-                val label = if (isCode) linkLabelRaw.substring(1, linkLabelRaw.length - 1) else linkLabelRaw
-                append(label)
-                addStyle(
-                    SpanStyle(
-                        fontFamily = if (isCode) FontFamily.Monospace else null,
-                        fontWeight = FontWeight.Medium,
-                        textDecoration = TextDecoration.Underline,
-                        color = linkFg
-                    ),
-                    start,
-                    length
-                )
-            }
-            codeContent != null -> {
-                append(" $codeContent ")
-                addStyle(
-                    SpanStyle(
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.5.sp,
-                        background = codeBg,
-                        color = codeFg
-                    ),
-                    start,
-                    length
-                )
-            }
-            boldItalic != null -> {
-                append(boldItalic)
-                addStyle(
-                    SpanStyle(fontWeight = FontWeight.SemiBold, fontStyle = FontStyle.Italic),
-                    start,
-                    length
-                )
-            }
-            bold != null -> {
-                append(bold)
-                addStyle(SpanStyle(fontWeight = FontWeight.SemiBold), start, length)
-            }
-            strike != null -> {
-                append(strike)
-                addStyle(
-                    SpanStyle(color = strikeFg, textDecoration = TextDecoration.LineThrough),
-                    start,
-                    length
-                )
-            }
-            italicStar != null || italicUnder != null -> {
-                append(italicStar ?: italicUnder.orEmpty())
-                addStyle(SpanStyle(fontStyle = FontStyle.Italic), start, length)
+private fun appendInlineMarkdown(
+    builder: AnnotatedString.Builder,
+    text: String,
+    start: Int,
+    end: Int,
+    codeBg: Color,
+    codeFg: Color,
+    linkFg: Color,
+    strikeFg: Color,
+    depth: Int
+) {
+    if (start >= end) return
+    if (depth >= 8) {
+        builder.append(text, start, end)
+        return
+    }
+    var i = start
+    while (i < end) {
+        val c = text[i]
+
+        // 1. Atomic inline code span (`...` / ``...``)
+        if (c == '`') {
+            val codeClose = findClosingBacktickRun(text, i, end)
+            if (codeClose != null) {
+                val (openEnd, closeStart, closeEnd) = codeClose
+                val rawCode = text.substring(openEnd, closeStart)
+                val cleanCode = if (openEnd - i > 1 && rawCode.length >= 2 && rawCode.startsWith(' ') && rawCode.endsWith(' ')) {
+                    rawCode.substring(1, rawCode.length - 1)
+                } else {
+                    rawCode
+                }
+                if (cleanCode.isNotEmpty() && '\n' !in cleanCode) {
+                    val spanStart = builder.length
+                    builder.append(" $cleanCode ")
+                    builder.addStyle(
+                        SpanStyle(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            background = codeBg,
+                            color = codeFg
+                        ),
+                        spanStart,
+                        builder.length
+                    )
+                    i = closeEnd
+                    continue
+                }
             }
         }
-        pos = m.range.last + 1
+
+        // 2. Markdown link `[label](url)` (with `file://` rendered as clickable file pills)
+        if (c == '[') {
+            val link = parseMarkdownLink(text, i, end)
+            if (link != null) {
+                val (labelStart, labelEnd, rawUrl, linkEnd) = link
+                val rawLabel = text.substring(labelStart, labelEnd)
+                if (rawUrl.startsWith("file://", ignoreCase = true)) {
+                    val decodedTarget = rawUrl.removePrefix("file:///").removePrefix("file://")
+                    val baseLabel = rawLabel.trim().removeSurrounding("`").ifBlank { decodedTarget }
+                    val fragMatch = fileLineFragmentRegex.find(decodedTarget)
+                    val lineSuffix = fragMatch?.groupValues?.get(2)?.replace("-L", "-")?.let { ":$it" }.orEmpty()
+                    val display = if (lineSuffix.isNotEmpty() && !baseLabel.contains(':') && !baseLabel.contains('#')) {
+                        "$baseLabel$lineSuffix"
+                    } else {
+                        baseLabel
+                    }
+                    builder.pushStringAnnotation(tag = HERDR_LINK_TAG, annotation = decodedTarget)
+                    val spanStart = builder.length
+                    builder.append(" 📄 $display ")
+                    builder.addStyle(
+                        SpanStyle(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            background = codeBg,
+                            color = linkFg
+                        ),
+                        spanStart,
+                        builder.length
+                    )
+                    builder.pop()
+                } else {
+                    builder.pushStringAnnotation(tag = HERDR_LINK_TAG, annotation = rawUrl)
+                    val spanStart = builder.length
+                    appendInlineMarkdown(builder, text, labelStart, labelEnd, codeBg, codeFg, linkFg, strikeFg, depth + 1)
+                    builder.addStyle(
+                        SpanStyle(
+                            fontWeight = FontWeight.Medium,
+                            textDecoration = TextDecoration.Underline,
+                            color = linkFg
+                        ),
+                        spanStart,
+                        builder.length
+                    )
+                    builder.pop()
+                }
+                i = linkEnd
+                continue
+            }
+        }
+
+        // 3. Bold + Italic `***...***`
+        if (c == '*' && i + 2 < end && text[i + 1] == '*' && text[i + 2] == '*') {
+            val close = findClosingMarker(text, i + 3, end, "***")
+            if (close > i + 3) {
+                val spanStart = builder.length
+                appendInlineMarkdown(builder, text, i + 3, close, codeBg, codeFg, linkFg, strikeFg, depth + 1)
+                builder.addStyle(
+                    SpanStyle(fontWeight = FontWeight.SemiBold, fontStyle = FontStyle.Italic),
+                    spanStart,
+                    builder.length
+                )
+                i = close + 3
+                continue
+            }
+        }
+
+        // 4. Bold `**...**` (supports nested `code` / *italic* / links!)
+        if (c == '*' && i + 1 < end && text[i + 1] == '*') {
+            val close = findClosingMarker(text, i + 2, end, "**")
+            if (close > i + 2) {
+                val spanStart = builder.length
+                appendInlineMarkdown(builder, text, i + 2, close, codeBg, codeFg, linkFg, strikeFg, depth + 1)
+                builder.addStyle(SpanStyle(fontWeight = FontWeight.SemiBold), spanStart, builder.length)
+                i = close + 2
+                continue
+            }
+        }
+
+        // 5. Strikethrough `~~...~~`
+        if (c == '~' && i + 1 < end && text[i + 1] == '~') {
+            val close = findClosingMarker(text, i + 2, end, "~~")
+            if (close > i + 2) {
+                val spanStart = builder.length
+                appendInlineMarkdown(builder, text, i + 2, close, codeBg, codeFg, linkFg, strikeFg, depth + 1)
+                builder.addStyle(
+                    SpanStyle(color = strikeFg, textDecoration = TextDecoration.LineThrough),
+                    spanStart,
+                    builder.length
+                )
+                i = close + 2
+                continue
+            }
+        }
+
+        // 6. Italic `*...*` or `_..._` (respecting identifier `_` boundaries)
+        if ((c == '*' || c == '_') && canOpenSingleEmph(text, i, start, end, c)) {
+            val close = findClosingSingleEmph(text, i + 1, end, c)
+            if (close > i + 1) {
+                val spanStart = builder.length
+                appendInlineMarkdown(builder, text, i + 1, close, codeBg, codeFg, linkFg, strikeFg, depth + 1)
+                builder.addStyle(SpanStyle(fontStyle = FontStyle.Italic), spanStart, builder.length)
+                i = close + 1
+                continue
+            }
+        }
+
+        builder.append(c)
+        i++
     }
-    if (pos < text.length) {
-        append(text.substring(pos))
+}
+
+private fun findClosingBacktickRun(text: String, openStart: Int, limit: Int): Triple<Int, Int, Int>? {
+    var openEnd = openStart
+    while (openEnd < limit && text[openEnd] == '`') openEnd++
+    val tickLen = openEnd - openStart
+    if (tickLen == 0) return null
+    var j = openEnd
+    while (j < limit) {
+        val ch = text[j]
+        if (ch == '\n') return null
+        if (ch == '`') {
+            var runEnd = j
+            while (runEnd < limit && text[runEnd] == '`') runEnd++
+            if (runEnd - j == tickLen) {
+                return Triple(openEnd, j, runEnd)
+            }
+            j = runEnd
+            continue
+        }
+        j++
+    }
+    return null
+}
+
+private data class ParsedInlineLink(
+    val labelStart: Int,
+    val labelEnd: Int,
+    val url: String,
+    val linkEnd: Int
+)
+
+private fun parseMarkdownLink(text: String, openBracket: Int, limit: Int): ParsedInlineLink? {
+    var j = openBracket + 1
+    while (j < limit) {
+        val ch = text[j]
+        if (ch == '\n') return null
+        if (ch == '`') {
+            val code = findClosingBacktickRun(text, j, limit)
+            if (code != null) {
+                j = code.third
+                continue
+            }
+        }
+        if (ch == ']') {
+            if (j + 1 >= limit || text[j + 1] != '(') return null
+            var u = j + 2
+            var parenDepth = 1
+            while (u < limit && parenDepth > 0) {
+                val uc = text[u]
+                if (uc == '\n' || uc.isWhitespace()) return null
+                when (uc) {
+                    '(' -> parenDepth++
+                    ')' -> parenDepth--
+                }
+                if (parenDepth == 0) {
+                    val url = text.substring(j + 2, u)
+                    if (url.isEmpty() || j <= openBracket + 1) return null
+                    return ParsedInlineLink(openBracket + 1, j, url, u + 1)
+                }
+                u++
+            }
+            return null
+        }
+        j++
+    }
+    return null
+}
+
+private fun findClosingMarker(text: String, from: Int, limit: Int, marker: String): Int {
+    var j = from
+    while (j + marker.length <= limit) {
+        val ch = text[j]
+        if (ch == '`') {
+            val code = findClosingBacktickRun(text, j, limit)
+            if (code != null) {
+                j = code.third
+                continue
+            }
+        }
+        if (text.regionMatches(j, marker, 0, marker.length)) {
+            if (j > from && !text[j - 1].isWhitespace()) return j
+        }
+        j++
+    }
+    return -1
+}
+
+private fun canOpenSingleEmph(text: String, pos: Int, boundStart: Int, boundEnd: Int, delim: Char): Boolean {
+    if (pos + 1 >= boundEnd) return false
+    val next = text[pos + 1]
+    if (next == delim || next.isWhitespace()) return false
+    if (delim == '_' && pos > boundStart && (text[pos - 1].isLetterOrDigit() || text[pos - 1] == '_')) return false
+    if (delim == '*' && pos > boundStart && (text[pos - 1].isLetterOrDigit())) return false
+    return true
+}
+
+private fun findClosingSingleEmph(text: String, from: Int, limit: Int, delim: Char): Int {
+    var j = from
+    while (j < limit) {
+        val ch = text[j]
+        if (ch == '\n') return -1
+        if (ch == '`') {
+            val code = findClosingBacktickRun(text, j, limit)
+            if (code != null) {
+                j = code.third
+                continue
+            }
+        }
+        if (ch == delim) {
+            // Skip double marker (`**` or `__`) if encountered inside
+            if (j + 1 < limit && text[j + 1] == delim) {
+                j += 2
+                continue
+            }
+            val validPrev = j > from && !text[j - 1].isWhitespace()
+            val validNext = if (delim == '_') {
+                j + 1 >= limit || (!text[j + 1].isLetterOrDigit() && text[j + 1] != '_')
+            } else {
+                j + 1 >= limit || !text[j + 1].isLetterOrDigit()
+            }
+            if (validPrev && validNext) return j
+        }
+        j++
+    }
+    return -1
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun RichInlineText(
+    text: String,
+    style: TextStyle,
+    color: Color,
+    copyFallback: String,
+    onCopy: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val annotated = formatRichMarkdownInline(text)
+    val hasLinks = remember(annotated) {
+        annotated.getStringAnnotations(HERDR_LINK_TAG, 0, annotated.length).isNotEmpty()
+    }
+    if (!hasLinks) {
+        Text(
+            text = annotated,
+            style = style,
+            color = color,
+            modifier = modifier.combinedClickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {},
+                onLongClick = { onCopy(copyFallback) }
+            )
+        )
+    } else {
+        var layoutResult by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
+        Text(
+            text = annotated,
+            style = style,
+            color = color,
+            onTextLayout = { layoutResult = it },
+            modifier = modifier.pointerInput(annotated, copyFallback) {
+                detectTapGestures(
+                    onLongPress = { onCopy(copyFallback) },
+                    onTap = { pos ->
+                        val layout = layoutResult ?: return@detectTapGestures
+                        val offset = layout.getOffsetForPosition(pos)
+                        val hit = annotated.getStringAnnotations(HERDR_LINK_TAG, offset, offset).firstOrNull()
+                        if (hit != null) {
+                            onCopy(hit.item)
+                        }
+                    }
+                )
+            }
+        )
     }
 }
 
@@ -494,18 +773,13 @@ internal fun MarkdownDocumentRenderer(
                     palette = palette,
                     onCopy = onCopy
                 )
-                is MarkdownBlockNode.Paragraph -> Text(
-                    text = formatRichMarkdownInline(node.text),
+                is MarkdownBlockNode.Paragraph -> RichInlineText(
+                    text = node.text,
                     style = HerdrType.Body.copy(lineHeight = 22.sp),
                     color = HerdrColors.Foreground,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .combinedClickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                            onClick = {},
-                            onLongClick = { onCopy(node.text) }
-                        )
+                    copyFallback = node.text,
+                    onCopy = onCopy,
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
         }
@@ -547,7 +821,6 @@ private fun rememberCodeHighlightPalette(): CodeHighlightPalette {
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HeadingNodeView(
     level: Int,
@@ -555,23 +828,18 @@ private fun HeadingNodeView(
     rawMarkdown: String,
     onCopy: (String) -> Unit
 ) {
-    val copyMod = Modifier
-        .fillMaxWidth()
-        .combinedClickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null,
-            onClick = {},
-            onLongClick = { onCopy(rawMarkdown) }
-        )
     when (level) {
         1 -> Column(
-            modifier = copyMod.padding(top = 6.dp),
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
             verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            Text(
-                text = formatRichMarkdownInline(text),
+            RichInlineText(
+                text = text,
                 style = HerdrType.Title.copy(fontSize = 19.sp, lineHeight = 25.sp, fontWeight = FontWeight.Bold),
-                color = HerdrColors.Foreground
+                color = HerdrColors.Foreground,
+                copyFallback = rawMarkdown,
+                onCopy = onCopy,
+                modifier = Modifier.fillMaxWidth()
             )
             Box(
                 modifier = Modifier
@@ -581,13 +849,16 @@ private fun HeadingNodeView(
             )
         }
         2 -> Column(
-            modifier = copyMod.padding(top = 5.dp),
+            modifier = Modifier.fillMaxWidth().padding(top = 5.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Text(
-                text = formatRichMarkdownInline(text),
+            RichInlineText(
+                text = text,
                 style = HerdrType.Heading.copy(fontSize = 17.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold),
-                color = HerdrColors.Foreground
+                color = HerdrColors.Foreground,
+                copyFallback = rawMarkdown,
+                onCopy = onCopy,
+                modifier = Modifier.fillMaxWidth()
             )
             Box(
                 modifier = Modifier
@@ -599,30 +870,35 @@ private fun HeadingNodeView(
         3 -> {
             val railColor = HerdrColors.Accent
             Box(
-                modifier = copyMod
+                modifier = Modifier
+                    .fillMaxWidth()
                     .padding(top = 4.dp)
                     .drawBehind {
                         drawRect(color = railColor, size = Size(3.dp.toPx(), size.height))
                     }
                     .padding(start = 10.dp)
             ) {
-                Text(
-                    text = formatRichMarkdownInline(text),
+                RichInlineText(
+                    text = text,
                     style = HerdrType.Heading.copy(fontSize = 15.5.sp, lineHeight = 21.sp, fontWeight = FontWeight.SemiBold),
-                    color = HerdrColors.Foreground
+                    color = HerdrColors.Foreground,
+                    copyFallback = rawMarkdown,
+                    onCopy = onCopy,
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
         }
-        else -> Text(
-            text = formatRichMarkdownInline(text),
+        else -> RichInlineText(
+            text = text,
             style = HerdrType.Label.copy(fontSize = 14.5.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold),
             color = HerdrColors.Accent,
-            modifier = copyMod.padding(top = 3.dp)
+            copyFallback = rawMarkdown,
+            onCopy = onCopy,
+            modifier = Modifier.fillMaxWidth().padding(top = 3.dp)
         )
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun QuoteNodeView(
     node: MarkdownBlockNode.QuoteBlock,
@@ -643,6 +919,7 @@ private fun QuoteNodeView(
         "NOTE" -> "ℹ️ 说明"
         else -> null
     }
+    val body = node.lines.joinToString("\n")
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -651,12 +928,6 @@ private fun QuoteNodeView(
             .drawBehind {
                 drawRect(color = barColor, size = Size(3.dp.toPx(), size.height))
             }
-            .combinedClickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = {},
-                onLongClick = { onCopy(node.lines.joinToString("\n").ifBlank { rawMarkdown }) }
-            )
             .padding(start = 13.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
@@ -668,18 +939,19 @@ private fun QuoteNodeView(
                 fontWeight = FontWeight.SemiBold
             )
         }
-        val body = node.lines.joinToString("\n")
         if (body.isNotBlank()) {
-            Text(
-                text = formatRichMarkdownInline(body),
+            RichInlineText(
+                text = body,
                 style = HerdrType.Body.copy(lineHeight = 21.sp),
-                color = HerdrColors.Foreground
+                color = HerdrColors.Foreground,
+                copyFallback = body.ifBlank { rawMarkdown },
+                onCopy = onCopy,
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ListNodeView(
     node: MarkdownBlockNode.ListBlock,
@@ -687,14 +959,7 @@ private fun ListNodeView(
     onCopy: (String) -> Unit
 ) {
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .combinedClickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = {},
-                onLongClick = { onCopy(rawMarkdown) }
-            ),
+        modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
         node.items.forEach { item ->
@@ -752,10 +1017,12 @@ private fun ListNodeView(
                         )
                     }
                 }
-                Text(
-                    text = formatRichMarkdownInline(item.text),
+                RichInlineText(
+                    text = item.text,
                     style = HerdrType.Body.copy(lineHeight = 21.sp),
                     color = if (item.checked == true) HerdrColors.Muted else HerdrColors.Foreground,
+                    copyFallback = rawMarkdown,
+                    onCopy = onCopy,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -772,21 +1039,28 @@ internal fun SyntaxHighlightedCodeCard(
     onCopy: (String) -> Unit
 ) {
     val lines = remember(code) { code.split('\n') }
+    val isCollapsible = lines.size > 28
+    var expanded by remember(stateKey) { mutableStateOf(false) }
+    val visibleCount = if (isCollapsible && !expanded) 18 else lines.size
+    val visibleCode = remember(code, visibleCount, lines.size) {
+        if (visibleCount >= lines.size) code else lines.take(visibleCount).joinToString("\n")
+    }
     var copied by remember(stateKey, code) { mutableStateOf(false) }
-    val highlighted = remember(code, language, palette) {
-        CodeSyntaxHighlighter.highlight(code = code, language = language, palette = palette)
+    val highlighted = remember(visibleCode, language, palette) {
+        CodeSyntaxHighlighter.highlight(code = visibleCode, language = language, palette = palette)
     }
-    val gutterText = remember(lines.size) {
-        (1..lines.size).joinToString("\n")
+    val gutterText = remember(visibleCount) {
+        (1..visibleCount).joinToString("\n")
     }
-    val gutterWidth = remember(lines.size) {
+    val gutterWidth = remember(visibleCount) {
         when {
-            lines.size >= 100 -> 34.dp
-            lines.size >= 10 -> 26.dp
-            else -> 20.dp
+            visibleCount >= 100 -> 36.dp
+            visibleCount >= 10 -> 28.dp
+            else -> 22.dp
         }
     }
     val displayLang = language.trim().ifBlank { "CODE" }.uppercase(Locale.ROOT)
+    val gutterBorderColor = HerdrColors.Border.copy(alpha = 0.45f)
 
     Column(
         modifier = Modifier
@@ -841,22 +1115,25 @@ internal fun SyntaxHighlightedCodeCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(IntrinsicSize.Min)
-                .padding(vertical = 8.dp)
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.Top
         ) {
             Text(
                 text = gutterText,
-                style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 17.sp, textAlign = TextAlign.End),
+                style = HerdrType.Mono.copy(fontSize = 11.5.sp, lineHeight = 17.sp, textAlign = TextAlign.End),
                 color = HerdrColors.Dim.copy(alpha = 0.7f),
+                softWrap = false,
                 modifier = Modifier
                     .width(gutterWidth)
-                    .padding(start = 6.dp, end = 6.dp)
-            )
-            Box(
-                modifier = Modifier
-                    .width(1.dp)
-                    .fillMaxHeight()
-                    .background(HerdrColors.Border.copy(alpha = 0.45f))
+                    .drawBehind {
+                        val stroke = 1.dp.toPx()
+                        drawRect(
+                            color = gutterBorderColor,
+                            topLeft = Offset(size.width - stroke, 0f),
+                            size = Size(stroke, size.height)
+                        )
+                    }
+                    .padding(start = 6.dp, end = 7.dp)
             )
             Box(
                 modifier = Modifier
@@ -872,7 +1149,141 @@ internal fun SyntaxHighlightedCodeCard(
                 )
             }
         }
+        if (isCollapsible) {
+            HerdrDivider()
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(HerdrColors.Raised.copy(alpha = 0.4f))
+                    .clickable { expanded = !expanded }
+                    .padding(vertical = 6.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (expanded) "收起代码预览 ▴" else "展开全部 ${lines.size} 行代码 ▾",
+                    style = HerdrType.Caption,
+                    color = HerdrColors.Accent,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
     }
+}
+
+internal enum class DiffLineKind { HUNK, ADD, DEL, CONTEXT, META }
+
+internal data class ParsedDiffLine(
+    val kind: DiffLineKind,
+    val oldLineNo: Int?,
+    val newLineNo: Int?,
+    val code: String,
+    val strongRange: IntRange? = null
+)
+
+private val diffHunkHeaderRegex = Regex("""^@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@.*$""")
+
+internal fun parseUnifiedDiffLines(diffText: String): List<ParsedDiffLine> {
+    val rawLines = diffText.replace("\r\n", "\n").replace('\r', '\n').split('\n')
+    val out = ArrayList<ParsedDiffLine>(rawLines.size)
+    var curOld: Int? = null
+    var curNew: Int? = null
+
+    for (raw in rawLines) {
+        when {
+            raw.startsWith("@@") -> {
+                val m = diffHunkHeaderRegex.find(raw)
+                if (m != null) {
+                    curOld = m.groupValues[1].toIntOrNull()
+                    curNew = m.groupValues[2].toIntOrNull()
+                }
+                out.add(ParsedDiffLine(DiffLineKind.HUNK, null, null, raw))
+            }
+            raw.startsWith("+++") || raw.startsWith("---") || raw.startsWith("diff ") || raw.startsWith("index ") -> {
+                out.add(ParsedDiffLine(DiffLineKind.META, null, null, raw))
+            }
+            raw.startsWith("…") -> {
+                out.add(ParsedDiffLine(DiffLineKind.META, null, null, raw))
+            }
+            raw.startsWith("+") -> {
+                val newNo = curNew
+                if (curNew != null) curNew = curNew + 1
+                out.add(ParsedDiffLine(DiffLineKind.ADD, null, newNo, raw.substring(1)))
+            }
+            raw.startsWith("-") -> {
+                val oldNo = curOld
+                if (curOld != null) curOld = curOld + 1
+                out.add(ParsedDiffLine(DiffLineKind.DEL, oldNo, null, raw.substring(1)))
+            }
+            raw.startsWith(" ") -> {
+                val oldNo = curOld
+                val newNo = curNew
+                if (curOld != null) curOld = curOld + 1
+                if (curNew != null) curNew = curNew + 1
+                out.add(ParsedDiffLine(DiffLineKind.CONTEXT, oldNo, newNo, raw.substring(1)))
+            }
+            else -> {
+                out.add(ParsedDiffLine(DiffLineKind.META, null, null, raw))
+            }
+        }
+    }
+
+    // Intra-line word/segment highlighting for contiguous DEL/ADD replacement runs of equal size.
+    var i = 0
+    while (i < out.size) {
+        if (out[i].kind != DiffLineKind.DEL) {
+            i++
+            continue
+        }
+        val delStart = i
+        while (i < out.size && out[i].kind == DiffLineKind.DEL) i++
+        val delCount = i - delStart
+
+        val addStart = i
+        while (i < out.size && out[i].kind == DiffLineKind.ADD) i++
+        val addCount = i - addStart
+
+        if (delCount == addCount && delCount in 1..8) {
+            for (k in 0 until delCount) {
+                val delCode = out[delStart + k].code
+                val addCode = out[addStart + k].code
+                var prefix = 0
+                while (prefix < delCode.length && prefix < addCode.length && delCode[prefix] == addCode[prefix]) {
+                    prefix++
+                }
+                var suffix = 0
+                while (delCode.length - suffix > prefix && addCode.length - suffix > prefix &&
+                    delCode[delCode.length - 1 - suffix] == addCode[addCode.length - 1 - suffix]
+                ) {
+                    suffix++
+                }
+                fun isWordChar(ch: Char): Boolean = ch.isLetterOrDigit() || ch == '_'
+                while (prefix > 0 && isWordChar(delCode[prefix - 1]) &&
+                    ((prefix < delCode.length && isWordChar(delCode[prefix])) ||
+                        (prefix < addCode.length && isWordChar(addCode[prefix])))
+                ) {
+                    prefix--
+                }
+                while (suffix > 0 && isWordChar(delCode[delCode.length - suffix]) &&
+                    ((delCode.length - suffix > prefix && isWordChar(delCode[delCode.length - suffix - 1])) ||
+                        (addCode.length - suffix > prefix && isWordChar(addCode[addCode.length - suffix - 1])))
+                ) {
+                    suffix--
+                }
+                val delEndIdx = delCode.length - suffix
+                val addEndIdx = addCode.length - suffix
+                if (prefix + suffix >= 2) {
+                    if (delEndIdx > prefix) {
+                        out[delStart + k] = out[delStart + k].copy(strongRange = prefix until delEndIdx)
+                    }
+                    if (addEndIdx > prefix) {
+                        out[addStart + k] = out[addStart + k].copy(strongRange = prefix until addEndIdx)
+                    }
+                }
+            }
+        }
+    }
+
+    return out
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -884,19 +1295,99 @@ internal fun InlineUnifiedDiffCard(
     onCopy: (String) -> Unit
 ) {
     val palette = rememberCodeHighlightPalette()
-    val (addCount, delCount, annotated) = remember(diffText, palette) {
+    val parsedAll = remember(diffText) { parseUnifiedDiffLines(diffText) }
+    val (addCount, delCount) = remember(parsedAll) {
         var adds = 0
         var dels = 0
-        for (line in diffText.lineSequence()) {
-            when {
-                line.startsWith("+++") || line.startsWith("---") -> Unit
-                line.startsWith("+") -> adds++
-                line.startsWith("-") -> dels++
+        for (ln in parsedAll) {
+            if (ln.kind == DiffLineKind.ADD) adds++
+            else if (ln.kind == DiffLineKind.DEL) dels++
+        }
+        adds to dels
+    }
+    val isCollapsible = parsedAll.size > 28
+    var expanded by remember(stateKey) { mutableStateOf(false) }
+    val visibleLines = remember(parsedAll, isCollapsible, expanded) {
+        if (!isCollapsible || expanded) parsedAll else parsedAll.take(20)
+    }
+
+    val maxDigits = remember(visibleLines) {
+        val maxNo = visibleLines.maxOfOrNull { maxOf(it.oldLineNo ?: 0, it.newLineNo ?: 0) } ?: 0
+        when {
+            maxNo >= 1000 -> 4
+            maxNo >= 100 -> 3
+            maxNo >= 10 -> 2
+            else -> 1
+        }
+    }
+    val gutterText = remember(visibleLines, maxDigits) {
+        visibleLines.joinToString("\n") { ln ->
+            when (ln.kind) {
+                DiffLineKind.HUNK -> "${"".padStart(maxDigits)} ${"".padStart(maxDigits)} ·"
+                DiffLineKind.META -> "${"".padStart(maxDigits)} ${"".padStart(maxDigits)}  "
+                DiffLineKind.ADD -> "${"".padStart(maxDigits)} ${(ln.newLineNo?.toString() ?: "").padStart(maxDigits)} +"
+                DiffLineKind.DEL -> "${(ln.oldLineNo?.toString() ?: "").padStart(maxDigits)} ${"".padStart(maxDigits)} -"
+                DiffLineKind.CONTEXT -> "${(ln.oldLineNo?.toString() ?: "").padStart(maxDigits)} ${(ln.newLineNo?.toString() ?: "").padStart(maxDigits)}  "
             }
         }
-        Triple(adds, dels, CodeSyntaxHighlighter.highlight(diffText, "diff", palette))
     }
+
+    val addStrongBg = HerdrColors.Done.copy(alpha = 0.28f)
+    val delStrongBg = HerdrColors.Blocked.copy(alpha = 0.28f)
+    val codeAnnotated = remember(visibleLines, palette, addStrongBg, delStrongBg) {
+        buildAnnotatedString {
+            visibleLines.forEachIndexed { idx, ln ->
+                val start = length
+                append(ln.code)
+                val end = length
+                when (ln.kind) {
+                    DiffLineKind.HUNK -> addStyle(
+                        SpanStyle(color = palette.diffHunkFg, fontWeight = FontWeight.SemiBold),
+                        start,
+                        end
+                    )
+                    DiffLineKind.META -> addStyle(
+                        SpanStyle(color = palette.diffMetaFg),
+                        start,
+                        end
+                    )
+                    DiffLineKind.ADD -> {
+                        addStyle(SpanStyle(color = palette.diffAddFg), start, end)
+                        val sr = ln.strongRange
+                        if (sr != null && sr.first >= 0 && sr.last < ln.code.length) {
+                            addStyle(
+                                SpanStyle(background = addStrongBg, fontWeight = FontWeight.SemiBold),
+                                start + sr.first,
+                                start + sr.last + 1
+                            )
+                        }
+                    }
+                    DiffLineKind.DEL -> {
+                        addStyle(SpanStyle(color = palette.diffDelFg), start, end)
+                        val sr = ln.strongRange
+                        if (sr != null && sr.first >= 0 && sr.last < ln.code.length) {
+                            addStyle(
+                                SpanStyle(background = delStrongBg, fontWeight = FontWeight.SemiBold),
+                                start + sr.first,
+                                start + sr.last + 1
+                            )
+                        }
+                    }
+                    DiffLineKind.CONTEXT -> Unit
+                }
+                if (idx < visibleLines.lastIndex) append('\n')
+            }
+        }
+    }
+
     var copied by remember(stateKey, diffText) { mutableStateOf(false) }
+    var gutterLayout by remember(visibleLines) { mutableStateOf<TextLayoutResult?>(null) }
+    var codeLayout by remember(visibleLines) { mutableStateOf<TextLayoutResult?>(null) }
+    val hunkTint = HerdrColors.AccentSubtle.copy(alpha = 0.45f)
+    val gutterBorder = HerdrColors.Border.copy(alpha = 0.45f)
+    val addBarColor = HerdrColors.Done
+    val delBarColor = HerdrColors.Blocked
+    val gutterWidth = remember(maxDigits) { ((maxDigits * 2 + 3) * 6.8f + 12f).dp }
 
     Column(
         modifier = Modifier
@@ -952,24 +1443,116 @@ internal fun InlineUnifiedDiffCard(
             )
         }
         HerdrDivider()
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .combinedClickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = {},
-                    onLongClick = { onCopy(diffText) }
-                )
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 8.dp, vertical = 6.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Top
         ) {
             Text(
-                text = annotated,
-                style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
-                color = HerdrColors.Muted,
-                softWrap = false
+                text = gutterText,
+                style = HerdrType.Mono.copy(fontSize = 10.5.sp, lineHeight = 16.5.sp),
+                color = HerdrColors.Dim.copy(alpha = 0.85f),
+                softWrap = false,
+                onTextLayout = { gutterLayout = it },
+                modifier = Modifier
+                    .width(gutterWidth)
+                    .background(HerdrColors.Surface.copy(alpha = 0.65f))
+                    .drawBehind {
+                        val layout = gutterLayout ?: return@drawBehind
+                        val lineTotal = minOf(layout.lineCount, visibleLines.size)
+                        val barW = 2.5.dp.toPx()
+                        for (i in 0 until lineTotal) {
+                            val ln = visibleLines[i]
+                            val top = layout.getLineTop(i)
+                            val bottom = layout.getLineBottom(i)
+                            when (ln.kind) {
+                                DiffLineKind.ADD -> {
+                                    drawRect(palette.diffAddBg, topLeft = Offset(0f, top), size = Size(size.width, bottom - top))
+                                    drawRect(addBarColor, topLeft = Offset(0f, top), size = Size(barW, bottom - top))
+                                }
+                                DiffLineKind.DEL -> {
+                                    drawRect(palette.diffDelBg, topLeft = Offset(0f, top), size = Size(size.width, bottom - top))
+                                    drawRect(delBarColor, topLeft = Offset(0f, top), size = Size(barW, bottom - top))
+                                }
+                                DiffLineKind.HUNK -> {
+                                    drawRect(hunkTint, topLeft = Offset(0f, top), size = Size(size.width, bottom - top))
+                                }
+                                DiffLineKind.CONTEXT, DiffLineKind.META -> Unit
+                            }
+                        }
+                        val stroke = 1.dp.toPx()
+                        drawRect(
+                            color = gutterBorder,
+                            topLeft = Offset(size.width - stroke, 0f),
+                            size = Size(stroke, size.height)
+                        )
+                    }
+                    .padding(horizontal = 6.dp, vertical = 6.dp)
             )
+            BoxWithConstraints(
+                modifier = Modifier
+                    .weight(1f)
+                    .combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {},
+                        onLongClick = { onCopy(diffText) }
+                    )
+            ) {
+                val minCodePaneWidth = maxWidth
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = codeAnnotated,
+                        style = HerdrType.Mono.copy(fontSize = 11.5.sp, lineHeight = 16.5.sp),
+                        color = HerdrColors.Foreground,
+                        softWrap = false,
+                        onTextLayout = { codeLayout = it },
+                        modifier = Modifier
+                            .widthIn(min = minCodePaneWidth)
+                            .drawBehind {
+                                val layout = codeLayout ?: return@drawBehind
+                                val lineTotal = minOf(layout.lineCount, visibleLines.size)
+                                for (i in 0 until lineTotal) {
+                                    val bg = when (visibleLines[i].kind) {
+                                        DiffLineKind.ADD -> palette.diffAddBg
+                                        DiffLineKind.DEL -> palette.diffDelBg
+                                        DiffLineKind.HUNK -> hunkTint
+                                        DiffLineKind.CONTEXT, DiffLineKind.META -> null
+                                    } ?: continue
+                                    val top = layout.getLineTop(i)
+                                    val bottom = layout.getLineBottom(i)
+                                    drawRect(
+                                        color = bg,
+                                        topLeft = Offset(0f, top),
+                                        size = Size(size.width, bottom - top)
+                                    )
+                                }
+                            }
+                            .padding(horizontal = 8.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+        if (isCollapsible) {
+            HerdrDivider()
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(HerdrColors.Surface)
+                    .clickable { expanded = !expanded }
+                    .padding(vertical = 5.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (expanded) "收起 Diff ▴" else "展开完整 Diff (${parsedAll.size} 行) ▾",
+                    style = HerdrType.Caption,
+                    color = HerdrColors.Accent,
+                    fontWeight = FontWeight.Medium
+                )
+            }
         }
     }
 }
