@@ -1511,4 +1511,44 @@ class StructuredTerminalReaderTest {
         """.trimIndent()
         assertFalse(StructuredTerminalReader.hasInteractiveDialogOnScreen(idleScreen, staleDoneSummary))
     }
+
+    @Test
+    fun liveWorkingActivityExcludesVoiceTipBarePromptAndCompletedToolHeaders() {
+        val workingScreen = """
+            > 这是素材
+              ▸ 📎 3 image(s) (363 KB) (ctrl+o to expand)
+
+            ○ Thought for 9m 3s (The provided images depict complete comic sheets.)
+            ● Ran (python -c "print('ok')")
+            ● Explored 3 files (diag_sheet_0.jpg, diag_sheet_1.jpg)
+            ● Used ExitPlanMode (Created At: 2026-11-24T15:25:09+08:00)
+            ⠋ Visual inspection of the light and dark borders confirms the halftone blush
+            └ Tip: Use /voice (or press f5) to record your prompt
+            ───────────────────────────────────────────────────────────────────────────
+            >
+            ───────────────────────────────────────────────────────────────────────────
+              ● [14:32:52] node "D:\luoyu\Documents\Code\watch.mjs" running
+            ───────────────────────────────────────────────────────────────────────────
+              esc to cancel                                  Gemini 4 Carbon · high · 1 task(s)
+        """.trimIndent()
+
+        val summary = TerminalSummary(
+            address = "t48",
+            agentApp = "antigravity",
+            agentStatus = AgentStateWord.WORKING,
+            turn = 29
+        )
+        val snap = StructuredTerminalReader.analyzeWorkbench(workingScreen, summary)
+        assertEquals(1, snap.turns.size)
+        val activity = snap.liveWorkingActivity
+        assertTrue("Expected liveWorkingActivity to be present", activity != null)
+        assertTrue(
+            "Expected live title to reflect active spinner, got: ${activity!!.title}",
+            activity.title.contains("Visual inspection")
+        )
+        assertTrue(
+            "Expected tailLines to exclude Tip / bare '>' / completed tool / daemon bar, got: ${activity.tailLines}",
+            activity.tailLines.isEmpty()
+        )
+    }
 }

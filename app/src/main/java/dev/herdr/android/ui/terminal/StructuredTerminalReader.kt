@@ -47,6 +47,7 @@ data class LiveWorkingActivity(
 
 data class ConversationTurn(
     val turnIndex: Int,
+    val stableId: String = "turn_$turnIndex",
     val userPrompt: TerminalSemanticBlock.UserPromptBlock?,
     val responseBlocks: List<TerminalSemanticBlock>,
     val toolOperationCount: Int = 0,
@@ -525,6 +526,7 @@ object StructuredTerminalReader {
             blocks = finalBlocks,
             liveStatus = status,
             rawTail = cleaned.rawTail,
+            cleanedLines = cleaned.lines,
             summary = summary
         )
         val actions = buildQuickActionsForStatus(
@@ -5068,6 +5070,7 @@ object StructuredTerminalReader {
         blocks: List<TerminalSemanticBlock>,
         liveStatus: AgentStateWord,
         rawTail: List<String>,
+        cleanedLines: List<String> = emptyList(),
         summary: TerminalSummary?
     ): Pair<List<ConversationTurn>, LiveWorkingActivity?> {
         val conversationBlocks = blocks.filterNot { it is TerminalSemanticBlock.SessionHeaderBlock }
@@ -5144,6 +5147,7 @@ object StructuredTerminalReader {
                 ?: ""
             return ConversationTurn(
                 turnIndex = idx,
+                stableId = "pty_$idx",
                 userPrompt = prompt,
                 responseBlocks = body,
                 toolOperationCount = toolOps,
@@ -5227,17 +5231,45 @@ object StructuredTerminalReader {
                 rawTitle
             }
 
-            val tailLines = lastToolBlock?.activeStepTailLines?.takeIf { it.isNotEmpty() }
-                ?: rawTail.asSequence()
-                    .map { it.trim() }
-                    .filter {
-                        it.isNotEmpty() &&
-                            !fullRuleRegex.matches(it) &&
-                            !containsCommonFooterMarker(it) &&
-                            it != tailSpinner
+            val tailLines = lastToolBlock?.takeIf { it.isRunning }?.activeStepTailLines
+                ?.filter { ln ->
+                    val t = ln.trim()
+                    t.isNotEmpty() &&
+                        !fullRuleRegex.matches(t) &&
+                        !lonePromptRegex.matches(t) &&
+                        !tipRegex.containsMatchIn(t) &&
+                        !containsCommonFooterMarker(t)
+                }
+                ?.takeIf { it.isNotEmpty() }
+                ?.takeLast(4)
+                ?: run {
+                    val afterBoundary = ArrayList<String>(4)
+                    for (k in cleanedLines.lastIndex downTo 0) {
+                        val trimmedLine = cleanedLines[k].trim()
+                        if (trimmedLine.isEmpty()) continue
+                        val isBoundary = genericPromptRegex.matches(trimmedLine) ||
+                            piClickToJumpPromptRegex.matches(trimmedLine) ||
+                            agyToolVerbRegex.matches(trimmedLine) ||
+                            thoughtRegex.matches(trimmedLine) ||
+                            piToolGroupHeaderRegex.matches(trimmedLine) ||
+                            piCheckToolRegex.matches(trimmedLine) ||
+                            proseLeadDotRegex.matches(trimmedLine) ||
+                            trimmedLine.startsWith("• ") ||
+                            trimmedLine.startsWith("▸ 📎") ||
+                            trimmedLine.startsWith("[📎")
+                        if (isBoundary) break
+                        if (trimmedLine != tailSpinner &&
+                            !fullRuleRegex.matches(trimmedLine) &&
+                            !lonePromptRegex.matches(trimmedLine) &&
+                            !tipRegex.containsMatchIn(trimmedLine) &&
+                            !containsCommonFooterMarker(trimmedLine)
+                        ) {
+                            afterBoundary.add(trimmedLine)
+                            if (afterBoundary.size >= 4) break
+                        }
                     }
-                    .toList()
-                    .takeLast(4)
+                    afterBoundary.asReversed()
+                }
 
             liveActivity = LiveWorkingActivity(
                 title = title,

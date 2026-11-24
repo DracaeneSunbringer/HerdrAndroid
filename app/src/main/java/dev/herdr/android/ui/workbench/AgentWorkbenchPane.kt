@@ -364,15 +364,33 @@ fun AgentWorkbenchPane(
         hasInitialSnapshot = true
     }
 
+    val syncAgentKind = remember(summary.agentApp, liveSnapshot.dialect) {
+        TranscriptAgentKind.fromAgentHint(summary.agentApp, liveSnapshot.dialect.name)
+    }
+
+    var firstTranscriptGateExpired by remember(session.address) { mutableStateOf(false) }
+    LaunchedEffect(session.address) {
+        firstTranscriptGateExpired = false
+        delay(1_800L)
+        firstTranscriptGateExpired = true
+    }
+
     val snapshot = if (preferRawMarkdown && fusedSnapshot.isRawMarkdownActive) {
         fusedSnapshot
     } else {
         liveSnapshot
     }
 
-    val syncAgentKind = remember(summary.agentApp, liveSnapshot.dialect) {
-        TranscriptAgentKind.fromAgentHint(summary.agentApp, liveSnapshot.dialect.name)
-    }
+    val isAwaitingFirstTranscriptPaint = readerMode &&
+        preferRawMarkdown &&
+        syncAgentKind != null &&
+        !fusedSnapshot.isRawMarkdownActive &&
+        !firstTranscriptGateExpired &&
+        transcriptState?.lastError == null &&
+        !(transcriptState?.locateAttempted == true && transcriptState.path.isBlank()) &&
+        liveSnapshot.blocks.none {
+            it is TerminalSemanticBlock.AskCardBlock || it is TerminalSemanticBlock.SessionHeaderBlock
+        }
     LaunchedEffect(
         session.address,
         syncAgentKind,
@@ -569,35 +587,50 @@ fun AgentWorkbenchPane(
     var followBottom by remember(session.address) { mutableStateOf(true) }
     var isProgrammaticScroll by remember(session.address) { mutableStateOf(false) }
     var lastProgrammaticTarget by remember(session.address) { mutableIntStateOf(0) }
-    var collapsedTurnIndices by remember(session.address) { mutableStateOf(emptySet<Int>()) }
+    var manualCollapsedTurnKeys by remember(session.address) { mutableStateOf(emptySet<String>()) }
     var userToggledCollapse by remember(session.address) { mutableStateOf(false) }
     var showTerminalSheet by remember(session.address) { mutableStateOf(false) }
     var showTurnSheet by remember(session.address) { mutableStateOf(false) }
 
     val sessionHeader = blocks.firstOrNull { it is TerminalSemanticBlock.SessionHeaderBlock }
         as? TerminalSemanticBlock.SessionHeaderBlock
-    val turns = snapshot.turns
+    val turns = if (isAwaitingFirstTranscriptPaint) emptyList() else snapshot.turns
     val hasCwdHeader = summary.cwd.isNotBlank()
-    val hasLoadEarlierBanner = transcriptState?.hasEarlier == true
+    val hasLoadEarlierBanner = !isAwaitingFirstTranscriptPaint && transcriptState?.hasEarlier == true
+    val isPartialTurnWindow = hasLoadEarlierBanner || !snapshot.isRawMarkdownActive
+    val turnNumberOffset = if (isPartialTurnWindow && summary.turn > turns.size) {
+        summary.turn - turns.size
+    } else {
+        0
+    }
+    val totalDisplayTurns = if (turns.isNotEmpty()) {
+        maxOf(summary.turn, turns.size + turnNumberOffset)
+    } else {
+        summary.turn
+    }
     val hasPendingReceiptItem = shouldShowPendingReceipt && dispatchedReceipt != null
-    val liveWorkingActivity = if (effectiveStatus == AgentStateWord.WORKING) {
+    val liveWorkingActivity = if (!isAwaitingFirstTranscriptPaint && effectiveStatus == AgentStateWord.WORKING) {
         snapshot.liveWorkingActivity
     } else {
         null
     }
 
-    LaunchedEffect(session.address, turns.size, userToggledCollapse) {
-        if (!userToggledCollapse && turns.size > 6) {
-            collapsedTurnIndices = turns.dropLast(4)
+    val collapsedTurnKeys = remember(turns, userToggledCollapse, manualCollapsedTurnKeys) {
+        if (userToggledCollapse) {
+            manualCollapsedTurnKeys
+        } else if (turns.size > 4) {
+            turns.dropLast(4)
                 .filter { !it.hasInteractiveCard && !it.isRunning }
-                .map { it.turnIndex }
+                .map { it.stableId }
                 .toSet()
+        } else {
+            emptySet()
         }
     }
 
-    val slicedByTurnIndex = remember(turns) {
+    val slicedByTurnKey = remember(turns) {
         turns.associate { turn ->
-            turn.turnIndex to sliceTurnResponseBlocks(turn.responseBlocks)
+            turn.stableId to sliceTurnResponseBlocks(turn.responseBlocks)
         }
     }
 
@@ -606,13 +639,13 @@ fun AgentWorkbenchPane(
         hasLoadEarlierBanner,
         sessionHeader,
         turns,
-        slicedByTurnIndex,
-        collapsedTurnIndices,
+        slicedByTurnKey,
+        collapsedTurnKeys,
         liveWorkingActivity,
         hasPendingReceiptItem,
         queuedPrompts.size
     ) {
-        val startMap = LinkedHashMap<Int, Int>(turns.size)
+        val startMap = LinkedHashMap<String, Int>(turns.size)
         var count = 0
         if (hasCwdHeader) count++
         if (hasLoadEarlierBanner) count++
@@ -622,8 +655,8 @@ fun AgentWorkbenchPane(
         } else {
             val showTurnHeaders = turns.size >= 2
             for (turn in turns) {
-                startMap[turn.turnIndex] = count
-                val isCollapsed = turn.turnIndex in collapsedTurnIndices &&
+                startMap[turn.stableId] = count
+                val isCollapsed = turn.stableId in collapsedTurnKeys &&
                     !turn.hasInteractiveCard &&
                     !turn.isRunning
                 if (isCollapsed) {
@@ -631,7 +664,7 @@ fun AgentWorkbenchPane(
                 } else {
                     if (showTurnHeaders) count += 1
                     if (turn.userPrompt != null) count += 1
-                    count += slicedByTurnIndex[turn.turnIndex]?.size ?: turn.responseBlocks.size
+                    count += slicedByTurnKey[turn.stableId]?.size ?: turn.responseBlocks.size
                 }
             }
         }
@@ -654,9 +687,10 @@ fun AgentWorkbenchPane(
                 readerListState.firstVisibleItemIndex
             }
             var matched = turns.first().turnIndex
-            for ((tIdx, startItemIdx) in turnStartItemIndices) {
+            for (turn in turns) {
+                val startItemIdx = turnStartItemIndices[turn.stableId] ?: continue
                 if (startItemIdx <= focalItemIdx) {
-                    matched = tIdx
+                    matched = turn.turnIndex
                 } else {
                     break
                 }
@@ -689,9 +723,56 @@ fun AgentWorkbenchPane(
             }
     }
 
-    LaunchedEffect(snapshot, hasInitialSnapshot, readerMode, readerAnchorIndex, dispatchedReceipt?.timestampMs) {
-        if (!readerMode || !hasInitialSnapshot || readerAnchorIndex < 0) return@LaunchedEffect
+    val tailTurn = turns.lastOrNull()
+    val tailSlices = tailTurn?.let { slicedByTurnKey[it.stableId] }.orEmpty()
+    val tailAutoScrollSignature = remember(
+        readerMode,
+        hasInitialSnapshot,
+        isAwaitingFirstTranscriptPaint,
+        tailTurn?.stableId,
+        tailTurn?.userPrompt?.text?.length,
+        tailSlices.size,
+        tailTurn?.answerPreview,
+        tailTurn?.toolOperationCount,
+        liveWorkingActivity != null,
+        liveWorkingActivity?.title,
+        liveWorkingActivity?.tailLines?.size,
+        hasPendingReceiptItem,
+        dispatchedReceipt?.timestampMs,
+        queuedPrompts.size
+    ) {
+        listOf(
+            readerMode,
+            hasInitialSnapshot,
+            isAwaitingFirstTranscriptPaint,
+            tailTurn?.stableId.orEmpty(),
+            tailTurn?.userPrompt?.text?.length ?: -1,
+            tailSlices.size,
+            tailTurn?.answerPreview.orEmpty(),
+            tailTurn?.toolOperationCount ?: 0,
+            liveWorkingActivity != null,
+            liveWorkingActivity?.title.orEmpty(),
+            liveWorkingActivity?.tailLines?.size ?: 0,
+            hasPendingReceiptItem,
+            dispatchedReceipt?.timestampMs ?: 0L,
+            queuedPrompts.size
+        )
+    }
+    LaunchedEffect(tailAutoScrollSignature) {
+        if (!readerMode || !hasInitialSnapshot || isAwaitingFirstTranscriptPaint || readerAnchorIndex <= 0) return@LaunchedEffect
         if (followBottom && !readerListState.isScrollInProgress) {
+            isProgrammaticScroll = true
+            try {
+                readerListState.scrollToItem(readerAnchorIndex)
+            } finally {
+                isProgrammaticScroll = false
+            }
+        }
+    }
+    // If initial firstPaint fit near the very top before backfill prepended older collapsed turns, keep bottom anchored.
+    LaunchedEffect(turns.size) {
+        if (!readerMode || !hasInitialSnapshot || isAwaitingFirstTranscriptPaint || readerAnchorIndex <= 0) return@LaunchedEffect
+        if (followBottom && !readerListState.isScrollInProgress && readerListState.firstVisibleItemIndex <= 2) {
             isProgrammaticScroll = true
             try {
                 readerListState.scrollToItem(readerAnchorIndex)
@@ -829,10 +910,8 @@ fun AgentWorkbenchPane(
                         val meta = buildList {
                             add(tone.label)
                             add(agentAppLabel(summary.agentApp))
-                            if (turns.isNotEmpty()) {
-                                add("${turns.size} 轮")
-                            } else if (summary.turn > 0) {
-                                add("${summary.turn} 轮")
+                            if (totalDisplayTurns > 0) {
+                                add("${totalDisplayTurns} 轮")
                             }
                         }.joinToString(" · ")
                         OneLine(meta, HerdrType.Caption.copy(fontSize = 11.5.sp), HerdrColors.Muted)
@@ -942,7 +1021,9 @@ fun AgentWorkbenchPane(
                             isShowingRawMarkdown = preferRawMarkdown && fusedSnapshot.isRawMarkdownActive,
                             turns = turns,
                             activeVisibleTurnIndex = visibleTurnIndex,
-                            collapsedTurnIndices = collapsedTurnIndices,
+                            turnNumberOffset = turnNumberOffset,
+                            totalDisplayTurns = totalDisplayTurns,
+                            collapsedTurnKeys = collapsedTurnKeys,
                             sessionId = transcriptState?.sessionId.orEmpty(),
                             activeModel = activeStreamModel,
                             lastError = transcriptState?.lastError,
@@ -959,10 +1040,10 @@ fun AgentWorkbenchPane(
                                 userToggledCollapse = true
                                 val older = turns.dropLast(1)
                                     .filter { !it.hasInteractiveCard && !it.isRunning }
-                                    .map { it.turnIndex }
+                                    .map { it.stableId }
                                     .toSet()
-                                val hasAnyCollapsed = older.any { it in collapsedTurnIndices }
-                                collapsedTurnIndices = if (hasAnyCollapsed) emptySet() else older
+                                val hasAnyCollapsed = older.any { it in collapsedTurnKeys }
+                                manualCollapsedTurnKeys = if (hasAnyCollapsed) emptySet() else older
                             }
                         )
                         HerdrDivider()
@@ -1000,12 +1081,16 @@ fun AgentWorkbenchPane(
                         }
                         if (turns.isEmpty()) {
                             item(key = "empty", contentType = "empty") {
-                                val emptyHint = summary.agentMessage?.takeIf { it.isNotBlank() }
-                                    ?: if (hasInitialSnapshot && rawScreen.isNotBlank()) {
-                                        if (isAgentTui) "终端已就绪，在下方输入首条指令" else "终端空闲"
-                                    } else {
-                                        "正在同步画面…"
-                                    }
+                                val emptyHint = if (isAwaitingFirstTranscriptPaint) {
+                                    "正在同步原生会话记录…"
+                                } else {
+                                    summary.agentMessage?.takeIf { it.isNotBlank() }
+                                        ?: if (hasInitialSnapshot && rawScreen.isNotBlank()) {
+                                            if (isAgentTui) "终端已就绪，在下方输入首条指令" else "终端空闲"
+                                        } else {
+                                            "正在同步画面…"
+                                        }
+                                }
                                 Text(
                                     emptyHint,
                                     style = HerdrType.Body,
@@ -1015,46 +1100,49 @@ fun AgentWorkbenchPane(
                         } else {
                             val showTurnHeaders = turns.size >= 2
                             turns.forEach { turn ->
-                                val isCollapsed = turn.turnIndex in collapsedTurnIndices &&
+                                val displayTurnNo = turn.turnIndex + turnNumberOffset
+                                val isCollapsed = turn.stableId in collapsedTurnKeys &&
                                     !turn.hasInteractiveCard &&
                                     !turn.isRunning
                                 if (isCollapsed) {
                                     item(
-                                        key = "${session.address}#turn_summary#${turn.turnIndex}",
+                                        key = "${session.address}#turn_summary#${turn.stableId}",
                                         contentType = "turn_summary"
                                     ) {
                                         TurnSummaryCard(
                                             turn = turn,
+                                            displayTurnNumber = displayTurnNo,
                                             onExpand = {
                                                 userToggledCollapse = true
-                                                collapsedTurnIndices = collapsedTurnIndices - turn.turnIndex
+                                                manualCollapsedTurnKeys = collapsedTurnKeys - turn.stableId
                                             }
                                         )
                                     }
                                 } else {
                                     if (showTurnHeaders) {
                                         item(
-                                            key = "${session.address}#turn_hdr#${turn.turnIndex}",
+                                            key = "${session.address}#turn_hdr#${turn.stableId}",
                                             contentType = "turn_header"
                                         ) {
                                             TurnDividerHeader(
                                                 turn = turn,
+                                                displayTurnNumber = displayTurnNo,
                                                 canCollapse = !turn.hasInteractiveCard && !turn.isRunning,
                                                 onCollapse = {
                                                     userToggledCollapse = true
-                                                    collapsedTurnIndices = collapsedTurnIndices + turn.turnIndex
+                                                    manualCollapsedTurnKeys = collapsedTurnKeys + turn.stableId
                                                 }
                                             )
                                         }
                                     }
                                     if (turn.userPrompt != null) {
                                         item(
-                                            key = "${session.address}#turn#${turn.turnIndex}#prompt",
+                                            key = "${session.address}#turn#${turn.stableId}#prompt",
                                             contentType = TerminalSemanticBlock.UserPromptBlock::class
                                         ) {
                                             ReaderBlock(
                                                 block = turn.userPrompt,
-                                                stateKey = "${session.address}#t${turn.turnIndex}#prompt",
+                                                stateKey = "${session.address}#t#${turn.stableId}#prompt",
                                                 isSequenceBusy = isSequenceBusy,
                                                 onSubmitAgyAskAnswer = onSubmitAgyAskAnswer,
                                                 onNavigateAgyAsk = onNavigateAgyAsk,
@@ -1062,10 +1150,10 @@ fun AgentWorkbenchPane(
                                             )
                                         }
                                     }
-                                    val slices = slicedByTurnIndex[turn.turnIndex].orEmpty()
+                                    val slices = slicedByTurnKey[turn.stableId].orEmpty()
                                     itemsIndexed(
                                         items = slices,
-                                        key = { _, slice -> "${session.address}#t${turn.turnIndex}#${slice.subKey}" },
+                                        key = { _, slice -> "${session.address}#t#${turn.stableId}#${slice.subKey}" },
                                         contentType = { _, slice -> slice.block::class }
                                     ) { _, slice ->
                                         val block = slice.block
@@ -1078,7 +1166,7 @@ fun AgentWorkbenchPane(
                                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                             ReaderBlock(
                                                 block = block,
-                                                stateKey = "${session.address}#t${turn.turnIndex}#${slice.subKey}",
+                                                stateKey = "${session.address}#t#${turn.stableId}#${slice.subKey}",
                                                 isSequenceBusy = isSequenceBusy,
                                                 stepOutputs = transcriptState?.stepOutputs.orEmpty(),
                                                 loadingSteps = transcriptState?.loadingSteps.orEmpty(),
@@ -1462,16 +1550,18 @@ fun AgentWorkbenchPane(
         visible = showTurnSheet,
         turns = turns,
         activeTurnIndex = visibleTurnIndex,
-        collapsedTurnIndices = collapsedTurnIndices,
+        turnNumberOffset = turnNumberOffset,
+        totalDisplayTurns = totalDisplayTurns,
+        collapsedTurnKeys = collapsedTurnKeys,
         hasLoadEarlier = hasLoadEarlierBanner,
         isLoadingEarlier = transcriptState?.isLoadingEarlier == true,
         onLoadEarlier = onLoadEarlierTranscript,
-        onJumpToTurn = { turnIdx ->
+        onJumpToTurn = { targetTurn ->
             showTurnSheet = false
             userToggledCollapse = true
-            collapsedTurnIndices = collapsedTurnIndices - turnIdx
-            val targetItem = turnStartItemIndices[turnIdx] ?: 0
-            followBottom = turnIdx == turns.lastOrNull()?.turnIndex
+            manualCollapsedTurnKeys = collapsedTurnKeys - targetTurn.stableId
+            val targetItem = turnStartItemIndices[targetTurn.stableId] ?: 0
+            followBottom = targetTurn.stableId == turns.lastOrNull()?.stableId
             scope.launch {
                 isProgrammaticScroll = true
                 try {
@@ -1489,10 +1579,10 @@ fun AgentWorkbenchPane(
             userToggledCollapse = true
             val older = turns.dropLast(1)
                 .filter { !it.hasInteractiveCard && !it.isRunning }
-                .map { it.turnIndex }
+                .map { it.stableId }
                 .toSet()
-            val hasAnyCollapsed = older.any { it in collapsedTurnIndices }
-            collapsedTurnIndices = if (hasAnyCollapsed) emptySet() else older
+            val hasAnyCollapsed = older.any { it in collapsedTurnKeys }
+            manualCollapsedTurnKeys = if (hasAnyCollapsed) emptySet() else older
         },
         onDismiss = { showTurnSheet = false }
     )
@@ -2406,10 +2496,11 @@ private fun ReaderBlock(
                 var copiedCode by remember(stateKey, block.content) { mutableStateOf(false) }
                 val isDiffBlock = block.kindLabel == "Diff" ||
                     lines.any { l -> l.startsWith("@@ ") || l.startsWith("diff --git ") }
-                val addBg = HerdrColors.DoneSubtle.copy(alpha = 0.7f)
-                val delBg = HerdrColors.BlockedSubtle.copy(alpha = 0.7f)
-                val addFg = HerdrColors.Done
-                val delFg = HerdrColors.Blocked
+                val isLightDiff = HerdrColors.IsLight
+                val addBg = if (isLightDiff) Color(0xFFECFDF3) else Color(0xFF14532D).copy(alpha = 0.34f)
+                val delBg = if (isLightDiff) Color(0xFFFEF2F2) else Color(0xFF7F1D1D).copy(alpha = 0.34f)
+                val addFg = if (isLightDiff) Color(0xFF166534) else Color(0xFF86EFAC)
+                val delFg = if (isLightDiff) Color(0xFF991B1B) else Color(0xFFFCA5A5)
                 val metaFg = HerdrColors.Accent
                 Column(
                     modifier = Modifier
@@ -2615,6 +2706,8 @@ private fun ToolGroupCard(
     }
     val primaryLabel = block.actionBreakdownLabel ?: block.summaryLabel
     val isAlertTone = block.hasError || block.isRunning
+    val diffGreen = if (HerdrColors.IsLight) Color(0xFF16A34A) else Color(0xFF4ADE80)
+    val diffGreenSubtle = if (HerdrColors.IsLight) Color(0xFFDCFCE7) else Color(0xFF14532D).copy(alpha = 0.38f)
     val pillBg = when {
         block.hasError -> HerdrColors.BlockedSubtle
         block.isRunning -> HerdrColors.WorkingSubtle
@@ -2674,7 +2767,7 @@ private fun ToolGroupCard(
                 Row(
                     modifier = Modifier
                         .clip(HerdrShapes.Small)
-                        .background(if (expanded && allDiffsShown) HerdrColors.AccentSubtle else HerdrColors.DoneSubtle)
+                        .background(if (expanded && allDiffsShown) HerdrColors.AccentSubtle else diffGreenSubtle)
                         .clickable {
                             expanded = true
                             expandedDiffStepIndices = if (allDiffsShown) emptySet() else diffIndices.toSet()
@@ -2686,13 +2779,13 @@ private fun ToolGroupCard(
                     Icon(
                         imageVector = HerdrIcons.GitDiff,
                         contentDescription = null,
-                        tint = if (expanded && allDiffsShown) HerdrColors.Accent else HerdrColors.Done,
+                        tint = if (expanded && allDiffsShown) HerdrColors.Accent else diffGreen,
                         modifier = Modifier.size(10.dp)
                     )
                     Text(
                         "${diffIndices.size} Diff",
                         style = HerdrType.Caption.copy(fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold),
-                        color = if (expanded && allDiffsShown) HerdrColors.Accent else HerdrColors.Done,
+                        color = if (expanded && allDiffsShown) HerdrColors.Accent else diffGreen,
                         maxLines = 1
                     )
                 }
@@ -2776,7 +2869,7 @@ private fun ToolGroupCard(
                             Text(
                                 "Diff",
                                 style = HerdrType.Caption.copy(fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold),
-                                color = HerdrColors.Done,
+                                color = diffGreen,
                                 maxLines = 1
                             )
                         }
@@ -2865,7 +2958,7 @@ private fun ToolGroupCard(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
                                     val (tagBg, tagFg) = when (entry.category) {
-                                        ToolActionCategory.EDIT -> HerdrColors.DoneSubtle to HerdrColors.Done
+                                        ToolActionCategory.EDIT -> diffGreenSubtle to diffGreen
                                         ToolActionCategory.COMMAND -> HerdrColors.AccentSubtle to HerdrColors.Accent
                                         else -> HerdrColors.Raised to HerdrColors.Dim
                                     }
@@ -2895,7 +2988,7 @@ private fun ToolGroupCard(
                                         Text(
                                             text = if (isDiffOpen) "收起 ▴" else "Diff ▾",
                                             style = HerdrType.Caption.copy(fontSize = 10.5.sp),
-                                            color = HerdrColors.Done,
+                                            color = diffGreen,
                                             fontWeight = FontWeight.Medium,
                                             softWrap = false,
                                             maxLines = 1,
@@ -2942,7 +3035,11 @@ private fun ToolGroupCard(
                                         )
                                     }
                                 }
-                                if (entry.detailLines.isNotEmpty()) {
+                                val hideRedundantDiffCount = !entry.diffPreview.isNullOrBlank() &&
+                                    entryIdx in expandedDiffStepIndices &&
+                                    entry.detailLines.size == 1 &&
+                                    entry.detailLines[0].trim().endsWith("行")
+                                if (entry.detailLines.isNotEmpty() && !hideRedundantDiffCount) {
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -3050,7 +3147,9 @@ private fun WorkbenchContextNavStrip(
     isShowingRawMarkdown: Boolean,
     turns: List<ConversationTurn>,
     activeVisibleTurnIndex: Int,
-    collapsedTurnIndices: Set<Int>,
+    turnNumberOffset: Int,
+    totalDisplayTurns: Int,
+    collapsedTurnKeys: Set<String>,
     sessionId: String,
     activeModel: String?,
     lastError: String?,
@@ -3062,8 +3161,8 @@ private fun WorkbenchContextNavStrip(
     val olderCollapsible = remember(turns) {
         turns.dropLast(1).filter { !it.hasInteractiveCard && !it.isRunning }
     }
-    val collapsedInOlderCount = remember(olderCollapsible, collapsedTurnIndices) {
-        olderCollapsible.count { it.turnIndex in collapsedTurnIndices }
+    val collapsedInOlderCount = remember(olderCollapsible, collapsedTurnKeys) {
+        olderCollapsible.count { it.stableId in collapsedTurnKeys }
     }
     val activeTurn = remember(turns, activeVisibleTurnIndex) {
         turns.firstOrNull { it.turnIndex == activeVisibleTurnIndex } ?: turns.lastOrNull()
@@ -3136,7 +3235,7 @@ private fun WorkbenchContextNavStrip(
                     modifier = Modifier.size(13.dp)
                 )
                 Text(
-                    text = "第 $activeVisibleTurnIndex/${turns.size} 轮",
+                    text = "第 ${activeVisibleTurnIndex.coerceIn(1, turns.size.coerceAtLeast(1)) + turnNumberOffset}/$totalDisplayTurns 轮",
                     style = HerdrType.Caption.copy(fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold),
                     color = HerdrColors.Foreground,
                     maxLines = 1,
@@ -3187,7 +3286,7 @@ private fun WorkbenchContextNavStrip(
                     modifier = Modifier.size(13.dp)
                 )
                 Text(
-                    text = if (collapsedInOlderCount > 0) "展开($collapsedInOlderCount)" else "收起旧轮",
+                    text = if (collapsedInOlderCount > 0) "展开旧轮" else "收起旧轮",
                     style = HerdrType.Caption.copy(fontSize = 11.sp, fontWeight = FontWeight.Medium),
                     color = HerdrColors.Muted,
                     maxLines = 1,
@@ -3201,6 +3300,7 @@ private fun WorkbenchContextNavStrip(
 @Composable
 private fun TurnDividerHeader(
     turn: ConversationTurn,
+    displayTurnNumber: Int,
     canCollapse: Boolean,
     onCollapse: () -> Unit
 ) {
@@ -3218,7 +3318,7 @@ private fun TurnDividerHeader(
                 .padding(horizontal = 8.dp, vertical = 2.dp)
         ) {
             Text(
-                "第 ${turn.turnIndex} 轮",
+                "第 $displayTurnNumber 轮",
                 style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold),
                 color = HerdrColors.Muted
             )
@@ -3252,6 +3352,7 @@ private fun TurnDividerHeader(
 @Composable
 private fun TurnSummaryCard(
     turn: ConversationTurn,
+    displayTurnNumber: Int,
     onExpand: () -> Unit
 ) {
     val promptText = turn.userPrompt?.text?.let { splitHcPrompt(it).second }?.trim().orEmpty()
@@ -3277,7 +3378,7 @@ private fun TurnSummaryCard(
                     .padding(horizontal = 7.dp, vertical = 2.dp)
             ) {
                 Text(
-                    "#${turn.turnIndex}",
+                    "#$displayTurnNumber",
                     style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
                     color = HerdrColors.Accent
                 )
@@ -3777,11 +3878,13 @@ private fun TurnDirectorySheet(
     visible: Boolean,
     turns: List<ConversationTurn>,
     activeTurnIndex: Int,
-    collapsedTurnIndices: Set<Int>,
+    turnNumberOffset: Int,
+    totalDisplayTurns: Int,
+    collapsedTurnKeys: Set<String>,
     hasLoadEarlier: Boolean,
     isLoadingEarlier: Boolean,
     onLoadEarlier: () -> Unit,
-    onJumpToTurn: (Int) -> Unit,
+    onJumpToTurn: (ConversationTurn) -> Unit,
     onToggleCollapseOlder: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -3790,8 +3893,8 @@ private fun TurnDirectorySheet(
     val olderCollapsible = remember(turns) {
         turns.dropLast(1).filter { !it.hasInteractiveCard && !it.isRunning }
     }
-    val collapsedInOlderCount = remember(olderCollapsible, collapsedTurnIndices) {
-        olderCollapsible.count { it.turnIndex in collapsedTurnIndices }
+    val collapsedInOlderCount = remember(olderCollapsible, collapsedTurnKeys) {
+        olderCollapsible.count { it.stableId in collapsedTurnKeys }
     }
     val initialIdx = remember(turns, activeTurnIndex) {
         (turns.indexOfFirst { it.turnIndex == activeTurnIndex }.coerceAtLeast(0) - 2).coerceAtLeast(0)
@@ -3836,7 +3939,11 @@ private fun TurnDirectorySheet(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "会话轮次目录 (${turns.size})",
+                    text = if (turnNumberOffset > 0) {
+                        "会话轮次目录 (近 ${turns.size} / 共 $totalDisplayTurns 轮)"
+                    } else {
+                        "会话轮次目录 (${turns.size})"
+                    },
                     style = HerdrType.Heading,
                     color = HerdrColors.Foreground,
                     modifier = Modifier.weight(1f)
@@ -3886,10 +3993,11 @@ private fun TurnDirectorySheet(
             ) {
                 itemsIndexed(
                     items = turns,
-                    key = { _, t -> t.turnIndex }
+                    key = { _, t -> t.stableId }
                 ) { _, turn ->
+                    val displayTurnNo = turn.turnIndex + turnNumberOffset
                     val isActive = turn.turnIndex == activeTurnIndex
-                    val isCollapsed = turn.turnIndex in collapsedTurnIndices && !turn.hasInteractiveCard && !turn.isRunning
+                    val isCollapsed = turn.stableId in collapsedTurnKeys && !turn.hasInteractiveCard && !turn.isRunning
                     val promptPreview = remember(turn.userPrompt?.text) {
                         turn.userPrompt?.text?.let { splitHcPrompt(it).second }?.trim()?.replace('\n', ' ').orEmpty()
                     }
@@ -3904,7 +4012,7 @@ private fun TurnDirectorySheet(
                                 if (isActive) HerdrColors.Accent.copy(alpha = 0.35f) else HerdrColors.Border.copy(alpha = 0.75f),
                                 rowShape
                             )
-                            .clickable { onJumpToTurn(turn.turnIndex) }
+                            .clickable { onJumpToTurn(turn) }
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -3916,7 +4024,7 @@ private fun TurnDirectorySheet(
                                 .padding(horizontal = 7.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = "#${turn.turnIndex}",
+                                text = "#$displayTurnNo",
                                 style = HerdrType.Mono.copy(fontSize = 11.sp, fontWeight = FontWeight.Bold),
                                 color = if (isActive) HerdrColors.Accent else HerdrColors.Muted
                             )
@@ -3928,7 +4036,7 @@ private fun TurnDirectorySheet(
                         }
                         Column(modifier = Modifier.weight(1f)) {
                             OneLine(
-                                text = promptPreview.ifBlank { turn.answerPreview.ifBlank { "第 ${turn.turnIndex} 轮" } },
+                                text = promptPreview.ifBlank { turn.answerPreview.ifBlank { "第 $displayTurnNo 轮" } },
                                 style = HerdrType.Label.copy(
                                     fontSize = 12.5.sp,
                                     fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Medium

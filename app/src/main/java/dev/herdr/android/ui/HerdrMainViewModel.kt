@@ -1293,9 +1293,16 @@ class HerdrMainViewModel(
         staleBackfills.forEach { addr -> transcriptBackfillJobs.remove(addr)?.cancel() }
         sessionJob?.cancel()
         lastDesiredAttachMode = initialMode
+        _activeTerminalSummary.value = summary
+        if (TranscriptAgentKind.fromAgentHint(summary.agentApp) != null) {
+            syncTerminalTranscript(
+                address = summary.address,
+                dialectHint = StructuredTerminalReader.detectDialect(summary.agentApp),
+                forceRelocate = false
+            )
+        }
         sessionJob = HerdrKeepAliveCoordinator.processScope.launch {
             runCatching { _activeSession.value?.detach() }
-            _activeTerminalSummary.value = summary
             if (summary.cols > 88) {
                 rememberDesktopDimensions(summary.address, summary.cols, summary.rows)
             }
@@ -2075,10 +2082,16 @@ class HerdrMainViewModel(
             if (!forceRelocate && !needsUpgradeLocate && curState?.locateAttempted == true && nowMs - lastMissMs < 1_500L) {
                 return
             }
-            val detail = controller.getTerminalDetail(address).getOrNull()
-                ?: controller.terminals.value.firstOrNull { it.address == address }
+            val cachedSummary = controller.terminals.value.firstOrNull { it.address == address }
                 ?: _activeTerminalSummary.value?.takeIf { it.address == address }
-                ?: return
+            val detail = if (cachedSummary != null &&
+                cachedSummary.cwd.isNotBlank() &&
+                (cachedSummary.rootPid != null || cachedSummary.foregroundPid != null || agentKind != TranscriptAgentKind.CLAUDE)
+            ) {
+                cachedSummary
+            } else {
+                controller.getTerminalDetail(address).getOrNull() ?: cachedSummary ?: return
+            }
             val detailNormCwd = detail.cwd.trim().replace('\\', '/').trimEnd('/').lowercase()
             val siblingsCount = if (detailNormCwd.isEmpty()) 1 else controller.terminals.value.count {
                 it.state == "live" && it.cwd.trim().replace('\\', '/').trimEnd('/').lowercase() == detailNormCwd
@@ -2092,7 +2105,7 @@ class HerdrMainViewModel(
                 ?.screenSnapshot
                 ?.value
                 ?.takeIf { it.isNotBlank() }
-                ?: controller.readTerminalPreview(address).getOrNull()
+                ?: if (siblingsCount > 1 || forceRelocate) controller.readTerminalPreview(address).getOrNull() else null
             val hints = StructuredTerminalReader.extractLocateHints(
                 rawScreen = liveScreen,
                 summary = detail,
@@ -2244,63 +2257,64 @@ class HerdrMainViewModel(
     ) {
         transcriptBackfillJobs.remove(address)?.cancel()
         transcriptBackfillJobs[address] = viewModelScope.launch(Dispatchers.IO) {
+            val startState = _transcriptStatesByAddress.value[address] ?: return@launch
+            if (startState.sessionId != sessionId ||
+                startState.path != path ||
+                !startState.hasEarlier ||
+                startState.headOffset <= 0L
+            ) {
+                return@launch
+            }
             val mutex = transcriptSyncMutexes[address]
                 ?: transcriptSyncMutexes.computeIfAbsent(address) { Mutex() }
+            val initialTurns = startState.events.count { it is TranscriptRawEvent.UserMessage }
+            var headCursor = startState.headOffset
+            var stillHasEarlier = startState.hasEarlier
+            var accHeadEvents = emptyList<TranscriptRawEvent>()
             var rounds = 0
-            while (rounds < 6 && isActive) {
+
+            while (rounds < 6 && isActive && stillHasEarlier && headCursor > 0L) {
                 if (controller.connectionState.value !is ConnectionState.Connected) break
-                val preCheck = _transcriptStatesByAddress.value[address] ?: break
-                if (preCheck.sessionId != sessionId ||
-                    preCheck.path != path ||
-                    !preCheck.hasEarlier ||
-                    preCheck.headOffset <= 0L ||
-                    preCheck.events.count { it is TranscriptRawEvent.UserMessage } >= RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
-                ) {
+                val liveCheck = _transcriptStatesByAddress.value[address] ?: break
+                if (liveCheck.sessionId != sessionId || liveCheck.path != path) break
+                if (initialTurns + accHeadEvents.count { it is TranscriptRawEvent.UserMessage } >= RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS) {
                     break
                 }
                 rounds++
-                val progressed = mutex.withLock {
-                    val cur = _transcriptStatesByAddress.value[address] ?: return@withLock false
-                    if (cur.sessionId != sessionId ||
-                        cur.path != path ||
-                        !cur.hasEarlier ||
-                        cur.headOffset <= 0L ||
-                        cur.events.count { it is TranscriptRawEvent.UserMessage } >= RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
-                    ) {
-                        return@withLock false
-                    }
-                    val headChunk = controller.readTranscriptHead(
-                        agentKind = cur.agentKind,
-                        path = cur.path,
-                        beforeOffset = cur.headOffset,
-                        windowBytes = INITIAL_BACKFILL_STEP_BYTES
-                    ).getOrElse { err ->
-                        Log.w("HerdrTranscript", "backfill($address) failed: ${err.message}")
-                        return@withLock false
-                    }
-                    val latest = _transcriptStatesByAddress.value[address] ?: return@withLock false
-                    if (latest.sessionId != sessionId || latest.path != path) return@withLock false
-                    val merged = mergeTranscriptEvents(headChunk.events, latest.events)
-                    val nextHead = minOf(latest.headOffset, headChunk.startOffset)
-                    val stillHasEarlier = headChunk.hasEarlier && nextHead > 0L
-                    _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
-                        address to latest.copy(
-                            headOffset = nextHead,
-                            hasEarlier = stillHasEarlier,
-                            events = merged,
-                            activeModel = latest.activeModel ?: findLatestModel(merged)
-                        )
-                        )
-                    val userTurns = merged.count { it is TranscriptRawEvent.UserMessage }
-                    Log.i(
-                        "HerdrTranscript",
-                        "backfilled($address) -> total=${merged.size}, turns=$userTurns, headOffset=$nextHead"
-                    )
-                    stillHasEarlier && userTurns < RemoteTranscriptSidecar.MIN_INITIAL_USER_TURNS
+                val headChunk = controller.readTranscriptHead(
+                    agentKind = startState.agentKind,
+                    path = path,
+                    beforeOffset = headCursor,
+                    windowBytes = INITIAL_BACKFILL_STEP_BYTES
+                ).getOrElse { err ->
+                    Log.w("HerdrTranscript", "backfill($address) failed: ${err.message}")
+                    break
                 }
-                if (!progressed) break
-                // Yield briefly between 1 MB chunks so live tail updates can interleave cleanly.
-                delay(20)
+                accHeadEvents = mergeTranscriptEvents(headChunk.events, accHeadEvents)
+                headCursor = minOf(headCursor, headChunk.startOffset)
+                stillHasEarlier = headChunk.hasEarlier && headCursor > 0L
+            }
+
+            if (accHeadEvents.isEmpty() || !isActive) return@launch
+            mutex.withLock {
+                val latest = _transcriptStatesByAddress.value[address] ?: return@withLock
+                if (latest.sessionId != sessionId || latest.path != path) return@withLock
+                val merged = mergeTranscriptEvents(accHeadEvents, latest.events)
+                val nextHead = minOf(latest.headOffset, headCursor)
+                val finalHasEarlier = stillHasEarlier && nextHead > 0L
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to latest.copy(
+                        headOffset = nextHead,
+                        hasEarlier = finalHasEarlier,
+                        events = merged,
+                        activeModel = latest.activeModel ?: findLatestModel(merged)
+                    )
+                    )
+                val userTurns = merged.count { it is TranscriptRawEvent.UserMessage }
+                Log.i(
+                    "HerdrTranscript",
+                    "backfilled($address, rounds=$rounds) -> total=${merged.size}, turns=$userTurns, headOffset=$nextHead"
+                )
             }
         }
     }
@@ -2715,7 +2729,7 @@ class HerdrMainViewModel(
     }
 
     companion object {
-        private const val INITIAL_FIRST_PAINT_WINDOW_BYTES: Long = 393_216L
+        private const val INITIAL_FIRST_PAINT_WINDOW_BYTES: Long = 524_288L
         private const val INITIAL_BACKFILL_STEP_BYTES: Long = 1_048_576L
     }
 }

@@ -50,6 +50,8 @@ object TranscriptSessionAssembler {
     private val boldHeadingRegex = Regex("\\*\\*([^*\\n]{2,64})\\*\\*")
     private val whitespaceRegex = Regex("\\s+")
     private val hcWrapperRegex = Regex("^<hc\\b[^>]*>([\\s\\S]*?)(?:</hc>)?\\s*$")
+    private val attachmentBadgeRegex = Regex("""\[📎[^\]]*]""")
+    private val trailingEllipsisRegex = Regex("""[….]+$""")
     private val isoUtcRegex = Regex("^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})")
     private val orderedMarkerRegex = Regex("^\\d+\\.$")
 
@@ -247,12 +249,13 @@ object TranscriptSessionAssembler {
                 null
             }
 
+            val sectionStableId = "tx_${sec.firstOffset}"
             val cachedTurn = if (turnKey != null) cache?.completedTurnsByKey?.get(turnKey) else null
             val turn = if (cachedTurn != null) {
-                if (cachedTurn.turnIndex == idx + 1 && !cachedTurn.isRunning) {
+                if (cachedTurn.turnIndex == idx + 1 && cachedTurn.stableId == sectionStableId && !cachedTurn.isRunning) {
                     cachedTurn
                 } else {
-                    cachedTurn.copy(turnIndex = idx + 1, isRunning = false)
+                    cachedTurn.copy(turnIndex = idx + 1, stableId = sectionStableId, isRunning = false)
                 }
             } else {
                 val bodyBlocks = buildTurnResponseBlocks(
@@ -266,6 +269,7 @@ object TranscriptSessionAssembler {
 
                 assembleTurnStats(
                     turnIndex = idx + 1,
+                    stableId = sectionStableId,
                     prompt = sec.userPrompt,
                     body = bodyBlocks,
                     isLatestRunning = turnRunning,
@@ -332,16 +336,75 @@ object TranscriptSessionAssembler {
             val promptUnflushed = livePrompt != null && !promptsMatch(lastSidePrompt, livePrompt.text)
 
             if (promptUnflushed) {
+                // Demote previous tail turn so two turns never display simultaneous running states.
+                val prevLast = mergedTurns.last()
+                if (prevLast.isRunning || prevLast.responseBlocks.any { it is TerminalSemanticBlock.ToolGroupBlock && it.isRunning }) {
+                    val demotedBody = prevLast.responseBlocks.map { blk ->
+                        if (blk is TerminalSemanticBlock.ToolGroupBlock && blk.isRunning) {
+                            val cleanEntries = blk.entries.map { e -> if (e.isRunning) e.copy(isRunning = false) else e }
+                            blk.copy(
+                                isRunning = false,
+                                entries = cleanEntries,
+                                summaryLabel = blk.summaryLabel.removeSuffix(" · 进行中"),
+                                actionBreakdownLabel = blk.actionBreakdownLabel?.removeSuffix(" · 进行中")
+                            )
+                        } else {
+                            blk
+                        }
+                    }
+                    mergedTurns[mergedTurns.lastIndex] = prevLast.copy(
+                        isRunning = false,
+                        actionBreakdownLabel = prevLast.actionBreakdownLabel?.removeSuffix(" · 进行中"),
+                        responseBlocks = demotedBody
+                    )
+                    val prevPromptIdx = mergedBlocks.indexOfLast { it === prevLast.userPrompt }.let { idx ->
+                        if (idx >= 0) idx else -1
+                    }
+                    for (bi in (prevPromptIdx + 1) until mergedBlocks.size) {
+                        val b = mergedBlocks[bi]
+                        if (b is TerminalSemanticBlock.ToolGroupBlock && b.isRunning) {
+                            val cleanEntries = b.entries.map { e -> if (e.isRunning) e.copy(isRunning = false) else e }
+                            mergedBlocks[bi] = b.copy(
+                                isRunning = false,
+                                entries = cleanEntries,
+                                summaryLabel = b.summaryLabel.removeSuffix(" · 进行中"),
+                                actionBreakdownLabel = b.actionBreakdownLabel?.removeSuffix(" · 进行中")
+                            )
+                        }
+                    }
+                }
                 val nextIndex = mergedTurns.size + 1
                 mergedBlocks.add(livePrompt!!)
                 mergedBlocks.addAll(liveLastTurn.responseBlocks)
                 mergedTurns.add(
                     liveLastTurn.copy(
                         turnIndex = nextIndex,
+                        stableId = "live_unflushed",
                         isRunning = isWorking || liveLastTurn.isRunning
                     )
                 )
             } else {
+                if (livePrompt != null && lastSidePrompt != null) {
+                    val liveBadges = attachmentBadgeRegex.findAll(livePrompt.text).map { it.value }.toList()
+                    val shouldUpgradeBadge = liveBadges.isNotEmpty() && (
+                        "[📎" !in lastSidePrompt ||
+                            ("KB)" in livePrompt.text && "KB)" !in lastSidePrompt) ||
+                            ("MB)" in livePrompt.text && "MB)" !in lastSidePrompt)
+                        )
+                    if (shouldUpgradeBadge) {
+                        val strippedSide = lastSidePrompt.replace(attachmentBadgeRegex, "").trimEnd()
+                        val upgradedPrompt = TerminalSemanticBlock.UserPromptBlock(
+                            if (strippedSide.isEmpty()) liveBadges.joinToString("\n")
+                            else "$strippedSide\n${liveBadges.joinToString(" ")}"
+                        )
+                        val oldPrompt = mergedTurns.last().userPrompt
+                        mergedTurns[mergedTurns.lastIndex] = mergedTurns.last().copy(userPrompt = upgradedPrompt)
+                        val oldIdx = mergedBlocks.indexOfLast { it === oldPrompt }
+                        if (oldIdx >= 0) {
+                            mergedBlocks[oldIdx] = upgradedPrompt
+                        }
+                    }
+                }
                 val interactiveExtras = liveLastTurn.responseBlocks.filter {
                     it is TerminalSemanticBlock.AskCardBlock || it is TerminalSemanticBlock.UrgentAlertBlock
                 }.filter { extra ->
@@ -555,6 +618,7 @@ object TranscriptSessionAssembler {
 
     private fun assembleTurnStats(
         turnIndex: Int,
+        stableId: String = "turn_$turnIndex",
         prompt: TerminalSemanticBlock.UserPromptBlock?,
         body: List<TerminalSemanticBlock>,
         isLatestRunning: Boolean,
@@ -618,6 +682,7 @@ object TranscriptSessionAssembler {
 
         return ConversationTurn(
             turnIndex = turnIndex,
+            stableId = stableId,
             userPrompt = prompt,
             responseBlocks = body,
             toolOperationCount = toolOps,
@@ -657,6 +722,12 @@ object TranscriptSessionAssembler {
             "find_by_name", "glob" -> "查找"
             "search_web", "websearch" -> "检索"
             "invoke_subagent", "agent", "task" -> "子代理"
+            "exit_plan_mode", "exitplanmode" -> "退出规划模式"
+            "enter_plan_mode", "enterplanmode" -> "进入规划模式"
+            "ask_question", "askuserquestion" -> "询问确认"
+            "manage_task", "task_output" -> "管理任务"
+            "send_message" -> "发送消息"
+            "define_subagent" -> "定义子代理"
             else -> tc.name
         }
         return if (tc.primaryTarget.isNotBlank()) "$verb ${tc.primaryTarget}" else verb
@@ -698,14 +769,26 @@ object TranscriptSessionAssembler {
 
     private fun promptsMatch(sidePrompt: String?, livePrompt: String): Boolean {
         if (sidePrompt.isNullOrBlank()) return false
-        fun norm(s: String): String {
+        fun normCore(s: String): String {
             val unwrapped = hcWrapperRegex.find(s.trim())?.groupValues?.get(1) ?: s
-            return unwrapped.replace(whitespaceRegex, "").take(160)
+            val withoutAttachments = unwrapped.replace(attachmentBadgeRegex, " ")
+            return withoutAttachments
+                .replace(whitespaceRegex, "")
+                .replace(trailingEllipsisRegex, "")
+                .take(160)
         }
-        val a = norm(sidePrompt)
-        val b = norm(livePrompt)
+        val a = normCore(sidePrompt)
+        val b = normCore(livePrompt)
+        if (a.isEmpty() && b.isEmpty()) {
+            return "[📎" in sidePrompt && "[📎" in livePrompt
+        }
         if (a.isEmpty() || b.isEmpty()) return false
-        return a == b || (a.length >= 6 && b.length >= 6 && (a.contains(b) || b.contains(a)))
+        if (a.equals(b, ignoreCase = true)) return true
+        val minLen = minOf(a.length, b.length)
+        if (minLen >= 4 && (a.startsWith(b, ignoreCase = true) || b.startsWith(a, ignoreCase = true))) {
+            return true
+        }
+        return minLen >= 6 && (a.contains(b, ignoreCase = true) || b.contains(a, ignoreCase = true))
     }
 
     private fun formatCompactModelName(raw: String): String {

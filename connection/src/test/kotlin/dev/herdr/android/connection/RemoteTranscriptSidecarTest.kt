@@ -548,6 +548,141 @@ class RemoteTranscriptSidecarTest {
         }
     }
 
+    @Test
+    fun editFileDiffPreservesFirstLineIndentationAndEmitsDeletionsBeforeAdditions() = runBlocking {
+        val home = File(tempFolder.root, "home_diff").apply { mkdirs() }
+        val agyRoot = File(home, ".gemini/antigravity-cli").apply { mkdirs() }
+        val uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        File(agyRoot, "conversations").apply { mkdirs() }
+            .let { File(it, "$uuid.db-wal").writeBytes(byteArrayOf(1)) }
+        val logsDir = File(agyRoot, "brain/$uuid/.system_generated/logs").apply { mkdirs() }
+        val compactLog = File(logsDir, "transcript.jsonl")
+        val target = "        versionCode = 19\n        versionName = \"0.5.1\""
+        val replacement = "        versionCode = 20\n        versionName = \"0.5.2\""
+        val plannerJson = org.json.JSONObject()
+            .put("step_index", 10)
+            .put("type", "PLANNER_RESPONSE")
+            .put("status", "DONE")
+            .put(
+                "tool_calls",
+                org.json.JSONArray().put(
+                    org.json.JSONObject()
+                        .put("name", "edit_file")
+                        .put(
+                            "args",
+                            org.json.JSONObject()
+                                .put("Path", "D:\\repo\\app\\build.gradle.kts")
+                                .put("Target", target)
+                                .put("Replacement", replacement)
+                        )
+                )
+            )
+            .toString()
+        compactLog.writeText(plannerJson + "\n", StandardCharsets.UTF_8)
+
+        val fakeSsh = object : AuthenticatedSshConnection {
+            override val hostKeyFingerprint = "local-sftp"
+            override suspend fun exec(command: String): SshHcExecChannel =
+                throw AssertionError("exec() must not be called")
+
+            override suspend fun openSftp(): SshSftpChannel = LocalFsSftpChannel(home, maxPacketBytes = 32_768)
+            override fun close() = Unit
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sidecar = RemoteTranscriptSidecar(fakeSsh, HostPlatform.WINDOWS, scope)
+        try {
+            val chunk = sidecar.readTail(
+                agentKind = TranscriptAgentKind.ANTIGRAVITY,
+                path = toTestSftpPath(compactLog),
+                offset = 0L
+            )
+            val step = chunk.events.filterIsInstance<TranscriptRawEvent.AssistantStep>().single()
+            val expectedDiff = listOf(
+                "-        versionCode = 19",
+                "-        versionName = \"0.5.1\"",
+                "+        versionCode = 20",
+                "+        versionName = \"0.5.2\""
+            ).joinToString("\n")
+            assertEquals(expectedDiff, step.toolCalls.single().diffPreview)
+        } finally {
+            sidecar.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun agyUserInputExtractsUploadedImageAndVideoBadges() = runBlocking {
+        val home = File(tempFolder.root, "home_media").apply { mkdirs() }
+        val agyRoot = File(home, ".gemini/antigravity-cli").apply { mkdirs() }
+        val uuid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+        File(agyRoot, "conversations").apply { mkdirs() }
+            .let { File(it, "$uuid.db-wal").writeBytes(byteArrayOf(1)) }
+        val logsDir = File(agyRoot, "brain/$uuid/.system_generated/logs").apply { mkdirs() }
+        val compactLog = File(logsDir, "transcript.jsonl")
+
+        val u1 = org.json.JSONObject()
+            .put("step_index", 28)
+            .put("type", "USER_INPUT")
+            .put("source", "USER_EXPLICIT")
+            .put(
+                "content",
+                """
+                <ADDITIONAL_METADATA>
+                The user has uploaded 3 image(s):
+                - a.png
+                - b.png
+                - c.png
+                </ADDITIONAL_METADATA>
+                <USER_REQUEST>
+                这是素材
+                </USER_REQUEST>
+                """.trimIndent()
+            )
+            .toString()
+        val u2 = org.json.JSONObject()
+            .put("step_index", 30)
+            .put("type", "USER_INPUT")
+            .put("source", "USER_EXPLICIT")
+            .put(
+                "content",
+                """
+                <ADDITIONAL_METADATA>
+                The user has uploaded 2 video(s):
+                - clip1.mp4
+                </ADDITIONAL_METADATA>
+                <USER_REQUEST>
+                </USER_REQUEST>
+                """.trimIndent()
+            )
+            .toString()
+        compactLog.writeText("$u1\n$u2\n", StandardCharsets.UTF_8)
+
+        val fakeSsh = object : AuthenticatedSshConnection {
+            override val hostKeyFingerprint = "local-sftp"
+            override suspend fun exec(command: String): SshHcExecChannel =
+                throw AssertionError("exec() must not be called")
+
+            override suspend fun openSftp(): SshSftpChannel = LocalFsSftpChannel(home, maxPacketBytes = 32_768)
+            override fun close() = Unit
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sidecar = RemoteTranscriptSidecar(fakeSsh, HostPlatform.WINDOWS, scope)
+        try {
+            val chunk = sidecar.readTail(
+                agentKind = TranscriptAgentKind.ANTIGRAVITY,
+                path = toTestSftpPath(compactLog),
+                offset = 0L
+            )
+            val msgs = chunk.events.filterIsInstance<TranscriptRawEvent.UserMessage>()
+            assertEquals(2, msgs.size)
+            assertEquals("这是素材\n[📎 3 image(s)]", msgs[0].text)
+            assertEquals("[📎 2 video(s)]", msgs[1].text)
+        } finally {
+            sidecar.close()
+            scope.cancel()
+        }
+    }
+
     private fun toTestSftpPath(file: File): String {
         val slash = file.absolutePath.replace('\\', '/')
         return if (slash.length >= 2 && slash[0].isLetter() && slash[1] == ':') "/$slash" else slash

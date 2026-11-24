@@ -67,8 +67,12 @@ data class CodeHighlightPalette(
     val annotation: Color,
     val diffAddFg: Color,
     val diffAddBg: Color,
+    val diffAddStrongBg: Color = diffAddBg,
+    val diffAddBar: Color = diffAddFg,
     val diffDelFg: Color,
     val diffDelBg: Color,
+    val diffDelStrongBg: Color = diffDelBg,
+    val diffDelBar: Color = diffDelFg,
     val diffHunkFg: Color,
     val diffMetaFg: Color
 )
@@ -791,21 +795,28 @@ internal fun MarkdownDocumentRenderer(
 
 @Composable
 private fun rememberCodeHighlightPalette(): CodeHighlightPalette {
+    val isLight = HerdrColors.IsLight
     val keyword = HerdrColors.Accent
-    val string = HerdrColors.Done
+    val string = if (isLight) Color(0xFF15803D) else Color(0xFF86EFAC)
     val comment = HerdrColors.Dim
     val number = HerdrColors.Working
-    val type = if (HerdrColors.IsLight) Color(0xFF0B5CAD) else Color(0xFF7DCFFF)
+    val type = if (isLight) Color(0xFF0B5CAD) else Color(0xFF7DCFFF)
     val annotation = HerdrColors.Working
-    val diffAddFg = HerdrColors.Done
-    val diffAddBg = if (HerdrColors.IsLight) Color(0xFFE6F7ED) else HerdrColors.DoneSubtle.copy(alpha = 0.78f)
-    val diffDelFg = HerdrColors.Blocked
-    val diffDelBg = if (HerdrColors.IsLight) Color(0xFFFEECEC) else HerdrColors.BlockedSubtle.copy(alpha = 0.78f)
+    val diffAddFg = if (isLight) Color(0xFF166534) else Color(0xFF86EFAC)
+    val diffAddBg = if (isLight) Color(0xFFECFDF3) else Color(0xFF14532D).copy(alpha = 0.34f)
+    val diffAddStrongBg = if (isLight) Color(0xFFBBF7D0) else Color(0xFF22C55E).copy(alpha = 0.32f)
+    val diffAddBar = if (isLight) Color(0xFF16A34A) else Color(0xFF22C55E)
+    val diffDelFg = if (isLight) Color(0xFF991B1B) else Color(0xFFFCA5A5)
+    val diffDelBg = if (isLight) Color(0xFFFEF2F2) else Color(0xFF7F1D1D).copy(alpha = 0.34f)
+    val diffDelStrongBg = if (isLight) Color(0xFFFECACA) else Color(0xFFEF4444).copy(alpha = 0.32f)
+    val diffDelBar = if (isLight) Color(0xFFDC2626) else Color(0xFFEF4444)
     val diffHunkFg = HerdrColors.Accent
     val diffMetaFg = HerdrColors.Muted
     return remember(
-        keyword, string, comment, number, type, annotation,
-        diffAddFg, diffAddBg, diffDelFg, diffDelBg, diffHunkFg, diffMetaFg
+        isLight, keyword, string, comment, number, type, annotation,
+        diffAddFg, diffAddBg, diffAddStrongBg, diffAddBar,
+        diffDelFg, diffDelBg, diffDelStrongBg, diffDelBar,
+        diffHunkFg, diffMetaFg
     ) {
         CodeHighlightPalette(
             keyword = keyword,
@@ -816,8 +827,12 @@ private fun rememberCodeHighlightPalette(): CodeHighlightPalette {
             annotation = annotation,
             diffAddFg = diffAddFg,
             diffAddBg = diffAddBg,
+            diffAddStrongBg = diffAddStrongBg,
+            diffAddBar = diffAddBar,
             diffDelFg = diffDelFg,
             diffDelBg = diffDelBg,
+            diffDelStrongBg = diffDelStrongBg,
+            diffDelBar = diffDelBar,
             diffHunkFg = diffHunkFg,
             diffMetaFg = diffMetaFg
         )
@@ -1178,14 +1193,22 @@ internal data class ParsedDiffLine(
 )
 
 private val diffHunkHeaderRegex = Regex("""^@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@.*$""")
+private val syntheticSnippetHunkRegex = Regex("""^@@\s*-(?:0,0|1(?:,\d+)?)\s+\+1(?:,\d+)?\s*@@\s*$""")
 
 internal fun parseUnifiedDiffLines(diffText: String): List<ParsedDiffLine> {
     val rawLines = diffText.replace("\r\n", "\n").replace('\r', '\n').split('\n')
     val out = ArrayList<ParsedDiffLine>(rawLines.size)
+    val hunkIndices = rawLines.indices.filter { rawLines[it].startsWith("@@") }
+    val skipSyntheticHeader = hunkIndices.size == 1 &&
+        hunkIndices[0] == 0 &&
+        syntheticSnippetHunkRegex.matches(rawLines[0].trim())
     var curOld: Int? = null
     var curNew: Int? = null
 
-    for (raw in rawLines) {
+    for ((idx, raw) in rawLines.withIndex()) {
+        if (idx == 0 && skipSyntheticHeader) {
+            continue
+        }
         when {
             raw.startsWith("@@") -> {
                 val m = diffHunkHeaderRegex.find(raw)
@@ -1220,6 +1243,29 @@ internal fun parseUnifiedDiffLines(diffText: String): List<ParsedDiffLine> {
             }
             else -> {
                 out.add(ParsedDiffLine(DiffLineKind.META, null, null, raw))
+            }
+        }
+    }
+
+    // Normalize reversed [ADD+, DEL+] clusters (e.g., legacy LCS outputs) to canonical [DEL+, ADD+]
+    var normIdx = 0
+    while (normIdx < out.size) {
+        if (out[normIdx].kind != DiffLineKind.ADD) {
+            normIdx++
+            continue
+        }
+        val addStart = normIdx
+        while (normIdx < out.size && out[normIdx].kind == DiffLineKind.ADD) normIdx++
+        val addEnd = normIdx
+        if (normIdx < out.size && out[normIdx].kind == DiffLineKind.DEL) {
+            val delStart = normIdx
+            while (normIdx < out.size && out[normIdx].kind == DiffLineKind.DEL) normIdx++
+            val delEnd = normIdx
+            val reordered = ArrayList<ParsedDiffLine>(delEnd - addStart)
+            reordered.addAll(out.subList(delStart, delEnd))
+            reordered.addAll(out.subList(addStart, addEnd))
+            for (k in reordered.indices) {
+                out[addStart + k] = reordered[k]
             }
         }
     }
@@ -1268,7 +1314,7 @@ internal fun parseUnifiedDiffLines(diffText: String): List<ParsedDiffLine> {
                 }
                 val delEndIdx = delCode.length - suffix
                 val addEndIdx = addCode.length - suffix
-                if (prefix + suffix >= 2) {
+                if (prefix + suffix >= 1) {
                     if (delEndIdx > prefix) {
                         out[delStart + k] = out[delStart + k].copy(strongRange = prefix until delEndIdx)
                     }
@@ -1308,6 +1354,9 @@ internal fun InlineUnifiedDiffCard(
         if (!isCollapsible || expanded) parsedAll else parsedAll.take(20)
     }
 
+    val hasLineNumbers = remember(visibleLines) {
+        visibleLines.any { it.oldLineNo != null || it.newLineNo != null }
+    }
     val maxDigits = remember(visibleLines) {
         val maxNo = visibleLines.maxOfOrNull { maxOf(it.oldLineNo ?: 0, it.newLineNo ?: 0) } ?: 0
         when {
@@ -1317,20 +1366,53 @@ internal fun InlineUnifiedDiffCard(
             else -> 1
         }
     }
-    val gutterText = remember(visibleLines, maxDigits) {
-        visibleLines.joinToString("\n") { ln ->
-            when (ln.kind) {
-                DiffLineKind.HUNK -> "${"".padStart(maxDigits)} ${"".padStart(maxDigits)} ·"
-                DiffLineKind.META -> "${"".padStart(maxDigits)} ${"".padStart(maxDigits)}  "
-                DiffLineKind.ADD -> "${"".padStart(maxDigits)} ${(ln.newLineNo?.toString() ?: "").padStart(maxDigits)} +"
-                DiffLineKind.DEL -> "${(ln.oldLineNo?.toString() ?: "").padStart(maxDigits)} ${"".padStart(maxDigits)} -"
-                DiffLineKind.CONTEXT -> "${(ln.oldLineNo?.toString() ?: "").padStart(maxDigits)} ${(ln.newLineNo?.toString() ?: "").padStart(maxDigits)}  "
+    val gutterDefaultFg = HerdrColors.Dim.copy(alpha = 0.85f)
+    val gutterAnnotated = remember(visibleLines, hasLineNumbers, maxDigits, palette, gutterDefaultFg) {
+        buildAnnotatedString {
+            visibleLines.forEachIndexed { idx, ln ->
+                val start = length
+                if (!hasLineNumbers) {
+                    when (ln.kind) {
+                        DiffLineKind.ADD -> append("+")
+                        DiffLineKind.DEL -> append("-")
+                        DiffLineKind.CONTEXT, DiffLineKind.HUNK, DiffLineKind.META -> append(" ")
+                    }
+                } else {
+                    val noStr = (ln.newLineNo ?: ln.oldLineNo)?.toString()?.padStart(maxDigits)
+                        ?: "".padStart(maxDigits)
+                    val sign = when (ln.kind) {
+                        DiffLineKind.ADD -> "+"
+                        DiffLineKind.DEL -> "-"
+                        DiffLineKind.CONTEXT, DiffLineKind.HUNK, DiffLineKind.META -> " "
+                    }
+                    append(noStr)
+                    append(' ')
+                    append(sign)
+                }
+                val color = when (ln.kind) {
+                    DiffLineKind.ADD -> palette.diffAddBar
+                    DiffLineKind.DEL -> palette.diffDelBar
+                    DiffLineKind.CONTEXT, DiffLineKind.HUNK, DiffLineKind.META -> gutterDefaultFg
+                }
+                addStyle(
+                    SpanStyle(
+                        color = color,
+                        fontWeight = if (ln.kind == DiffLineKind.ADD || ln.kind == DiffLineKind.DEL) {
+                            FontWeight.SemiBold
+                        } else {
+                            FontWeight.Normal
+                        }
+                    ),
+                    start,
+                    length
+                )
+                if (idx < visibleLines.lastIndex) append('\n')
             }
         }
     }
 
-    val addStrongBg = HerdrColors.Done.copy(alpha = 0.28f)
-    val delStrongBg = HerdrColors.Blocked.copy(alpha = 0.28f)
+    val addStrongBg = palette.diffAddStrongBg
+    val delStrongBg = palette.diffDelStrongBg
     val codeAnnotated = remember(visibleLines, palette, addStrongBg, delStrongBg) {
         buildAnnotatedString {
             visibleLines.forEachIndexed { idx, ln ->
@@ -1382,9 +1464,11 @@ internal fun InlineUnifiedDiffCard(
     var codeLayout by remember(visibleLines) { mutableStateOf<TextLayoutResult?>(null) }
     val hunkTint = HerdrColors.AccentSubtle.copy(alpha = 0.45f)
     val gutterBorder = HerdrColors.Border.copy(alpha = 0.45f)
-    val addBarColor = HerdrColors.Done
-    val delBarColor = HerdrColors.Blocked
-    val gutterWidth = remember(maxDigits) { ((maxDigits * 2 + 3) * 6.8f + 12f).dp }
+    val addBarColor = palette.diffAddBar
+    val delBarColor = palette.diffDelBar
+    val gutterWidth = remember(hasLineNumbers, maxDigits) {
+        if (!hasLineNumbers) 22.dp else ((maxDigits + 2) * 6.8f + 12f).dp
+    }
 
     Column(
         modifier = Modifier
@@ -1419,7 +1503,7 @@ internal fun InlineUnifiedDiffCard(
                 Text(
                     text = "+$addCount",
                     style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold),
-                    color = HerdrColors.Done,
+                    color = palette.diffAddBar,
                     maxLines = 1
                 )
             }
@@ -1427,14 +1511,14 @@ internal fun InlineUnifiedDiffCard(
                 Text(
                     text = "-$delCount",
                     style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold),
-                    color = HerdrColors.Blocked,
+                    color = palette.diffDelBar,
                     maxLines = 1
                 )
             }
             Text(
                 text = if (copied) "已复制" else "复制",
                 style = HerdrType.Caption,
-                color = if (copied) HerdrColors.Done else HerdrColors.Accent,
+                color = if (copied) palette.diffAddBar else HerdrColors.Accent,
                 fontWeight = FontWeight.Medium,
                 modifier = Modifier
                     .clip(HerdrShapes.Small)
@@ -1451,9 +1535,12 @@ internal fun InlineUnifiedDiffCard(
             verticalAlignment = Alignment.Top
         ) {
             Text(
-                text = gutterText,
-                style = HerdrType.Mono.copy(fontSize = 10.5.sp, lineHeight = 16.5.sp),
-                color = HerdrColors.Dim.copy(alpha = 0.85f),
+                text = gutterAnnotated,
+                style = HerdrType.Mono.copy(
+                    fontSize = 10.5.sp,
+                    lineHeight = 16.5.sp,
+                    textAlign = if (hasLineNumbers) TextAlign.End else TextAlign.Center
+                ),
                 softWrap = false,
                 onTextLayout = { gutterLayout = it },
                 modifier = Modifier

@@ -452,4 +452,118 @@ class TranscriptSessionAssemblerTest {
         assertEquals(11, addLine.newLineNo)
         assertEquals("12000", addLine.code.substring(addLine.strongRange!!))
     }
+
+    @Test
+    fun fuseShortPromptWithAttachmentDoesNotDuplicateTurnAndPreservesStableId() {
+        val uSide = TranscriptRawEvent.UserMessage(lineByteOffset = 5000L, stepIndex = 28, text = "这是素材")
+        val aSide = TranscriptRawEvent.AssistantStep(
+            lineByteOffset = 5200L,
+            stepIndex = 29,
+            status = "RUNNING",
+            toolCalls = listOf(
+                TranscriptToolCallSummary(
+                    name = "exit_plan_mode",
+                    primaryTarget = "",
+                    detailPreview = "Created At: 2026-11-24T15:25:09"
+                )
+            )
+        )
+        val sideState = TerminalTranscriptUiState(
+            address = "t48",
+            agentKind = TranscriptAgentKind.ANTIGRAVITY,
+            sessionId = "sess-48",
+            path = "/logs/transcript.jsonl",
+            headOffset = 5000L,
+            tailOffset = 5500L,
+            events = listOf(uSide, aSide)
+        )
+        val (rawBlocks, rawTurns) = TranscriptSessionAssembler.assemble(
+            events = sideState.events,
+            agentKind = TranscriptAgentKind.ANTIGRAVITY,
+            isLatestRunning = true
+        )
+        val liveTurn = ConversationTurn(
+            turnIndex = 1,
+            stableId = "pty_1",
+            userPrompt = TerminalSemanticBlock.UserPromptBlock("这是素材\n[📎 3 image(s) (363 KB)]"),
+            responseBlocks = emptyList(),
+            isRunning = true
+        )
+        val liveSnapshot = WorkbenchSnapshot(
+            blocks = listOf(liveTurn.userPrompt!!),
+            quickActions = emptyList(),
+            liveStatus = AgentStateWord.WORKING,
+            isExpandedMode = false,
+            dialect = TerminalDialect.ANTIGRAVITY,
+            turns = listOf(liveTurn)
+        )
+        val fused = TranscriptSessionAssembler.fusePreassembledWithLiveWorkbench(
+            rawBlocks = rawBlocks,
+            rawTurns = rawTurns,
+            liveSnapshot = liveSnapshot,
+            summary = TerminalSummary(address = "t48", agentApp = "antigravity", agentStatus = AgentStateWord.WORKING)
+        )
+        assertEquals(1, fused.turns.size)
+        assertEquals("这是素材\n[📎 3 image(s) (363 KB)]", fused.turns.single().userPrompt?.text)
+        assertEquals("tx_5000", fused.turns.single().stableId)
+        val toolGroup = fused.turns.single().responseBlocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>().single()
+        assertEquals("退出规划模式", toolGroup.entries.single().title)
+
+        val prepended = TranscriptSessionAssembler.assemble(
+            events = listOf(
+                TranscriptRawEvent.UserMessage(lineByteOffset = 1000L, stepIndex = 10, text = "前置旧轮次"),
+                TranscriptRawEvent.AssistantStep(lineByteOffset = 1200L, stepIndex = 11, status = "DONE", markdownContent = "已处理"),
+                uSide,
+                aSide
+            ),
+            agentKind = TranscriptAgentKind.ANTIGRAVITY,
+            isLatestRunning = true
+        ).second
+        assertEquals(2, prepended.size)
+        assertEquals(2, prepended.last().turnIndex)
+        assertEquals("tx_5000", prepended.last().stableId)
+    }
+
+    @Test
+    fun fuseGenuinelyUnflushedPromptDemotesPreviousRunningTurn() {
+        val (rawBlocks, rawTurns) = TranscriptSessionAssembler.assemble(
+            events = listOf(
+                TranscriptRawEvent.UserMessage(lineByteOffset = 1000L, stepIndex = 1, text = "上一轮已经发给sidecar的指令"),
+                TranscriptRawEvent.AssistantStep(
+                    lineByteOffset = 1200L,
+                    stepIndex = 2,
+                    status = "PENDING",
+                    toolCalls = listOf(TranscriptToolCallSummary(name = "run_command", primaryTarget = "echo ok"))
+                )
+            ),
+            agentKind = TranscriptAgentKind.ANTIGRAVITY,
+            isLatestRunning = true
+        )
+        val liveUnflushedTurn = ConversationTurn(
+            turnIndex = 2,
+            stableId = "pty_2",
+            userPrompt = TerminalSemanticBlock.UserPromptBlock("一条全新的未落盘问题"),
+            responseBlocks = emptyList(),
+            isRunning = true
+        )
+        val fused = TranscriptSessionAssembler.fusePreassembledWithLiveWorkbench(
+            rawBlocks = rawBlocks,
+            rawTurns = rawTurns,
+            liveSnapshot = WorkbenchSnapshot(
+                blocks = listOf(liveUnflushedTurn.userPrompt!!),
+                quickActions = emptyList(),
+                liveStatus = AgentStateWord.WORKING,
+                isExpandedMode = false,
+                dialect = TerminalDialect.ANTIGRAVITY,
+                turns = listOf(liveUnflushedTurn)
+            ),
+            summary = TerminalSummary(address = "t48", agentApp = "antigravity", agentStatus = AgentStateWord.WORKING)
+        )
+        assertEquals(2, fused.turns.size)
+        assertFalse(fused.turns[0].isRunning)
+        val prevGroups = fused.turns[0].responseBlocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>()
+        assertTrue(prevGroups.all { !it.isRunning && !it.summaryLabel.endsWith("· 进行中") })
+        assertTrue(fused.turns[1].isRunning)
+        assertEquals("live_unflushed", fused.turns[1].stableId)
+    }
 }

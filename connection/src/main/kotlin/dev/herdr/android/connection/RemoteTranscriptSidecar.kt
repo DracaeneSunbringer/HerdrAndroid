@@ -161,6 +161,8 @@ class RemoteTranscriptSidecar(
 
     private val locateTagStripRegex = Regex("</?(?:USER_REQUEST|hc)(?:\\s[^>]*)?>", RegexOption.IGNORE_CASE)
     private val locateWhitespaceRegex = Regex("\\s+")
+    private val agyUploadedImagesRegex = Regex("""The user has uploaded (\d+) image\(s\)""", RegexOption.IGNORE_CASE)
+    private val agyUploadedVideosRegex = Regex("""The user has uploaded (\d+) video\(s\)""", RegexOption.IGNORE_CASE)
 
     private fun locateInternal(
         sftp: SshSftpChannel,
@@ -336,6 +338,7 @@ class RemoteTranscriptSidecar(
 
         val orderedCandidates = LinkedHashMap<String, SftpEntryInfo>()
         val historyPromptsByCid = HashMap<String, MutableList<String>>()
+        val otherWorkspaceCids = HashSet<String>()
 
         // Tier 1: Fast `history.jsonl` lookup (tail 512 KB, collect ALL matching sessions for `normCwd`)
         val historyStat = sftp.statOrNull(joinRemote(agyRoot, "history.jsonl"))
@@ -354,7 +357,14 @@ class RemoteTranscriptSidecar(
                 }
                 val ws = normalizeComparePath(obj.str("workspace"))
                 val cid = obj.str("conversationId")
-                if (ws != normCwd || !isUuid36(cid)) continue
+                if (!isUuid36(cid)) continue
+                if (ws != normCwd) {
+                    if (ws.isNotEmpty() && cid !in orderedCandidates) {
+                        otherWorkspaceCids.add(cid)
+                    }
+                    continue
+                }
+                otherWorkspaceCids.remove(cid)
                 val displayText = obj.str("display").trim()
                 if (displayText.isNotEmpty()) {
                     val promptList = historyPromptsByCid.getOrPut(cid) { ArrayList(6) }
@@ -370,7 +380,7 @@ class RemoteTranscriptSidecar(
         }
 
         // Tier 2: Active WAL sessions whose prompts haven't landed in `history.jsonl` yet
-        val extraWalUuids = activeWalUuids.filter { it !in orderedCandidates }
+        val extraWalUuids = activeWalUuids.filter { it !in orderedCandidates && it !in otherWorkspaceCids }
         if (extraWalUuids.isNotEmpty()) {
             for ((cid, logStat) in filterAgyUuidsByCwd(sftp, agyRoot, extraWalUuids, rawCwd, normCwd)) {
                 orderedCandidates.putIfAbsent(cid, logStat)
@@ -379,7 +389,7 @@ class RemoteTranscriptSidecar(
 
         // Tier 3: Fallback scan over `conversations/*.db`, then `brain/<uuid>` when still empty
         if (orderedCandidates.isEmpty()) {
-            val remainingDbUuids = recentDbUuids.filter { it !in activeWalSet }
+            val remainingDbUuids = recentDbUuids.filter { it !in activeWalSet && it !in otherWorkspaceCids }
             if (remainingDbUuids.isNotEmpty()) {
                 for ((cid, logStat) in filterAgyUuidsByCwd(sftp, agyRoot, remainingDbUuids, rawCwd, normCwd)) {
                     orderedCandidates.putIfAbsent(cid, logStat)
@@ -1402,8 +1412,22 @@ class RemoteTranscriptSidecar(
                 reqBody = stripXmlTagsBlock(raw)
             }
             val cleanBody = reqBody.trim()
+            val metaBlock = extractTagBody(raw, "<ADDITIONAL_METADATA>", "</ADDITIONAL_METADATA>")
+                ?: raw.substringBefore("<USER_REQUEST>", "")
+            val imgCount = agyUploadedImagesRegex.find(metaBlock)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val vidCount = agyUploadedVideosRegex.find(metaBlock)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val mediaBadges = buildList {
+                if ("[📎" !in cleanBody) {
+                    if (imgCount > 0) add("[📎 $imgCount image(s)]")
+                    if (vidCount > 0) add("[📎 $vidCount video(s)]")
+                }
+            }
+            val fullText = buildList {
+                if (cleanBody.isNotEmpty()) add(cleanBody)
+                addAll(mediaBadges)
+            }.joinToString("\n")
             val userStepIdx = obj.optInt("step_index", -1).takeIf { it >= 0 }
-            if (cleanBody.isEmpty() && modelChange.isEmpty()) {
+            if (fullText.isEmpty() && modelChange.isEmpty()) {
                 return if (hasTrunc && userStepIdx != null) userStepIdx else -1
             }
             outEvents.add(
@@ -1411,7 +1435,7 @@ class RemoteTranscriptSidecar(
                     lineByteOffset = lineOffset,
                     stepIndex = userStepIdx,
                     createdAt = obj.strOrNull("created_at"),
-                    text = capText(cleanBody, 32_768),
+                    text = capText(fullText, 32_768),
                     modelChange = modelChange.ifEmpty { null }
                 )
             )
@@ -1805,8 +1829,8 @@ class RemoteTranscriptSidecar(
                 val fp = cleanArg(args.firstStr("Path", "TargetFile", "file_path", "path"))
                 primaryTarget = baseName(fp)
                 if (primaryTarget.isNotEmpty()) changedFile = primaryTarget
-                val rep = cleanArg(args.firstStr("Replacement", "ReplacementContent", "new_string", "Content", "content"))
-                val tgt = cleanArg(args.firstStr("Target", "TargetContent", "old_string"))
+                val rep = cleanMultilineArg(args.firstStr("Replacement", "ReplacementContent", "new_string", "Content", "content"))
+                val tgt = cleanMultilineArg(args.firstStr("Target", "TargetContent", "old_string"))
                 if (tgt.isNotEmpty() || rep.isNotEmpty()) {
                     val delLines = if (tgt.isNotEmpty()) countLines(tgt) else 0
                     val addLines = if (rep.isNotEmpty()) countLines(rep) else 0
@@ -1820,7 +1844,7 @@ class RemoteTranscriptSidecar(
             }
 
             "apply_patch" -> {
-                val patch = cleanArg(args.firstStr("patch", "input"))
+                val patch = cleanMultilineArg(args.firstStr("patch", "input"))
                 val pf = extractPatchFile(patch)
                 primaryTarget = if (pf.isNotEmpty()) baseName(pf) else "patch"
                 if (pf.isNotEmpty()) changedFile = primaryTarget
@@ -1891,7 +1915,6 @@ class RemoteTranscriptSidecar(
         val lines = splitNormLines(content)
         if (lines.isEmpty()) return null
         val sb = StringBuilder()
-        sb.append("@@ -0,0 +1,").append(lines.size).append(" @@\n")
         val emit = minOf(lines.size, maxLines)
         for (i in 0 until emit) {
             val nextLn = "+${lines[i]}\n"
@@ -1947,15 +1970,9 @@ class RemoteTranscriptSidecar(
 
         val ctxBefore = minOf(2, prefix)
         val ctxAfter = minOf(2, suffix)
-        val hunkOldStart = (oldMidStart - ctxBefore) + 1
-        val hunkNewStart = (newMidStart - ctxBefore) + 1
-        val hunkOldLen = (oldMidEnd - oldMidStart) + ctxBefore + ctxAfter
-        val hunkNewLen = (newMidEnd - newMidStart) + ctxBefore + ctxAfter
 
         val sb = StringBuilder()
-        sb.append("@@ -").append(hunkOldStart).append(',').append(hunkOldLen)
-            .append(" +").append(hunkNewStart).append(',').append(hunkNewLen).append(" @@\n")
-        var lineCount = 1
+        var lineCount = 0
 
         for (i in (oldMidStart - ctxBefore) until oldMidStart) {
             val ln = " ${oldL[i]}\n"
@@ -1983,10 +2000,10 @@ class RemoteTranscriptSidecar(
                 val emit: String
                 if (x < oldMidCount && y < newMidCount && oldL[oldMidStart + x] == newL[newMidStart + y]) {
                     emit = " ${oldL[oldMidStart + x]}\n"; x++; y++
-                } else if (y < newMidCount && (x == oldMidCount || dp[x][y + 1] >= dp[x + 1][y])) {
-                    emit = "+${newL[newMidStart + y]}\n"; y++
-                } else {
+                } else if (x < oldMidCount && (y == newMidCount || dp[x + 1][y] >= dp[x][y + 1])) {
                     emit = "-${oldL[oldMidStart + x]}\n"; x++
+                } else {
+                    emit = "+${newL[newMidStart + y]}\n"; y++
                 }
                 if (sb.length + emit.length > maxChars) {
                     sb.append("…\n")
@@ -2154,6 +2171,20 @@ class RemoteTranscriptSidecar(
             if (unquoted is String) return unquoted.trim()
         }
         return t
+    }
+
+    private fun cleanMultilineArg(raw: String): String {
+        if (raw.isEmpty()) return ""
+        val trimmed = raw.trim()
+        if (trimmed.length >= 2 && trimmed.first() == '"' && trimmed.last() == '"') {
+            val unquoted = try {
+                JSONTokener(trimmed).nextValue()
+            } catch (_: Exception) {
+                null
+            }
+            if (unquoted is String) return unquoted.trimEnd('\r', '\n')
+        }
+        return raw.trimEnd('\r', '\n')
     }
 
     private fun splitNormLines(text: String): List<String> =
