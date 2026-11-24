@@ -7,23 +7,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
-import org.json.JSONObject
 import org.junit.Assert.*
-import org.junit.Assume
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
+import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
+import java.util.concurrent.atomic.AtomicInteger
 
 class RemoteTranscriptSidecarTest {
 
@@ -31,38 +23,87 @@ class RemoteTranscriptSidecarTest {
     val tempFolder = TemporaryFolder()
 
     @Test
-    fun mockChannelHandlesHandshakeLocateTailHeadStepAndRespawnsOnWarmEof() = runBlocking {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        var execCount = 0
+    fun sftpSidecarHandlesLocateTailHeadIdleStatAndRespawnsOnWarmError() = runBlocking {
+        val home = File(tempFolder.root, "home").apply { mkdirs() }
+        val agyRoot = File(home, ".gemini/antigravity-cli").apply { mkdirs() }
+        val uuid = "11111111-2222-3333-4444-555555555555"
+        File(agyRoot, "conversations").apply { mkdirs() }
+            .let { File(it, "$uuid.db-wal").writeBytes(byteArrayOf(1, 2, 3)) }
+        File(agyRoot, "history.jsonl").writeText(
+            """{"display":"hello","timestamp":1000,"workspace":"D:\\Work","conversationId":"$uuid"}""" + "\n",
+            StandardCharsets.UTF_8
+        )
+        val logsDir = File(agyRoot, "brain/$uuid/.system_generated/logs").apply { mkdirs() }
+        val compactLog = File(logsDir, "transcript.jsonl")
+        compactLog.writeText(
+            """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n停掉一切实例\n</USER_REQUEST>"}""" + "\n",
+            StandardCharsets.UTF_8
+        )
+        val stepsDir = File(agyRoot, "brain/$uuid/.system_generated/steps/5").apply { mkdirs() }
+        File(stepsDir, "output.txt").writeText("step 5 ok", StandardCharsets.UTF_8)
+
+        val execCount = AtomicInteger(0)
+        val openSftpCount = AtomicInteger(0)
+        val openReadCount = AtomicInteger(0)
+        var dropNextOpenRead = false
+
         val fakeSsh = object : AuthenticatedSshConnection {
             override val hostKeyFingerprint = "SHA256:test"
             override suspend fun exec(command: String): SshHcExecChannel {
-                execCount++
-                val idx = execCount
-                return FakeSidecarExecChannel(dropSecondRequest = (idx == 1))
+                execCount.incrementAndGet()
+                throw AssertionError("SFTP sidecar must never spawn exec()")
             }
+
+            override suspend fun openSftp(): SshSftpChannel {
+                val chIndex = openSftpCount.incrementAndGet()
+                val delegate = LocalFsSftpChannel(home, maxPacketBytes = 32_768)
+                return object : SshSftpChannel by delegate {
+                    override fun openRead(path: String): SshSftpFile {
+                        if (chIndex == 1 && dropNextOpenRead) {
+                            dropNextOpenRead = false
+                            throw IOException("simulated SFTP channel drop")
+                        }
+                        openReadCount.incrementAndGet()
+                        return delegate.openRead(path)
+                    }
+                }
+            }
+
             override fun close() = Unit
         }
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val sidecar = RemoteTranscriptSidecar(fakeSsh, HostPlatform.WINDOWS, scope)
         try {
             val loc = sidecar.locate(TranscriptAgentKind.ANTIGRAVITY, 1234L, "D:\\Work")
             assertNotNull(loc)
-            assertEquals("uuid-abc", loc!!.sessionId)
-            assertEquals(1, execCount)
+            assertEquals(uuid, loc!!.sessionId)
+            assertEquals(0, execCount.get())
+            assertEquals(1, openSftpCount.get())
 
-            // Warm channel drops once on request 2 -> transparent idempotent retry respawns channel 2!
+            // Simulate the warm SFTP channel dropping right before readTail -> auto-reconnects channel 2
+            dropNextOpenRead = true
+            val readsBeforeTail = openReadCount.get()
             val tail = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, loc.path, 0L)
-            assertEquals(2, execCount)
+            assertEquals(2, openSftpCount.get())
+            assertEquals(readsBeforeTail + 1, openReadCount.get())
             assertEquals(1, tail.events.size)
             val msg = tail.events.single() as TranscriptRawEvent.UserMessage
             assertEquals("停掉一切实例", msg.text)
 
-            val head = sidecar.readHead(TranscriptAgentKind.ANTIGRAVITY, loc.path, 128L)
+            // Idle poll when offset == fileSize uses stat only and never opens remote file
+            val idle = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, loc.path, tail.nextOffset)
+            assertEquals(tail.nextOffset, idle.nextOffset)
+            assertTrue(idle.events.isEmpty())
+            assertEquals(readsBeforeTail + 1, openReadCount.get())
+
+            val head = sidecar.readHead(TranscriptAgentKind.ANTIGRAVITY, loc.path, tail.nextOffset)
             assertFalse(head.hasEarlier)
-            assertEquals(2, execCount) // Reuses warm channel 2 without respawning
+            assertEquals(2, openSftpCount.get())
 
             val stepOut = sidecar.readStepOutput(TranscriptAgentKind.ANTIGRAVITY, loc.path, 5)
             assertEquals("step 5 ok", stepOut)
+            assertEquals(0, execCount.get())
         } finally {
             sidecar.close()
             scope.cancel()
@@ -70,38 +111,24 @@ class RemoteTranscriptSidecarTest {
     }
 
     @Test
-    fun realWindowsPowerShellSidecarStreamsIncrementalUtf8AndPreFiltersAllThreeAgents() = runBlocking {
-        Assume.assumeTrue(System.getProperty("os.name").lowercase().contains("windows"))
-
+    fun localSftpSidecarLocatesAndStreamsAllThreeAgentsWithHydrationAndBackfill() = runBlocking {
+        val home = File(tempFolder.root, "home2").apply { mkdirs() }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val cmdTokens = RemoteTranscriptSidecar.windowsBootstrapCommand().split(' ').filter { it.isNotEmpty() }
         val localSsh = object : AuthenticatedSshConnection {
-            override val hostKeyFingerprint = "local-win"
+            override val hostKeyFingerprint = "local-sftp"
             override suspend fun exec(command: String): SshHcExecChannel {
-                val tokens = command.split(' ').filter { it.isNotEmpty() }
-                val proc = ProcessBuilder(tokens).start()
-                return object : SshHcExecChannel {
-                    override val input: InputStream = proc.inputStream
-                    override val output: OutputStream = proc.outputStream
-                    override val stderr: InputStream = proc.errorStream
-                    override fun close() {
-                        runCatching { proc.outputStream.close() }
-                        runCatching { proc.inputStream.close() }
-                        runCatching { proc.errorStream.close() }
-                        if (!proc.waitFor(2, TimeUnit.SECONDS)) {
-                            proc.destroyForcibly()
-                        }
-                    }
-                }
+                throw AssertionError("exec() must not be called")
             }
+
+            override suspend fun openSftp(): SshSftpChannel = LocalFsSftpChannel(home, maxPacketBytes = 32_768)
             override fun close() = Unit
         }
-        assertTrue(cmdTokens[0].equals("powershell.exe", ignoreCase = true))
 
-        val sidecar = RemoteTranscriptSidecar(localSsh, HostPlatform.WINDOWS, scope, initTimeoutMs = 20_000L)
+        val sidecar = RemoteTranscriptSidecar(localSsh, HostPlatform.WINDOWS, scope)
         try {
-            // 1. Antigravity transcript_full.jsonl + steps/2/output.txt
-            val agyBrain = File(tempFolder.root, "brain-1/.system_generated").apply { mkdirs() }
+            // 1. Antigravity locate via brain fallback + transcript_full.jsonl + steps/2/output.txt
+            val agyUuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            val agyBrain = File(home, ".gemini/antigravity-cli/brain/$agyUuid/.system_generated").apply { mkdirs() }
             val agyLogs = File(agyBrain, "logs").apply { mkdirs() }
             val step2Dir = File(agyBrain, "steps/2").apply { mkdirs() }
             File(step2Dir, "output.txt").writeText("完整的第2步输出：停掉一切实例 OK", StandardCharsets.UTF_8)
@@ -109,13 +136,17 @@ class RemoteTranscriptSidecarTest {
             val agyLog = File(agyLogs, "transcript_full.jsonl")
             val hugeBody = "A".repeat(40_000)
             val largeReplacement = (1..20).joinToString("\\n") { "line $it" }
-            val line1 = """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-23T01:00:00Z","content":"<USER_REQUEST>\n停掉一切实例 🚀\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>"}"""
+            val line1 = """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-23T01:00:00Z","content":"<USER_REQUEST>\n停掉一切实例 🚀\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>\n<ADDITIONAL_METADATA>\nActive Workspace: D:\\Code\\Demo\n</ADDITIONAL_METADATA>"}"""
             val line2 = """{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-23T01:00:05Z","input_tokens":1200,"cache_read_tokens":600,"output_tokens":340,"thinking":"Analyze shutdown steps","content":"## 执行计划\n\n````kotlin\nfun stopAll() = \"停掉一切实例\"\n````\n\n| 模块 | 状态 |\n| :--- | :---: |\n| core | 完成 |","tool_calls":[{"name":"edit_file","args":{"Path":"\"D:\\\\Code\\\\Foo.kt\"","Target":"oldLine1\noldLine2","Replacement":"$largeReplacement"}}]}"""
             val line3GenericHuge = """{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"$hugeBody"}"""
             val line4GenericErr = """{"step_index":9,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"permission denied"}"""
             agyLog.writeText("$line1\n$line2\n$line3GenericHuge\n$line4GenericErr\n", StandardCharsets.UTF_8)
 
-            val tail1 = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, agyLog.absolutePath, 0L)
+            val locatedAgy = sidecar.locate(TranscriptAgentKind.ANTIGRAVITY, 999L, "D:\\Code\\Demo")
+            assertNotNull(locatedAgy)
+            assertEquals(agyUuid, locatedAgy!!.sessionId)
+
+            val tail1 = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, locatedAgy.path, 0L)
             assertFalse(tail1.hasEarlier)
             assertEquals(agyLog.length(), tail1.nextOffset)
             assertEquals(3, tail1.events.size) // line3 GENERIC DONE stripped!
@@ -132,17 +163,41 @@ class RemoteTranscriptSidecarTest {
             assertEquals("Foo.kt", a1.toolCalls[0].changedFile)
             assertEquals("+20 -2 行", a1.toolCalls[0].detailPreview)
             assertEquals(2, a1.toolCalls[0].resultStepIndex)
+            assertNotNull(a1.toolCalls[0].diffPreview)
+            assertTrue(a1.toolCalls[0].diffPreview!!.contains("-oldLine1"))
+            assertTrue(a1.toolCalls[0].diffPreview!!.contains("+line 1"))
 
             val err1 = tail1.events[2] as TranscriptRawEvent.ToolStatusUpdate
             assertEquals("step_9", err1.callId)
             assertTrue(err1.hasError)
 
-            // Step output lookup
-            val stepText = sidecar.readStepOutput(TranscriptAgentKind.ANTIGRAVITY, agyLog.absolutePath, 2)
+            val stepText = sidecar.readStepOutput(TranscriptAgentKind.ANTIGRAVITY, locatedAgy.path, 2)
             assertEquals("完整的第2步输出：停掉一切实例 OK", stepText)
 
+            // Compact transcript.jsonl + sibling transcript_full.jsonl selective hydration + step fallback
+            val hydrateBrain = File(home, ".gemini/antigravity-cli/brain/22222222-3333-4444-5555-666666666666/.system_generated/logs").apply { mkdirs() }
+            val hydrateCompact = File(hydrateBrain, "transcript.jsonl")
+            val hydrateFull = File(hydrateBrain, "transcript_full.jsonl")
+            val cLine1 = """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\n第1轮提问\n</USER_REQUEST>"}"""
+            val cLine2 = """{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"truncated preview\n<truncated 5000 bytes>","truncated_fields":["content","tool_calls"],"tool_calls":[{"name":"edit_file","args":{"Path":"\"D:\\\\Code\\\\Bar.kt\""}}]}"""
+            val cLine3 = """{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"short preview\n<truncated 9000 bytes>","truncated_fields":["content"]}"""
+            val fLine2 = """{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"完整无损 Markdown 正文 ### 章节\n\n````kotlin\nval hydrated = true\n````","tool_calls":[{"name":"edit_file","args":{"Path":"\"D:\\\\Code\\\\Bar.kt\"","Target":"val old = 1\nval keep = 2","Replacement":"val old = 99\nval keep = 2"}}]}"""
+            val fLine3 = """{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"完整第2步输出：UNTRUNCATED_OK"}"""
+            hydrateCompact.writeText("$cLine1\n$cLine2\n$cLine3\n", StandardCharsets.UTF_8)
+            hydrateFull.writeText("$cLine1\n$fLine2\n$fLine3\n", StandardCharsets.UTF_8)
+
+            val hCompactSftpPath = toTestSftpPath(hydrateCompact)
+            val hTail = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, hCompactSftpPath, 0L)
+            assertEquals(2, hTail.events.size)
+            val hAsst = hTail.events[1] as TranscriptRawEvent.AssistantStep
+            assertTrue(hAsst.markdownContent.contains("完整无损 Markdown 正文"))
+            assertTrue(hAsst.toolCalls[0].diffPreview!!.contains("-val old = 1"))
+            assertTrue(hAsst.toolCalls[0].diffPreview!!.contains("+val old = 99"))
+            val hStep = sidecar.readStepOutput(TranscriptAgentKind.ANTIGRAVITY, hCompactSftpPath, 2)
+            assertTrue(hStep.contains("UNTRUNCATED_OK"))
+
             // Unchanged file -> 0 new events, same offset
-            val tailSame = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, agyLog.absolutePath, tail1.nextOffset)
+            val tailSame = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, locatedAgy.path, tail1.nextOffset)
             assertEquals(tail1.nextOffset, tailSame.nextOffset)
             assertTrue(tailSame.events.isEmpty())
 
@@ -151,37 +206,38 @@ class RemoteTranscriptSidecarTest {
             val partial = """{"step_index":11,"source":"MOD"""
             agyLog.appendText("$line5\n$partial", StandardCharsets.UTF_8)
 
-            val tailPartial = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, agyLog.absolutePath, tail1.nextOffset)
+            val tailPartial = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, locatedAgy.path, tail1.nextOffset)
             assertEquals(1, tailPartial.events.size)
             assertEquals("全部已停掉", (tailPartial.events[0] as TranscriptRawEvent.AssistantStep).markdownContent)
             assertTrue(tailPartial.nextOffset < agyLog.length())
 
             // Finish partial line with \n
             agyLog.appendText("""EL","type":"PLANNER_RESPONSE","status":"DONE","content":"收尾完成"}""" + "\n", StandardCharsets.UTF_8)
-            val tailComplete = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, agyLog.absolutePath, tailPartial.nextOffset)
+            val tailComplete = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, locatedAgy.path, tailPartial.nextOffset)
             assertEquals(1, tailComplete.events.size)
             assertEquals("收尾完成", (tailComplete.events[0] as TranscriptRawEvent.AssistantStep).markdownContent)
             assertEquals(agyLog.length(), tailComplete.nextOffset)
 
-            // Head upward pagination with small window (note sidecar clamps minimum window to 65_536; make >100KB file to test!)
-            val bigLog = File(tempFolder.root, "big_transcript.jsonl")
+            // Head upward pagination + >= 24-turn initial backfill over 32 KB SFTP packet reads
+            val bigLog = File(home, "big_transcript.jsonl")
             val sb = StringBuilder()
             for (k in 0 until 120) {
                 val pad = "x".repeat(900)
                 sb.append("""{"step_index":${k * 2},"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\n第${k}轮消息 $pad\n</USER_REQUEST>"}""").append('\n')
             }
             bigLog.writeText(sb.toString(), StandardCharsets.UTF_8)
-            val bigTail = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, bigLog.absolutePath, 0L, windowBytes = 65_536L)
+            val bigSftpPath = toTestSftpPath(bigLog)
+            val bigTail = sidecar.readTail(TranscriptAgentKind.ANTIGRAVITY, bigSftpPath, 0L, windowBytes = 65_536L)
+            assertTrue(bigTail.events.count { it is TranscriptRawEvent.UserMessage } >= 24)
             assertTrue(bigTail.hasEarlier)
             assertTrue(bigTail.startOffset > 0L)
-            val pageEarlier = sidecar.readHead(TranscriptAgentKind.ANTIGRAVITY, bigLog.absolutePath, bigTail.startOffset, windowBytes = 65_536L)
+            val pageEarlier = sidecar.readHead(TranscriptAgentKind.ANTIGRAVITY, bigSftpPath, bigTail.startOffset, windowBytes = 65_536L)
             assertFalse(pageEarlier.hasEarlier)
             assertEquals(0L, pageEarlier.startOffset)
-            val totalRecovered = pageEarlier.events.size + bigTail.events.size
-            assertEquals(120, totalRecovered)
+            assertEquals(120, pageEarlier.events.size + bigTail.events.size)
 
-            // 2. Codex rollout-*.jsonl
-            val codexFile = File(tempFolder.root, "rollout-123.jsonl")
+            // 2. Codex rollout-*.jsonl locate + readTail
+            val codexFile = File(home, ".codex/sessions/2026/11/24/rollout-123.jsonl").apply { parentFile.mkdirs() }
             codexFile.writeText(
                 listOf(
                     """{"timestamp":"2026-11-23T02:00:00Z","type":"session_meta","payload":{"id":"cid-1","cwd":"D:\\Work"}}""",
@@ -196,7 +252,10 @@ class RemoteTranscriptSidecarTest {
                 ).joinToString("\n") + "\n",
                 StandardCharsets.UTF_8
             )
-            val codexChunk = sidecar.readTail(TranscriptAgentKind.CODEX, codexFile.absolutePath, 0L)
+            val locatedCodex = sidecar.locate(TranscriptAgentKind.CODEX, null, "D:\\Work")
+            assertNotNull(locatedCodex)
+            assertEquals("cid-1", locatedCodex!!.sessionId)
+            val codexChunk = sidecar.readTail(TranscriptAgentKind.CODEX, locatedCodex.path, 0L)
             val codexUsers = codexChunk.events.filterIsInstance<TranscriptRawEvent.UserMessage>()
             assertEquals(1, codexUsers.size)
             assertEquals("请修复回归", codexUsers.single().text)
@@ -206,8 +265,8 @@ class RemoteTranscriptSidecarTest {
             assertEquals("Foo.kt", codexPatchEv.toolCalls[0].changedFile)
             assertEquals("+1 -1 行", codexPatchEv.toolCalls[0].detailPreview)
 
-            // 3. Claude Code .jsonl
-            val claudeFile = File(tempFolder.root, "claude-session.jsonl")
+            // 3. Claude Code .jsonl locate via project slug + readTail
+            val claudeFile = File(home, ".claude/projects/D--ClaudeProj/claude-session.jsonl").apply { parentFile.mkdirs() }
             claudeFile.writeText(
                 listOf(
                     """{"type":"user","isMeta":true,"message":{"role":"user","content":"ignored meta"}}""",
@@ -217,7 +276,10 @@ class RemoteTranscriptSidecarTest {
                 ).joinToString("\n") + "\n",
                 StandardCharsets.UTF_8
             )
-            val claudeChunk = sidecar.readTail(TranscriptAgentKind.CLAUDE, claudeFile.absolutePath, 0L)
+            val locatedClaude = sidecar.locate(TranscriptAgentKind.CLAUDE, null, "D:\\ClaudeProj")
+            assertNotNull(locatedClaude)
+            assertEquals("claude-session", locatedClaude!!.sessionId)
+            val claudeChunk = sidecar.readTail(TranscriptAgentKind.CLAUDE, locatedClaude.path, 0L)
             assertEquals(3, claudeChunk.events.size)
             val cUser = claudeChunk.events[0] as TranscriptRawEvent.UserMessage
             assertEquals("Check build", cUser.text)
@@ -229,88 +291,102 @@ class RemoteTranscriptSidecarTest {
             val cErr = claudeChunk.events[2] as TranscriptRawEvent.ToolStatusUpdate
             assertEquals("toolu_1", cErr.callId)
             assertTrue(cErr.hasError)
+
+            // Tier 1 Claude session lookup via ~/.claude/sessions/<pid>.json
+            val claudePidDir = File(home, ".claude/sessions").apply { mkdirs() }
+            val pidSessionFile = File(home, ".claude/projects/D--OtherProj/pid-sess-42.jsonl").apply { parentFile.mkdirs() }
+            pidSessionFile.writeText(
+                """{"type":"user","timestamp":"2026-11-23T04:00:00Z","message":{"role":"user","content":"matched by pid"}}""" + "\n",
+                StandardCharsets.UTF_8
+            )
+            File(claudePidDir, "4242.json").writeText("""{"pid":4242,"sessionId":"pid-sess-42"}""", StandardCharsets.UTF_8)
+            val locatedClaudeByPid = sidecar.locate(TranscriptAgentKind.CLAUDE, 4242L, "D:\\UnrelatedCwd")
+            assertNotNull(locatedClaudeByPid)
+            assertEquals("pid-sess-42", locatedClaudeByPid!!.sessionId)
         } finally {
             sidecar.close()
             scope.cancel()
         }
     }
 
-    private class FakeSidecarExecChannel(private val dropSecondRequest: Boolean) : SshHcExecChannel {
-        private val outQueue = LinkedBlockingQueue<ByteArray>()
-        private val closed = AtomicBoolean(false)
-        private val reqBuffer = ByteArrayOutputStream()
+    private fun toTestSftpPath(file: File): String {
+        val slash = file.absolutePath.replace('\\', '/')
+        return if (slash.length >= 2 && slash[0].isLetter() && slash[1] == ':') "/$slash" else slash
+    }
 
-        override val input: InputStream = object : InputStream() {
-            private var cur = byteArrayOf()
-            private var pos = 0
-            override fun read(): Int {
-                while (pos >= cur.size) {
-                    if (closed.get() && outQueue.isEmpty()) return -1
-                    cur = outQueue.take()
-                    pos = 0
-                    if (cur.isEmpty()) return -1
+    /**
+     * Local filesystem SFTP test double that mimics Windows OpenSSH `sftp-server.exe` behavior:
+     * - `homeDirectory()` returns `/C:/...` formatted canonical home
+     * - `readAt()` caps each single read return at [maxPacketBytes] (default 32 KB)
+     */
+    private class LocalFsSftpChannel(
+        private val homeRoot: File,
+        private val maxPacketBytes: Int = 32_768
+    ) : SshSftpChannel {
+
+        private fun normalizeToSftpString(file: File): String {
+            val slash = file.absolutePath.replace('\\', '/')
+            return if (slash.length >= 2 && slash[0].isLetter() && slash[1] == ':') "/$slash" else slash
+        }
+
+        private fun resolveLocal(path: String): File {
+            var p = path.trim().replace('\\', '/')
+            if (p.length >= 3 && p[0] == '/' && p[1].isLetter() && p[2] == ':') {
+                p = p.substring(1)
+            }
+            return File(p)
+        }
+
+        override fun homeDirectory(): String = normalizeToSftpString(homeRoot)
+
+        override fun statOrNull(path: String): SftpEntryInfo? {
+            val f = resolveLocal(path)
+            if (!f.exists()) return null
+            return SftpEntryInfo(
+                name = f.name,
+                path = normalizeToSftpString(f),
+                isDirectory = f.isDirectory,
+                isRegularFile = f.isFile,
+                size = if (f.isFile) f.length() else 0L,
+                mtimeSeconds = f.lastModified() / 1000L
+            )
+        }
+
+        override fun listDir(path: String): List<SftpEntryInfo> {
+            val dir = resolveLocal(path)
+            if (!dir.isDirectory) return emptyList()
+            val children = dir.listFiles() ?: return emptyList()
+            return children.map { f ->
+                SftpEntryInfo(
+                    name = f.name,
+                    path = normalizeToSftpString(f),
+                    isDirectory = f.isDirectory,
+                    isRegularFile = f.isFile,
+                    size = if (f.isFile) f.length() else 0L,
+                    mtimeSeconds = f.lastModified() / 1000L
+                )
+            }
+        }
+
+        override fun openRead(path: String): SshSftpFile {
+            val f = resolveLocal(path)
+            val raf = RandomAccessFile(f, "r")
+            return object : SshSftpFile {
+                override fun length(): Long = raf.length()
+
+                override fun readAt(fileOffset: Long, dst: ByteArray, dstOffset: Int, len: Int): Int {
+                    if (len <= 0) return 0
+                    raf.seek(fileOffset)
+                    val capped = minOf(len, maxPacketBytes)
+                    return raf.read(dst, dstOffset, capped)
                 }
-                return cur[pos++].toInt() and 255
-            }
-            override fun read(b: ByteArray, off: Int, len: Int): Int {
-                if (len == 0) return 0
-                val first = read()
-                if (first < 0) return -1
-                b[off] = first.toByte()
-                val rem = minOf(len - 1, cur.size - pos)
-                cur.copyInto(b, off + 1, pos, pos + rem)
-                pos += rem
-                return rem + 1
-            }
-        }
 
-        private var lineIndex = 0
-        override val output: OutputStream = object : OutputStream() {
-            override fun write(b: Int) {
-                if (closed.get()) throw IOException("closed")
-                if (b == 10) {
-                    val ln = reqBuffer.toString(StandardCharsets.UTF_8.name())
-                    reqBuffer.reset()
-                    handleLine(ln)
-                } else if (b != 13) {
-                    reqBuffer.write(b)
+                override fun close() {
+                    raf.close()
                 }
             }
         }
 
-        override val stderr: InputStream = ByteArrayInputStream(byteArrayOf())
-
-        private fun handleLine(line: String) {
-            if (lineIndex == 0) {
-                lineIndex++
-                send("""{"ok":true,"ready":true}""")
-                return
-            }
-            lineIndex++
-            if (dropSecondRequest && lineIndex == 3) {
-                close()
-                return
-            }
-            val req = JSONObject(line)
-            val id = req.getLong("id")
-            val resp = when (req.getString("op")) {
-                "locate" -> """{"ok":true,"id":$id,"found":true,"agent":"agy","sessionId":"uuid-abc","path":"C:\\logs\\transcript_full.jsonl","fileSize":1024}"""
-                "tail" -> """{"ok":true,"id":$id,"path":"C:\\logs\\transcript_full.jsonl","startOffset":0,"nextOffset":128,"fileSize":128,"hasEarlier":false,"reset":false,"events":[{"k":"user","o":0,"text":"停掉一切实例"}]}"""
-                "head" -> """{"ok":true,"id":$id,"path":"C:\\logs\\transcript_full.jsonl","startOffset":0,"nextOffset":128,"fileSize":128,"hasEarlier":false,"reset":false,"events":[]}"""
-                "step" -> """{"ok":true,"id":$id,"output":"step 5 ok"}"""
-                else -> """{"ok":false,"id":$id,"error":"bad op"}"""
-            }
-            send(resp)
-        }
-
-        private fun send(s: String) {
-            outQueue.put((s + "\n").toByteArray(StandardCharsets.UTF_8))
-        }
-
-        override fun close() {
-            if (closed.compareAndSet(false, true)) {
-                outQueue.offer(byteArrayOf())
-            }
-        }
+        override fun close() = Unit
     }
 }

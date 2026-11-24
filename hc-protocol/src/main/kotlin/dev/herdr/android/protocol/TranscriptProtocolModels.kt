@@ -43,7 +43,8 @@ data class TranscriptToolCallSummary(
     val detailPreview: String = "",
     val changedFile: String? = null,
     val resultStepIndex: Int? = null,
-    val hasError: Boolean = false
+    val hasError: Boolean = false,
+    val diffPreview: String? = null
 )
 
 sealed interface TranscriptRawEvent {
@@ -228,7 +229,8 @@ object TranscriptWireJson {
                     detailPreview = tc.optString("d", ""),
                     changedFile = tc.nullableString("f"),
                     resultStepIndex = tc.optPositiveOrZeroInt("rs"),
-                    hasError = tc.optBoolean("err", false)
+                    hasError = tc.optBoolean("err", false),
+                    diffPreview = tc.nullableString("df")
                 )
             )
         }

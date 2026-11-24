@@ -312,9 +312,10 @@ fun AgentWorkbenchPane(
             )
         )
     }
-    var snapshot by remember(session.address) {
+    var fusedSnapshot by remember(session.address) {
         mutableStateOf(liveSnapshot)
     }
+    var preferRawMarkdown by remember(session.address) { mutableStateOf(true) }
     var hasInitialSnapshot by remember(session.address) { mutableStateOf(false) }
 
     val latestTranscriptState by rememberUpdatedState(transcriptState)
@@ -339,16 +340,22 @@ fun AgentWorkbenchPane(
             TranscriptSessionAssembler.fuseWithLiveWorkbench(latestTranscriptState, computed, summary)
         }
         liveSnapshot = computed
-        snapshot = fused
+        fusedSnapshot = fused
         hasInitialSnapshot = true
     }
 
     LaunchedEffect(session.address, transcriptState) {
         if (hasInitialSnapshot) {
-            snapshot = withContext(Dispatchers.Default) {
+            fusedSnapshot = withContext(Dispatchers.Default) {
                 TranscriptSessionAssembler.fuseWithLiveWorkbench(transcriptState, liveSnapshot, currentSummary)
             }
         }
+    }
+
+    val snapshot = if (preferRawMarkdown && fusedSnapshot.isRawMarkdownActive) {
+        fusedSnapshot
+    } else {
+        liveSnapshot
     }
 
     val syncAgentKind = remember(summary.agentApp, liveSnapshot.dialect) {
@@ -755,7 +762,33 @@ fun AgentWorkbenchPane(
         // ---------------- Content ----------------
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             if (readerMode) {
+                val showStreamStrip = syncAgentKind != null && (
+                    fusedSnapshot.isRawMarkdownActive ||
+                        transcriptState?.path?.isNotBlank() == true ||
+                        transcriptState?.locateAttempted == true
+                    )
+                val activeStreamModel = transcriptState?.activeModel?.takeIf { it.isNotBlank() }
+                    ?: turns.lastOrNull()?.modelLabel
                 Column(modifier = Modifier.fillMaxSize()) {
+                    if (showStreamStrip) {
+                        ReaderStreamStatusStrip(
+                            isRawMarkdownSupported = fusedSnapshot.isRawMarkdownActive,
+                            isShowingRawMarkdown = preferRawMarkdown && fusedSnapshot.isRawMarkdownActive,
+                            turnCount = fusedSnapshot.turns.size,
+                            sessionId = transcriptState?.sessionId.orEmpty(),
+                            activeModel = activeStreamModel,
+                            lastError = transcriptState?.lastError,
+                            onCopy = { text -> clipboard.setText(AnnotatedString(text)) },
+                            onToggleStreamSource = {
+                                if (fusedSnapshot.isRawMarkdownActive) {
+                                    preferRawMarkdown = !preferRawMarkdown
+                                } else {
+                                    onRequestTranscriptSync(liveSnapshot.dialect, true)
+                                }
+                            }
+                        )
+                        HerdrDivider()
+                    }
                     if (turns.size >= 2) {
                         TurnQuickJumpBar(
                             turns = turns,
@@ -2033,6 +2066,15 @@ private fun ReaderBlock(
             }
         }
 
+        is TerminalSemanticBlock.MarkdownDocumentBlock -> {
+            MarkdownDocumentRenderer(
+                nodes = block.nodes,
+                rawMarkdown = block.rawMarkdown,
+                stateKey = stateKey,
+                onCopy = onCopy
+            )
+        }
+
         is TerminalSemanticBlock.ToolGroupBlock -> {
             if (block.isPureThought) {
                 ThoughtPillCard(block = block, stateKey = stateKey, onCopy = onCopy)
@@ -2273,6 +2315,12 @@ private fun ToolGroupCard(
 ) {
     var expanded by remember(stateKey, block.defaultExpanded) { mutableStateOf(block.defaultExpanded) }
     var expandedStepIndices by remember(stateKey) { mutableStateOf(emptySet<Int>()) }
+    var expandedDiffStepIndices by remember(stateKey) { mutableStateOf(emptySet<Int>()) }
+    val diffIndices = remember(block.entries) {
+        block.entries.mapIndexedNotNull { idx, entry ->
+            if (!entry.diffPreview.isNullOrBlank()) idx else null
+        }
+    }
     val primaryLabel = block.actionBreakdownLabel ?: block.summaryLabel
     val pillBg = when {
         block.hasError -> HerdrColors.BlockedSubtle
@@ -2291,7 +2339,12 @@ private fun ToolGroupCard(
                 .clip(HerdrShapes.Control)
                 .background(pillBg)
                 .combinedClickable(
-                    onClick = { expanded = !expanded },
+                    onClick = {
+                        if (!expanded && expandedDiffStepIndices.isEmpty() && diffIndices.isNotEmpty()) {
+                            expandedDiffStepIndices = diffIndices.take(1).toSet()
+                        }
+                        expanded = !expanded
+                    },
                     onLongClick = { onCopy(block.steps.joinToString("\n")) }
                 )
                 .padding(horizontal = 10.dp, vertical = 7.dp),
@@ -2312,6 +2365,26 @@ private fun ToolGroupCard(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
+            if (diffIndices.isNotEmpty()) {
+                val allDiffsShown = diffIndices.all { it in expandedDiffStepIndices }
+                Box(
+                    modifier = Modifier
+                        .clip(HerdrShapes.Pill)
+                        .background(if (expanded && allDiffsShown) HerdrColors.AccentSubtle else HerdrColors.DoneSubtle)
+                        .clickable {
+                            expanded = true
+                            expandedDiffStepIndices = if (allDiffsShown) emptySet() else diffIndices.toSet()
+                        }
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        "± ${diffIndices.size} Diff",
+                        style = HerdrType.Caption.copy(fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold),
+                        color = if (expanded && allDiffsShown) HerdrColors.Accent else HerdrColors.Done,
+                        maxLines = 1
+                    )
+                }
+            }
             if (!block.thoughtSummaryLabel.isNullOrBlank()) {
                 Box(
                     modifier = Modifier
@@ -2340,11 +2413,27 @@ private fun ToolGroupCard(
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 block.changedFiles.take(8).forEach { file ->
+                    val fileDiffIndices = remember(block.entries, file) {
+                        block.entries.mapIndexedNotNull { idx, entry ->
+                            if (!entry.diffPreview.isNullOrBlank() && file in entry.changedFiles) idx else null
+                        }
+                    }
+                    val hasDiffForFile = fileDiffIndices.isNotEmpty()
                     Row(
                         modifier = Modifier
                             .clip(HerdrShapes.Pill)
                             .background(HerdrColors.Raised)
-                            .clickable { onCopy(file) }
+                            .combinedClickable(
+                                onClick = {
+                                    if (hasDiffForFile) {
+                                        expanded = true
+                                        expandedDiffStepIndices = expandedDiffStepIndices + fileDiffIndices
+                                    } else {
+                                        onCopy(file)
+                                    }
+                                },
+                                onLongClick = { onCopy(file) }
+                            )
                             .padding(horizontal = 8.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -2356,6 +2445,14 @@ private fun ToolGroupCard(
                             color = HerdrColors.Foreground,
                             maxLines = 1
                         )
+                        if (hasDiffForFile) {
+                            Text(
+                                "Diff",
+                                style = HerdrType.Caption.copy(fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold),
+                                color = HerdrColors.Done,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
                 if (block.changedFiles.size > 8) {
@@ -2381,7 +2478,7 @@ private fun ToolGroupCard(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 if (block.entries.isNotEmpty()) {
-                    block.entries.forEach { entry ->
+                    block.entries.forEachIndexed { entryIdx, entry ->
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
@@ -2412,6 +2509,25 @@ private fun ToolGroupCard(
                                     color = if (entry.hasError) HerdrColors.Blocked else HerdrColors.Foreground,
                                     modifier = Modifier.weight(1f)
                                 )
+                                if (!entry.diffPreview.isNullOrBlank()) {
+                                    val isDiffOpen = entryIdx in expandedDiffStepIndices
+                                    Text(
+                                        text = if (isDiffOpen) "收起 Diff ▴" else "Diff ▾",
+                                        style = HerdrType.Caption.copy(fontSize = 10.5.sp),
+                                        color = HerdrColors.Done,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier
+                                            .clip(HerdrShapes.Small)
+                                            .clickable {
+                                                expandedDiffStepIndices = if (isDiffOpen) {
+                                                    expandedDiffStepIndices - entryIdx
+                                                } else {
+                                                    expandedDiffStepIndices + entryIdx
+                                                }
+                                            }
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
                                 val rStep = entry.resultStepIndex
                                 if (rStep != null) {
                                     val isStepOpen = rStep in expandedStepIndices
@@ -2455,6 +2571,15 @@ private fun ToolGroupCard(
                                         softWrap = false
                                     )
                                 }
+                            }
+                            val entryDiff = entry.diffPreview
+                            if (!entryDiff.isNullOrBlank() && entryIdx in expandedDiffStepIndices) {
+                                InlineUnifiedDiffCard(
+                                    diffText = entryDiff,
+                                    fileLabel = entry.changedFiles.firstOrNull(),
+                                    stateKey = "$stateKey#diff#$entryIdx",
+                                    onCopy = onCopy
+                                )
                             }
                             val rStep = entry.resultStepIndex
                             if (rStep != null && rStep in expandedStepIndices) {
@@ -2521,6 +2646,93 @@ private fun LoadEarlierTranscriptBanner(
             color = if (isLoading) HerdrColors.Muted else HerdrColors.Accent,
             fontWeight = FontWeight.Medium
         )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ReaderStreamStatusStrip(
+    isRawMarkdownSupported: Boolean,
+    isShowingRawMarkdown: Boolean,
+    turnCount: Int,
+    sessionId: String,
+    activeModel: String?,
+    lastError: String?,
+    onCopy: (String) -> Unit,
+    onToggleStreamSource: () -> Unit
+) {
+    val (pillBg, pillFg, modeLabel) = when {
+        !isRawMarkdownSupported && !lastError.isNullOrBlank() ->
+            Triple(HerdrColors.BlockedSubtle, HerdrColors.Blocked, "⚠️ 旁路重试")
+        !isRawMarkdownSupported ->
+            Triple(HerdrColors.WorkingSubtle, HerdrColors.Working, "⏳ 挂载 .jsonl 旁路…")
+        isShowingRawMarkdown ->
+            Triple(HerdrColors.DoneSubtle, HerdrColors.Done, "⚡ 原生 MD 流 · ${turnCount} 轮")
+        else ->
+            Triple(HerdrColors.AccentSubtle, HerdrColors.Accent, "🖥️ 屏幕流 · 点击切回 MD")
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(HerdrColors.Chrome.copy(alpha = 0.85f))
+            .padding(horizontal = 12.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(HerdrShapes.Pill)
+                .background(pillBg)
+                .combinedClickable(
+                    onClick = onToggleStreamSource,
+                    onLongClick = { if (!lastError.isNullOrBlank()) onCopy(lastError) }
+                )
+                .padding(horizontal = 9.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Text(
+                text = modeLabel,
+                style = HerdrType.Caption.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
+                color = pillFg,
+                maxLines = 1
+            )
+            if (isRawMarkdownSupported) {
+                Text(
+                    text = "⇄",
+                    style = HerdrType.Caption.copy(fontSize = 11.sp),
+                    color = pillFg.copy(alpha = 0.85f),
+                    maxLines = 1
+                )
+            }
+        }
+        Spacer(Modifier.weight(1f))
+        val shortSession = remember(sessionId) {
+            sessionId.trim().takeIf { it.isNotEmpty() }?.take(8)
+        }
+        if (shortSession != null) {
+            Box(
+                modifier = Modifier
+                    .clip(HerdrShapes.Small)
+                    .background(HerdrColors.Raised)
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = shortSession,
+                    style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontSize = 10.sp),
+                    color = HerdrColors.Dim,
+                    maxLines = 1
+                )
+            }
+        }
+        if (!activeModel.isNullOrBlank()) {
+            OneLine(
+                text = activeModel,
+                style = HerdrType.Caption.copy(fontSize = 10.5.sp),
+                color = HerdrColors.Muted,
+                modifier = Modifier.widthIn(max = 150.dp)
+            )
+        }
     }
 }
 

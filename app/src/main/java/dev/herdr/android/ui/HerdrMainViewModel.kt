@@ -3,6 +3,7 @@ package dev.herdr.android.ui
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.herdr.android.connection.ConnectionProfile
@@ -42,6 +43,7 @@ import dev.herdr.android.ui.workbench.ImageUploadPreparer
 import dev.herdr.android.update.AppUpdateManager
 import dev.herdr.android.update.AppUpdateState
 import dev.herdr.android.update.UpdateStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -2018,8 +2020,12 @@ class HerdrMainViewModel(
             mutex.withLock {
                 var nextForce = forceRelocate
                 while (true) {
-                    runCatching {
+                    try {
                         syncTerminalTranscriptOnce(address, agentKind, nextForce)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        Log.w("HerdrTranscript", "sync($address) unexpected error", e)
                     }
                     val again = transcriptPendingResync.remove(address) == true
                     if (!again) break
@@ -2053,27 +2059,44 @@ class HerdrMainViewModel(
                 ?: _activeTerminalSummary.value?.takeIf { it.address == address }
                 ?: return
             val probePid = detail.rootPid ?: detail.foregroundPid
+            Log.i("HerdrTranscript", "locating($address, agent=$agentKind, pid=$probePid, cwd=${detail.cwd})")
             val locResult = controller.locateTranscript(agentKind, probePid, detail.cwd)
             if (locResult.isFailure) {
+                val err = locResult.exceptionOrNull()
+                Log.w("HerdrTranscript", "locate($address, pid=$probePid) failed: ${err?.message}", err)
                 transcriptLocateRetryAtMs[address] = nowMs
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to (curState ?: TerminalTranscriptUiState(
+                        address = address,
+                        agentKind = agentKind
+                    )).copy(
+                        locateAttempted = true,
+                        lastError = err?.message?.take(160) ?: "locate failed"
+                    )
+                    )
                 return
             }
             val loc = locResult.getOrNull()
             if (loc == null) {
+                Log.i("HerdrTranscript", "locate($address, pid=$probePid) -> not found")
                 transcriptLocateRetryAtMs[address] = nowMs
                 _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
                     address to TerminalTranscriptUiState(
                         address = address,
                         agentKind = agentKind,
-                        locateAttempted = true
+                        locateAttempted = true,
+                        lastError = null
                     )
                     )
                 return
             }
             transcriptLocateRetryAtMs.remove(address)
             val sameSession = curState != null && curState.path == loc.path && curState.sessionId == loc.sessionId
+            if (!sameSession) {
+                Log.i("HerdrTranscript", "located($address) -> ${loc.sessionId} (${loc.fileSize} bytes)")
+            }
             curState = if (sameSession && !forceRelocate) {
-                curState!!.copy(locateAttempted = true, fileSize = loc.fileSize)
+                curState!!.copy(locateAttempted = true, fileSize = loc.fileSize, lastError = null)
             } else {
                 TerminalTranscriptUiState(
                     address = address,
@@ -2081,7 +2104,8 @@ class HerdrMainViewModel(
                     sessionId = loc.sessionId,
                     path = loc.path,
                     fileSize = loc.fileSize,
-                    locateAttempted = true
+                    locateAttempted = true,
+                    lastError = null
                 )
             }
             _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (address to curState)
@@ -2094,7 +2118,13 @@ class HerdrMainViewModel(
             agentKind = activeState.agentKind,
             path = activeState.path,
             offset = activeState.tailOffset
-        ).getOrElse { return }
+        ).getOrElse { err ->
+            Log.w("HerdrTranscript", "tail($address) failed: ${err.message}", err)
+            _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                address to activeState.copy(lastError = err.message?.take(160) ?: "tail failed")
+                )
+            return
+        }
 
         val prev = _transcriptStatesByAddress.value[address] ?: activeState
         val isInitialRead = prev.tailOffset == 0L || chunk.resetRequired
@@ -2104,6 +2134,12 @@ class HerdrMainViewModel(
             prev.events
         } else {
             mergeTranscriptEvents(prev.events, chunk.events)
+        }
+        if (isInitialRead || chunk.events.isNotEmpty()) {
+            Log.i(
+                "HerdrTranscript",
+                "tailed($address) -> +${chunk.events.size} events, total=${mergedEvents.size}, offset=${chunk.startOffset}..${chunk.nextOffset}"
+            )
         }
         val nextHead = when {
             isInitialRead -> chunk.startOffset
@@ -2123,7 +2159,8 @@ class HerdrMainViewModel(
             hasEarlier = nextHasEarlier,
             events = mergedEvents,
             activeModel = latestModel,
-            stepOutputs = if (chunk.resetRequired) emptyMap() else prev.stepOutputs
+            stepOutputs = if (chunk.resetRequired) emptyMap() else prev.stepOutputs,
+            lastError = null
         )
         _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (address to updated)
     }

@@ -81,7 +81,7 @@ class HcJsonTest {
         val chunk = TranscriptWireJson.parseChunkResponse(
             """{"ok":true,"id":3,"path":"p","startOffset":100,"nextOffset":512,"fileSize":512,"hasEarlier":true,"reset":false,"events":[
                 {"k":"user","o":100,"s":0,"ts":"2026-11-23T01:00:00Z","text":"hello","mc":"gpt-5"},
-                {"k":"assistant","o":200,"s":1,"ts":"2026-11-23T01:00:05Z","st":"DONE","m":"gemini-2.5-pro","th":"plan","md":"# Title\n\nBody","in":100,"cin":50,"out":25,"tc":[{"id":"step_2","n":"edit_file","t":"A.kt","d":"+2 -1","f":"A.kt","rs":2,"err":false}]},
+                {"k":"assistant","o":200,"s":1,"ts":"2026-11-23T01:00:05Z","st":"DONE","m":"gemini-2.5-pro","th":"plan","md":"# Title\n\nBody","in":100,"cin":50,"out":25,"tc":[{"id":"step_2","n":"edit_file","t":"A.kt","d":"+2 -1","f":"A.kt","rs":2,"err":false,"df":"@@ -1,1 +1,2 @@\n-val a = 1\n+val a = 2\n+val b = 3"}]},
                 {"k":"tokens","o":350,"m":"gpt-5","ef":"high","in":400,"cin":200,"out":90},
                 {"k":"tool_err","o":420,"id":"step_2","err":true}
             ]}""",
@@ -96,6 +96,7 @@ class HcJsonTest {
         assertEquals("gemini-2.5-pro", asst.model)
         assertEquals(1, asst.toolCalls.size)
         assertEquals(2, asst.toolCalls[0].resultStepIndex)
+        assertTrue(asst.toolCalls[0].diffPreview!!.contains("+val b = 3"))
         val err = chunk.events[3] as TranscriptRawEvent.ToolStatusUpdate
         assertEquals("step_2", err.callId)
         assertTrue(err.hasError)

@@ -21,7 +21,8 @@ data class TerminalTranscriptUiState(
     val events: List<TranscriptRawEvent> = emptyList(),
     val stepOutputs: Map<Int, String> = emptyMap(),
     val loadingSteps: Set<Int> = emptySet(),
-    val activeModel: String? = null
+    val activeModel: String? = null,
+    val lastError: String? = null
 )
 
 object TranscriptSessionAssembler {
@@ -348,7 +349,8 @@ object TranscriptSessionAssembler {
                             changedFiles = listOfNotNull(tc.changedFile?.takeIf { it.isNotBlank() }),
                             isRunning = isTurnRunning && isLastStep && step.markdownContent.isBlank() && tcIdx == step.toolCalls.lastIndex,
                             hasError = failed,
-                            resultStepIndex = tc.resultStepIndex
+                            resultStepIndex = tc.resultStepIndex,
+                            diffPreview = tc.diffPreview?.takeIf { it.isNotBlank() }
                         )
                     )
                 }
@@ -378,55 +380,21 @@ object TranscriptSessionAssembler {
     }
 
     internal fun markdownToSemanticBlocks(markdown: String): List<TerminalSemanticBlock> {
-        val segments = BtwRichContentParser.parse(markdown)
-        if (segments.isEmpty()) {
-            return if (markdown.isNotBlank()) listOf(TerminalSemanticBlock.AgentProseBlock(markdown.trim())) else emptyList()
+        val trimmed = markdown.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        val nodes = MarkdownDocumentParser.parse(trimmed)
+        if (nodes.isEmpty()) {
+            return listOf(TerminalSemanticBlock.AgentProseBlock(trimmed))
         }
-        val blocks = ArrayList<TerminalSemanticBlock>(segments.size * 2)
-        for (seg in segments) {
-            when (seg) {
-                is BtwContentSegment.Table -> {
-                    blocks.add(TerminalSemanticBlock.CodeOrTableBlock(content = seg.rawText, kindLabel = "表格"))
-                }
-                is BtwContentSegment.CodeBlock -> {
-                    blocks.add(
-                        TerminalSemanticBlock.CodeOrTableBlock(
-                            content = seg.code,
-                            kindLabel = seg.language?.takeIf { it.isNotBlank() } ?: "代码"
-                        )
-                    )
-                }
-                is BtwContentSegment.Heading -> {
-                    blocks.add(TerminalSemanticBlock.AgentProseBlock(text = seg.text, isHeading = true))
-                }
-                is BtwContentSegment.BulletList -> {
-                    for (item in seg.items) {
-                        val isOrd = orderedMarkerRegex.matches(item.marker.trim())
-                        val body = if (isOrd) "${item.marker.trim()} ${item.text}" else item.text
-                        blocks.add(
-                            TerminalSemanticBlock.AgentProseBlock(
-                                text = body,
-                                isBullet = true,
-                                indentLevel = item.indentLevel
-                            )
-                        )
-                    }
-                }
-                is BtwContentSegment.Blockquote -> {
-                    val text = if (seg.alertType != null) {
-                        "▎ [!${seg.alertType}] ${seg.text}".trim()
-                    } else {
-                        "▎ ${seg.text}"
-                    }
-                    blocks.add(TerminalSemanticBlock.AgentProseBlock(text = text))
-                }
-                is BtwContentSegment.Paragraph -> {
-                    blocks.add(TerminalSemanticBlock.AgentProseBlock(text = seg.text))
-                }
-            }
-        }
-        return blocks
+        return listOf(
+            TerminalSemanticBlock.MarkdownDocumentBlock(
+                rawMarkdown = trimmed,
+                nodes = nodes
+            )
+        )
     }
+
+    private val unusedLegacyOrderedMarkerRegex = orderedMarkerRegex
 
     private fun deduplicateAndSort(events: List<TranscriptRawEvent>): List<TranscriptRawEvent> {
         val seen = HashSet<String>(events.size)
@@ -489,6 +457,10 @@ object TranscriptSessionAssembler {
                 is TerminalSemanticBlock.UrgentAlertBlock -> {
                     if (b.isError) hasErr = true
                     if (alertHint == null) alertHint = "${b.title}: ${b.detail}"
+                }
+                is TerminalSemanticBlock.MarkdownDocumentBlock -> {
+                    val preview = MarkdownDocumentParser.extractPlainPreview(b.nodes, maxChars = 160)
+                    if (preview.isNotBlank()) proseCandidates.add(preview)
                 }
                 is TerminalSemanticBlock.AskCardBlock,
                 is TerminalSemanticBlock.UserPromptBlock,

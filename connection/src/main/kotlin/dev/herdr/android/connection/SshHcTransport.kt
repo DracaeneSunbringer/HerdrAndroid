@@ -16,12 +16,35 @@ interface SshHcConnector {
 interface AuthenticatedSshConnection : Closeable {
     val hostKeyFingerprint: String
     suspend fun exec(command: String): SshHcExecChannel
+    suspend fun openSftp(): SshSftpChannel =
+        throw UnsupportedOperationException("SFTP channel is not supported by this connection")
 }
 
 interface SshHcExecChannel : Closeable {
     val input: InputStream
     val output: OutputStream
     val stderr: InputStream
+}
+
+data class SftpEntryInfo(
+    val name: String,
+    val path: String,
+    val isDirectory: Boolean,
+    val isRegularFile: Boolean,
+    val size: Long,
+    val mtimeSeconds: Long
+)
+
+interface SshSftpFile : Closeable {
+    fun length(): Long
+    fun readAt(fileOffset: Long, dst: ByteArray, dstOffset: Int, len: Int): Int
+}
+
+interface SshSftpChannel : Closeable {
+    fun homeDirectory(): String
+    fun statOrNull(path: String): SftpEntryInfo?
+    fun listDir(path: String): List<SftpEntryInfo>
+    fun openRead(path: String): SshSftpFile
 }
 
 class HostKeyNotTrustedException(val fingerprint: String) : java.io.IOException(

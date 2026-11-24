@@ -9,6 +9,10 @@ import net.i2p.crypto.eddsa.EdDSASecurityProvider
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.Buffer
 import net.schmizz.sshj.common.SecurityUtils
+import net.schmizz.sshj.sftp.FileMode
+import net.schmizz.sshj.sftp.OpenMode
+import net.schmizz.sshj.sftp.Response
+import net.schmizz.sshj.sftp.SFTPException
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider
 import net.schmizz.sshj.userauth.password.PasswordFinder
@@ -19,6 +23,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.PublicKey
 import java.security.Security
+import java.util.EnumSet
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import javax.net.SocketFactory
@@ -160,12 +165,141 @@ class SshjHcConnector(
                             override val output = exec.outputStream
                             override val stderr = exec.errorStream
                             override fun close() {
-                                runCatching { exec.close() }
-                                runCatching { session.close() }
+                                runCatching { exec.inputStream.close() }
+                                runCatching { exec.outputStream.close() }
+                                runCatching { exec.errorStream.close() }
+                                Thread {
+                                    runCatching { exec.close() }
+                                    runCatching { session.close() }
+                                }.apply {
+                                    isDaemon = true
+                                    name = "herdr-ssh-exec-close"
+                                    start()
+                                }
                             }
                         }
                     } catch (error: Exception) {
                         runCatching { session.close() }
+                        throw error
+                    }
+                }
+
+                override suspend fun openSftp(): SshSftpChannel = withContext(Dispatchers.IO) {
+                    val sftp = ssh.newSFTPClient()
+                    try {
+                        sftp.sftpEngine.timeoutMs = 12_000
+                        val canonicalHome = sftp.canonicalize(".")
+                        val homeHasLeadingSlash = canonicalHome.startsWith("/")
+
+                        fun toSftpPath(raw: String): String {
+                            var norm = raw.trim().replace('\\', '/')
+                            if (homeHasLeadingSlash && norm.length >= 2 && norm[0].isLetter() && norm[1] == ':') {
+                                norm = "/$norm"
+                            } else if (!homeHasLeadingSlash && norm.length >= 3 && norm[0] == '/' && norm[1].isLetter() && norm[2] == ':') {
+                                norm = norm.substring(1)
+                            }
+                            return norm
+                        }
+
+                        object : SshSftpChannel {
+                            override fun homeDirectory(): String = canonicalHome
+
+                            override fun statOrNull(path: String): SftpEntryInfo? {
+                                val norm = toSftpPath(path)
+                                val attrs = try {
+                                    sftp.statExistence(norm)
+                                } catch (err: SFTPException) {
+                                    if (err.statusCode == Response.StatusCode.NO_SUCH_FILE ||
+                                        err.statusCode == Response.StatusCode.NO_SUCH_PATH
+                                    ) {
+                                        return null
+                                    }
+                                    throw err
+                                } ?: return null
+                                val trimmed = norm.trimEnd('/')
+                                val slashIdx = trimmed.lastIndexOf('/')
+                                val entryName = if (slashIdx >= 0) trimmed.substring(slashIdx + 1) else trimmed
+                                return SftpEntryInfo(
+                                    name = entryName,
+                                    path = norm,
+                                    isDirectory = attrs.type == FileMode.Type.DIRECTORY,
+                                    isRegularFile = attrs.type == FileMode.Type.REGULAR,
+                                    size = attrs.size,
+                                    mtimeSeconds = attrs.mtime
+                                )
+                            }
+
+                            override fun listDir(path: String): List<SftpEntryInfo> {
+                                val norm = toSftpPath(path)
+                                val entries = try {
+                                    sftp.ls(norm)
+                                } catch (err: SFTPException) {
+                                    if (err.statusCode == Response.StatusCode.NO_SUCH_FILE ||
+                                        err.statusCode == Response.StatusCode.NO_SUCH_PATH
+                                    ) {
+                                        return emptyList()
+                                    }
+                                    throw err
+                                }
+                                return entries.mapNotNull { r ->
+                                    if (r.name == "." || r.name == "..") return@mapNotNull null
+                                    SftpEntryInfo(
+                                        name = r.name,
+                                        path = r.path,
+                                        isDirectory = r.isDirectory,
+                                        isRegularFile = r.isRegularFile,
+                                        size = r.attributes.size,
+                                        mtimeSeconds = r.attributes.mtime
+                                    )
+                                }
+                            }
+
+                            override fun openRead(path: String): SshSftpFile {
+                                val rf = sftp.open(toSftpPath(path), EnumSet.of(OpenMode.READ))
+                                return object : SshSftpFile {
+                                    override fun length(): Long = rf.length()
+
+                                    override fun readAt(
+                                        fileOffset: Long,
+                                        dst: ByteArray,
+                                        dstOffset: Int,
+                                        len: Int
+                                    ): Int {
+                                        if (len <= 0) return 0
+                                        if (len <= 32_768) {
+                                            return rf.read(fileOffset, dst, dstOffset, len)
+                                        }
+                                        // ReadAheadRemoteFileInputStream slice size MUST stay <= 32 KB so
+                                        // SSHJ pipelines contiguous 32 KB requests without exceeding server caps.
+                                        val stream = rf.ReadAheadRemoteFileInputStream(16, fileOffset, len.toLong())
+                                        var total = 0
+                                        while (total < len) {
+                                            val step = minOf(32_768, len - total)
+                                            val r = stream.read(dst, dstOffset + total, step)
+                                            if (r < 0) break
+                                            total += r
+                                        }
+                                        return if (total > 0) total else -1
+                                    }
+
+                                    override fun close() {
+                                        runCatching { rf.close() }
+                                    }
+                                }
+                            }
+
+                            override fun close() {
+                                Thread {
+                                    runCatching { sftp.close() }
+                                }.apply {
+                                    isDaemon = true
+                                    name = "herdr-sftp-close"
+                                    start()
+                                }
+                            }
+                        }
+                    } catch (error: Exception) {
+                        runCatching { sftp.close() }
                         throw error
                     }
                 }

@@ -32,7 +32,8 @@ data class ToolStepEntry(
     val changedFiles: List<String> = emptyList(),
     val isRunning: Boolean = false,
     val hasError: Boolean = false,
-    val resultStepIndex: Int? = null
+    val resultStepIndex: Int? = null,
+    val diffPreview: String? = null
 )
 
 data class LiveWorkingActivity(
@@ -107,6 +108,12 @@ sealed interface TerminalSemanticBlock {
     /** Live interactive AskQuestion card rendered in-stream for Antigravity (`agy`). */
     data class AskCardBlock(
         val card: AgyAskCardState
+    ) : TerminalSemanticBlock
+
+    /** Native Markdown AST block produced directly by the `.jsonl` side-channel transcript stream. */
+    data class MarkdownDocumentBlock(
+        val rawMarkdown: String,
+        val nodes: List<MarkdownBlockNode>
     ) : TerminalSemanticBlock
 
     /** Clean session-ready card for newly created agent terminals before conversation starts. */
@@ -5021,6 +5028,10 @@ object StructuredTerminalReader {
                     }
                     is TerminalSemanticBlock.AskCardBlock -> {
                         hasAsk = true
+                    }
+                    is TerminalSemanticBlock.MarkdownDocumentBlock -> {
+                        val preview = MarkdownDocumentParser.extractPlainPreview(b.nodes, maxChars = 160)
+                        if (preview.isNotBlank()) proseCandidates.add(preview)
                     }
                     is TerminalSemanticBlock.UserPromptBlock,
                     is TerminalSemanticBlock.SessionHeaderBlock -> Unit

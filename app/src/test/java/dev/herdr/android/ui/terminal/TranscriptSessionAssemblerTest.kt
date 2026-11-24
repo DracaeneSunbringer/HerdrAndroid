@@ -5,6 +5,9 @@ import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.protocol.TranscriptAgentKind
 import dev.herdr.android.protocol.TranscriptRawEvent
 import dev.herdr.android.protocol.TranscriptToolCallSummary
+import dev.herdr.android.ui.workbench.CodeHighlightPalette
+import dev.herdr.android.ui.workbench.CodeSyntaxHighlighter
+import androidx.compose.ui.graphics.Color
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -75,6 +78,7 @@ class TranscriptSessionAssemblerTest {
                         primaryTarget = "RemoteTranscriptSidecar.kt",
                         detailPreview = "+12 -3 行",
                         changedFile = "RemoteTranscriptSidecar.kt",
+                        diffPreview = "@@ -1,1 +1,1 @@\n-oldCall()\n+newCall()",
                         resultStepIndex = 3
                     )
                 ),
@@ -120,11 +124,14 @@ class TranscriptSessionAssemblerTest {
         val toolGroup = t.responseBlocks.filterIsInstance<TerminalSemanticBlock.ToolGroupBlock>().single()
         assertTrue(toolGroup.hasError)
         assertEquals(2, toolGroup.entries.first { it.title.startsWith("读取") }.resultStepIndex)
-        assertTrue(toolGroup.entries.first { it.title.startsWith("编辑") }.hasError)
+        val editEntry = toolGroup.entries.first { it.title.startsWith("编辑") }
+        assertTrue(editEntry.hasError)
+        assertTrue(editEntry.diffPreview.orEmpty().contains("+newCall()"))
 
-        val codeBlock = t.responseBlocks.filterIsInstance<TerminalSemanticBlock.CodeOrTableBlock>().single()
-        assertEquals("kotlin", codeBlock.kindLabel)
-        assertEquals("fun sync() = Unit", codeBlock.content)
+        val mdDoc = t.responseBlocks.filterIsInstance<TerminalSemanticBlock.MarkdownDocumentBlock>().single()
+        val codeBlock = mdDoc.nodes.filterIsInstance<MarkdownBlockNode.CodeBlock>().single()
+        assertEquals("kotlin", codeBlock.language)
+        assertEquals("fun sync() = Unit", codeBlock.code)
     }
 
     @Test
@@ -188,7 +195,12 @@ class TranscriptSessionAssemblerTest {
         assertEquals(1, fused.turns.size)
         assertTrue(fused.turns.single().hasInteractiveCard)
         assertTrue(fused.turns.single().responseBlocks.any { it is TerminalSemanticBlock.AskCardBlock })
-        assertTrue(fused.turns.single().responseBlocks.any { it is TerminalSemanticBlock.AgentProseBlock && it.text == "请先确认以下问题：" })
+        assertTrue(
+            fused.turns.single().responseBlocks.any { blk ->
+                blk is TerminalSemanticBlock.MarkdownDocumentBlock &&
+                    blk.nodes.any { node -> node is MarkdownBlockNode.Paragraph && node.text == "请先确认以下问题：" }
+            }
+        )
 
         // Unflushed new screen turn while WORKING merges Turn 2 after raw Markdown Turn 1
         val liveTurn2Snapshot = WorkbenchSnapshot(
@@ -221,5 +233,104 @@ class TranscriptSessionAssemblerTest {
         assertEquals("继续推进第二阶段", fusedWithUnflushedTurn.turns[1].userPrompt?.text)
         assertTrue(fusedWithUnflushedTurn.turns[1].isRunning)
         assertNotNull(fusedWithUnflushedTurn.liveWorkingActivity)
+    }
+
+    @Test
+    fun markdownDocumentParserHandlesHeadingsRulesCheckboxesNestedListsAlertsAndFourBackticks() {
+        val raw = """
+            # 总览标题
+            ## 二级模块
+            ### 三级细节
+            #### 四级标签
+
+            ---
+
+            > [!WARNING]
+            > 请保留 Windows 原生命令链路。
+
+            - [x] 已接入旁路解析
+            - [ ] 待真机联调
+              - 嵌套子项 1
+              - 嵌套子项 2
+            1. 第一步
+            2. 第二步
+
+            ````markdown
+            外层说明：
+            ```kotlin
+            val ok = true
+            ```
+            ````
+
+            | 组件 | 结果 |
+            | :--- | ---: |
+            | Sidecar | 100% |
+        """.trimIndent()
+
+        val nodes = MarkdownDocumentParser.parse(raw)
+        val headings = nodes.filterIsInstance<MarkdownBlockNode.Heading>()
+        assertEquals(listOf(1, 2, 3, 4), headings.map { it.level })
+        assertEquals("总览标题", headings[0].text)
+        assertTrue(nodes.any { it === MarkdownBlockNode.HorizontalRule })
+
+        val quote = nodes.filterIsInstance<MarkdownBlockNode.QuoteBlock>().single()
+        assertEquals("WARNING", quote.alertType)
+        assertEquals(listOf("请保留 Windows 原生命令链路。"), quote.lines)
+
+        val listBlock = nodes.filterIsInstance<MarkdownBlockNode.ListBlock>().single()
+        assertEquals(6, listBlock.items.size)
+        assertEquals(true, listBlock.items[0].checked)
+        assertEquals("已接入旁路解析", listBlock.items[0].text)
+        assertEquals(false, listBlock.items[1].checked)
+        assertEquals(1, listBlock.items[2].indentLevel)
+        assertTrue(listBlock.items[4].ordered)
+        assertEquals(1, listBlock.items[4].ordinal)
+
+        val code = nodes.filterIsInstance<MarkdownBlockNode.CodeBlock>().single()
+        assertEquals("markdown", code.language)
+        assertTrue(code.code.contains("```kotlin"))
+
+        val table = nodes.filterIsInstance<MarkdownBlockNode.TableBlock>().single()
+        assertEquals(listOf("组件", "结果"), table.table.headers)
+        assertEquals(listOf(listOf("Sidecar", "100%")), table.table.rows)
+    }
+
+    @Test
+    fun codeSyntaxHighlighterStylesKotlinJsonAndDiff() {
+        val palette = CodeHighlightPalette(
+            keyword = Color(0xFF0000FF),
+            string = Color(0xFF008800),
+            comment = Color(0xFF888888),
+            number = Color(0xFFFF8800),
+            type = Color(0xFF00AAAA),
+            annotation = Color(0xFFAA00AA),
+            diffAddFg = Color(0xFF00AA00),
+            diffAddBg = Color(0x3300AA00),
+            diffDelFg = Color(0xFFAA0000),
+            diffDelBg = Color(0x33AA0000),
+            diffHunkFg = Color(0xFF0000AA),
+            diffMetaFg = Color(0xFF666666)
+        )
+
+        val ktOut = CodeSyntaxHighlighter.highlight(
+            code = "@Composable\nfun Demo(): String {\n    // comment\n    return \"hi\" + 42\n}",
+            language = "kt",
+            palette = palette
+        )
+        assertTrue(ktOut.spanStyles.any { it.item.color == palette.annotation })
+        assertTrue(ktOut.spanStyles.any { it.item.color == palette.keyword })
+        assertTrue(ktOut.spanStyles.any { it.item.color == palette.type })
+        assertTrue(ktOut.spanStyles.any { it.item.color == palette.comment })
+        assertTrue(ktOut.spanStyles.any { it.item.color == palette.string })
+        assertTrue(ktOut.spanStyles.any { it.item.color == palette.number })
+
+        val diffOut = CodeSyntaxHighlighter.highlight(
+            code = "@@ -1,2 +1,2 @@\n-val a = 1\n+val a = 2",
+            language = "diff",
+            palette = palette
+        )
+        assertTrue(diffOut.spanStyles.any { it.item.color == palette.diffHunkFg })
+        assertTrue(diffOut.spanStyles.any { it.item.color == palette.diffDelFg })
+        assertTrue(diffOut.spanStyles.any { it.item.color == palette.diffAddFg })
     }
 }
