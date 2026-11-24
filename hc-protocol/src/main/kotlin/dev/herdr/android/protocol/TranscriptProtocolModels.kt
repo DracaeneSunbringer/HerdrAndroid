@@ -36,6 +36,17 @@ data class TranscriptLocation(
     val fileSize: Long = 0L
 )
 
+data class TranscriptLocateHints(
+    val userPrompts: List<String> = emptyList(),
+    val assistantAnchors: List<String> = emptyList(),
+    val claimedPaths: Set<String> = emptySet(),
+    val expectedTurnCount: Int = 0,
+    val terminalTitle: String? = null
+) {
+    val hasContentAnchors: Boolean
+        get() = userPrompts.isNotEmpty() || assistantAnchors.isNotEmpty()
+}
+
 data class TranscriptToolCallSummary(
     val callId: String? = null,
     val name: String,

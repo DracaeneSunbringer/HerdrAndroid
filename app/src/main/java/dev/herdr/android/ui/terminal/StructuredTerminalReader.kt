@@ -2,6 +2,7 @@ package dev.herdr.android.ui.terminal
 
 import dev.herdr.android.protocol.AgentStateWord
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.protocol.TranscriptLocateHints
 
 /**
  * Semantic, phone-friendly view of a remote agent TUI screen.
@@ -732,6 +733,102 @@ object StructuredTerminalReader {
 
     fun extractQuickActions(rawScreen: String?, summary: TerminalSummary?): List<QuickReplyAction> =
         analyzeWorkbench(rawScreen, summary).quickActions
+
+    private val locateAttachmentRegex = Regex("\\[📎[^\\]]*]")
+    private val locateBulletLeadRegex = Regex("^(?:[•\\-*·◦▪]|\\d{1,2}[.)、])\\s*")
+
+    fun extractLocateHints(
+        rawScreen: String?,
+        summary: TerminalSummary?,
+        claimedPaths: Set<String> = emptySet()
+    ): TranscriptLocateHints {
+        val cleanWhitespace: (String) -> String = { raw ->
+            stripHcWrapper(raw)
+                .replace(locateAttachmentRegex, " ")
+                .replace(anyWhitespaceRegex, " ")
+                .trim()
+        }
+        val analyzed = rawScreen?.takeIf { it.isNotBlank() }?.let { analyzeWorkbench(it, summary) }
+        val userPrompts = if (analyzed != null) {
+            analyzed.turns
+                .asReversed()
+                .mapNotNull { t ->
+                    val raw = t.userPrompt?.text ?: return@mapNotNull null
+                    val norm = cleanWhitespace(raw).trimEnd('…', '.').trim()
+                    norm.takeIf { it.length >= 2 }
+                }
+                .distinct()
+                .take(6)
+        } else {
+            emptyList()
+        }
+
+        val anchors = LinkedHashSet<String>()
+        summary?.agentMessage?.takeIf { it.isNotBlank() }?.let { msg ->
+            val cleaned = cleanWhitespace(msg)
+                .replace("**", "")
+                .replace("`", "")
+                .trimEnd('…', '.')
+                .trim()
+            if (cleaned.length >= 8) {
+                anchors.add(cleaned.take(48))
+            }
+        }
+        if (analyzed != null) {
+            for (turn in analyzed.turns.takeLast(2).asReversed()) {
+                for (block in turn.responseBlocks.asReversed()) {
+                    if (anchors.size >= 7) break
+                    when (block) {
+                        is TerminalSemanticBlock.AgentProseBlock -> {
+                            val line = cleanWhitespace(block.text)
+                                .replace(locateBulletLeadRegex, "")
+                                .replace("**", "")
+                                .replace("`", "")
+                                .trim()
+                            if (line.length >= 10 && '…' !in line && !line.endsWith("...")) {
+                                anchors.add(line.take(56))
+                            }
+                        }
+                        is TerminalSemanticBlock.ToolGroupBlock -> {
+                            for (cf in block.changedFiles) {
+                                val f = cf.trim()
+                                if (f.length >= 8 && '…' !in f) anchors.add(f)
+                                if (anchors.size >= 7) break
+                            }
+                            for (st in block.entries) {
+                                for (cf in st.changedFiles) {
+                                    val f = cf.trim()
+                                    if (f.length >= 8 && '…' !in f) anchors.add(f)
+                                    if (anchors.size >= 7) break
+                                }
+                                if (anchors.size >= 7) break
+                            }
+                        }
+                        else -> Unit
+                    }
+                }
+                if (anchors.size >= 7) break
+            }
+        }
+        val cleanTitle = summary?.title?.trim()
+            ?.takeIf { raw ->
+                raw.isNotEmpty() &&
+                    !raw.endsWith(".exe", ignoreCase = true) &&
+                    ":\\" !in raw &&
+                    !raw.startsWith("/")
+            }
+            ?.let { raw ->
+                if (" | " in raw) raw.substringBeforeLast(" | ").trim() else raw
+            }
+            ?.takeIf { it.length >= 2 }
+        return TranscriptLocateHints(
+            userPrompts = userPrompts,
+            assistantAnchors = anchors.take(7),
+            claimedPaths = claimedPaths,
+            expectedTurnCount = summary?.turn ?: 0,
+            terminalTitle = cleanTitle
+        )
+    }
 
     private fun buildQuickActionsForStatus(
         status: AgentStateWord,

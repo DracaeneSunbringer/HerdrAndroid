@@ -1,6 +1,7 @@
 package dev.herdr.android.connection
 
 import dev.herdr.android.protocol.TranscriptAgentKind
+import dev.herdr.android.protocol.TranscriptLocateHints
 import dev.herdr.android.protocol.TranscriptRawEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -326,6 +327,221 @@ class RemoteTranscriptSidecarTest {
             val locatedClaudeByPid = sidecar.locate(TranscriptAgentKind.CLAUDE, 4242L, "D:\\UnrelatedCwd")
             assertNotNull(locatedClaudeByPid)
             assertEquals("pid-sess-42", locatedClaudeByPid!!.sessionId)
+        } finally {
+            sidecar.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun locateDisambiguatesConcurrentSameCwdSessionsAndIgnoresZombieWal() = runBlocking {
+        val home = File(tempFolder.root, "home3").apply { mkdirs() }
+        val agyRoot = File(home, ".gemini/antigravity-cli").apply { mkdirs() }
+        val convDir = File(agyRoot, "conversations").apply { mkdirs() }
+        val presDir = File(agyRoot, "presence").apply { mkdirs() }
+
+        val zombieUuid = "11111111-1111-1111-1111-111111111111"
+        val liveUuidA = "22222222-2222-2222-2222-222222222222"
+        val liveUuidB = "33333333-3333-3333-3333-333333333333"
+
+        // Crashed session left a stale .db-wal even though its presence.lock is no longer locked
+        File(convDir, "$zombieUuid.db").writeBytes(byteArrayOf(1))
+        File(convDir, "$zombieUuid.db-wal").writeBytes(byteArrayOf(1))
+        File(presDir, "$zombieUuid.lock").createNewFile()
+
+        // liveUuidA has checkpointed WAL (no .db-wal!) but active OS presence lock
+        File(convDir, "$liveUuidA.db").writeBytes(byteArrayOf(1))
+        File(presDir, "$liveUuidA.lock").createNewFile()
+
+        // liveUuidB has both active .db-wal and active OS presence lock
+        File(convDir, "$liveUuidB.db").writeBytes(byteArrayOf(1))
+        File(convDir, "$liveUuidB.db-wal").writeBytes(byteArrayOf(1))
+        File(presDir, "$liveUuidB.lock").createNewFile()
+
+        // Newer mtimes go zombieUuid -> liveUuidB -> liveUuidA, intentionally making zombieUuid look newest
+        File(agyRoot, "brain/$liveUuidA/.system_generated/logs").apply { mkdirs() }
+            .let { File(it, "transcript.jsonl") }
+            .apply {
+                writeText(
+                    """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n为什么苹果手机上使用 Clash Mi\n</USER_REQUEST>"}""" + "\n" +
+                        """{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","response":"已完成 路由器CF优选节点配置 并推送 v8.0.20"}""" + "\n",
+                    StandardCharsets.UTF_8
+                )
+                setLastModified(1_700_000_010_000L)
+            }
+        File(agyRoot, "brain/$liveUuidB/.system_generated/logs").apply { mkdirs() }
+            .let { File(it, "transcript.jsonl") }
+            .apply {
+                writeText(
+                    """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n每次压缩都会重新阅读handoff\n</USER_REQUEST>"}""" + "\n" +
+                        """{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","response":"已接手 推箱子接手修复 并修正文档"}""" + "\n",
+                    StandardCharsets.UTF_8
+                )
+                setLastModified(1_700_000_020_000L)
+            }
+        File(agyRoot, "brain/$zombieUuid/.system_generated/logs").apply { mkdirs() }
+            .let { File(it, "transcript.jsonl") }
+            .apply {
+                writeText(
+                    """{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"<USER_REQUEST>\n隐私信息和key\n</USER_REQUEST>"}""" + "\n",
+                    StandardCharsets.UTF_8
+                )
+                setLastModified(1_700_000_030_000L)
+            }
+
+        File(agyRoot, "history.jsonl").writeText(
+            listOf(
+                """{"display":"为什么苹果手机上使用 Clash Mi","timestamp":1000,"workspace":"D:\\luoyu\\Documents\\Code\\DaliySolve","conversationId":"$liveUuidA"}""",
+                """{"display":"每次压缩都会重新阅读handoff","timestamp":2000,"workspace":"D:\\luoyu\\Documents\\Code\\DaliySolve","conversationId":"$liveUuidB"}""",
+                """{"display":"隐私信息和key","timestamp":3000,"workspace":"D:\\luoyu\\Documents\\Code\\DaliySolve","conversationId":"$zombieUuid"}"""
+            ).joinToString("\n") + "\n",
+            StandardCharsets.UTF_8
+        )
+
+        val lockedFileNames = setOf("$liveUuidA.lock", "$liveUuidB.lock")
+        val fakeSsh = object : AuthenticatedSshConnection {
+            override val hostKeyFingerprint = "local-sftp"
+            override suspend fun exec(command: String): SshHcExecChannel =
+                throw AssertionError("exec() must not be called")
+
+            override suspend fun openSftp(): SshSftpChannel {
+                val delegate = LocalFsSftpChannel(home, maxPacketBytes = 32_768)
+                return object : SshSftpChannel by delegate {
+                    override fun openRead(path: String): SshSftpFile {
+                        val fileName = path.replace('\\', '/').substringAfterLast('/')
+                        if (fileName in lockedFileNames) {
+                            throw IOException("locked by live antigravity process")
+                        }
+                        return delegate.openRead(path)
+                    }
+                }
+            }
+
+            override fun close() = Unit
+        }
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sidecar = RemoteTranscriptSidecar(fakeSsh, HostPlatform.WINDOWS, scope)
+        try {
+            val locA = sidecar.locate(
+                agentKind = TranscriptAgentKind.ANTIGRAVITY,
+                pid = null,
+                cwd = "D:\\luoyu\\Documents\\Code\\DaliySolve",
+                hints = TranscriptLocateHints(
+                    userPrompts = listOf("为什么苹果手机上使用 Clash Mi"),
+                    assistantAnchors = listOf("路由器CF优选节点配置")
+                )
+            )
+            assertNotNull(locA)
+            assertEquals(liveUuidA, locA!!.sessionId)
+
+            val locB = sidecar.locate(
+                agentKind = TranscriptAgentKind.ANTIGRAVITY,
+                pid = null,
+                cwd = "D:\\luoyu\\Documents\\Code\\DaliySolve",
+                hints = TranscriptLocateHints(
+                    userPrompts = listOf("每次压缩都会重新阅读handoff"),
+                    assistantAnchors = listOf("推箱子接手修复"),
+                    claimedPaths = setOf(locA.path)
+                )
+            )
+            assertNotNull(locB)
+            assertEquals(liveUuidB, locB!!.sessionId)
+
+            // Even with zero screen hints, live presence lock outranks zombie .db-wal
+            val locNoHints = sidecar.locate(
+                agentKind = TranscriptAgentKind.ANTIGRAVITY,
+                pid = null,
+                cwd = "D:\\luoyu\\Documents\\Code\\DaliySolve"
+            )
+            assertNotNull(locNoHints)
+            assertTrue("Must not pick dead zombie session", locNoHints!!.sessionId != zombieUuid)
+        } finally {
+            sidecar.close()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun locateCodexFindsResumedOlderMonthRolloutAndDisambiguatesByThreadTitle() = runBlocking {
+        val home = File(tempFolder.root, "home_codex").apply { mkdirs() }
+        val codexDir = File(home, ".codex").apply { mkdirs() }
+        val novDay = File(codexDir, "sessions/2026/11/20").apply { mkdirs() }
+        val octDay29 = File(codexDir, "sessions/2026/10/29").apply { mkdirs() }
+        val octDay26 = File(codexDir, "sessions/2026/10/26").apply { mkdirs() }
+
+        // 35 newer files in 2026/11/20 for another workspace so 2026/10/* sits past the old 32-file cutoff
+        for (i in 1..35) {
+            val f = File(novDay, "rollout-2026-11-20T00-00-${i.toString().padStart(2, '0')}-99999999-0000-0000-0000-0000000000${i.toString().padStart(2, '0')}.jsonl")
+            f.writeText(
+                """{"type":"session_meta","payload":{"id":"other-$i","cwd":"D:\\OtherProject"}}""" + "\n",
+                StandardCharsets.UTF_8
+            )
+            f.setLastModified(1_700_000_000_000L + i * 1_000L)
+        }
+
+        val targetIdA = "01a1768f-4c9d-7812-a064-627c30562349"
+        val paddingA = "x".repeat(24_000)
+        val fileA = File(octDay26, "rollout-2026-10-26T12-54-25-$targetIdA.jsonl").apply {
+            writeText(
+                """{"type":"session_meta","payload":{"id":"$targetIdA","cwd":"D:\\luoyu\\Documents\\Code\\DaliySolve","base_instructions":{"text":"$paddingA"}}}""" + "\n" +
+                    """{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"你先清了，这样搞我下次连不连得上都不一定"}]}}""" + "\n",
+                StandardCharsets.UTF_8
+            )
+            setLastModified(1_700_050_000_000L)
+        }
+
+        val targetIdB = "01a18354-e424-73a0-9a62-88bda52757d7"
+        val paddingB = "y".repeat(24_000)
+        val fileB = File(octDay29, "rollout-2026-10-29T00-25-41-$targetIdB.jsonl").apply {
+            writeText(
+                """{"type":"session_meta","payload":{"id":"$targetIdB","base_instructions":{"text":"$paddingB"},"cwd":"D:\\luoyu\\Documents\\Code\\DaliySolve"}}""" + "\n" +
+                    """{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"继续同步上游 Actions"}]}}""" + "\n",
+                StandardCharsets.UTF_8
+            )
+            // Intentionally make fileB slightly newer mtime than fileA so only threadTitle distinguishes them
+            setLastModified(1_700_060_000_000L)
+        }
+
+        File(codexDir, "session_index.jsonl").writeText(
+            listOf(
+                """{"id":"$targetIdA","thread_name":"检查VPS漏洞、补丁需求与入侵痕迹","updated_at":"2026-10-26T04:55:36.160Z"}""",
+                """{"id":"$targetIdB","thread_name":"同步 GFC 私有仓库并触发 Actions","updated_at":"2026-10-28T16:26:05.683Z"}"""
+            ).joinToString("\n") + "\n",
+            StandardCharsets.UTF_8
+        )
+
+        val fakeSsh = object : AuthenticatedSshConnection {
+            override val hostKeyFingerprint = "local-sftp"
+            override suspend fun exec(command: String): SshHcExecChannel =
+                throw AssertionError("exec() must not be called")
+
+            override suspend fun openSftp(): SshSftpChannel = LocalFsSftpChannel(home, maxPacketBytes = 32_768)
+            override fun close() = Unit
+        }
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val sidecar = RemoteTranscriptSidecar(fakeSsh, HostPlatform.WINDOWS, scope)
+        try {
+            val locA = sidecar.locate(
+                agentKind = TranscriptAgentKind.CODEX,
+                pid = null,
+                cwd = "D:\\luoyu\\Documents\\Code\\DaliySolve",
+                hints = TranscriptLocateHints(terminalTitle = "检查VPS漏洞、补丁需求与入侵痕迹 | DaliySolve")
+            )
+            assertNotNull("Resumed October rollout must be found past 35 November rollouts", locA)
+            assertEquals(targetIdA, locA!!.sessionId)
+            assertTrue(locA.path.endsWith(fileA.name))
+
+            val locB = sidecar.locate(
+                agentKind = TranscriptAgentKind.CODEX,
+                pid = null,
+                cwd = "D:\\luoyu\\Documents\\Code\\DaliySolve",
+                hints = TranscriptLocateHints(terminalTitle = "同步 GFC 私有仓库并触发 Actions")
+            )
+            assertNotNull("UTC 2026-10-28T16:26Z rollout stored in 2026/10/29 must be resolved", locB)
+            assertEquals(targetIdB, locB!!.sessionId)
+            assertTrue(locB.path.endsWith(fileB.name))
         } finally {
             sidecar.close()
             scope.cancel()

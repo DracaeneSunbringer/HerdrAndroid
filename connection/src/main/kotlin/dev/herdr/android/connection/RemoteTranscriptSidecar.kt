@@ -2,6 +2,7 @@ package dev.herdr.android.connection
 
 import dev.herdr.android.protocol.TranscriptAgentKind
 import dev.herdr.android.protocol.TranscriptChunkResult
+import dev.herdr.android.protocol.TranscriptLocateHints
 import dev.herdr.android.protocol.TranscriptLocation
 import dev.herdr.android.protocol.TranscriptRawEvent
 import dev.herdr.android.protocol.TranscriptToolCallSummary
@@ -20,6 +21,7 @@ import org.json.JSONTokener
 import java.io.Closeable
 import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.time.LocalDate
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -51,9 +53,10 @@ class RemoteTranscriptSidecar(
     suspend fun locate(
         agentKind: TranscriptAgentKind,
         pid: Long?,
-        cwd: String
+        cwd: String,
+        hints: TranscriptLocateHints = TranscriptLocateHints()
     ): TranscriptLocation? = withSftp { sftp ->
-        locateInternal(sftp, agentKind, pid, cwd)
+        locateInternal(sftp, agentKind, pid, cwd, hints)
     }
 
     suspend fun readTail(
@@ -156,27 +159,141 @@ class RemoteTranscriptSidecar(
     // Pure-SFTP transcript session discovery (`agy`, `codex`, `claude`)
     // -------------------------------------------------------------------------
 
+    private val locateTagStripRegex = Regex("</?(?:USER_REQUEST|hc)(?:\\s[^>]*)?>", RegexOption.IGNORE_CASE)
+    private val locateWhitespaceRegex = Regex("\\s+")
+
     private fun locateInternal(
         sftp: SshSftpChannel,
         agentKind: TranscriptAgentKind,
         pid: Long?,
-        cwd: String
+        cwd: String,
+        hints: TranscriptLocateHints
     ): TranscriptLocation? {
         val home = sftp.homeDirectory()
         val normCwd = normalizeComparePath(cwd)
 
         return when (agentKind) {
-            TranscriptAgentKind.ANTIGRAVITY -> locateAgy(sftp, home, cwd, normCwd)
-            TranscriptAgentKind.CODEX -> locateCodex(sftp, home, normCwd)
-            TranscriptAgentKind.CLAUDE -> locateClaude(sftp, home, pid, cwd, normCwd)
+            TranscriptAgentKind.ANTIGRAVITY -> locateAgy(sftp, home, cwd, normCwd, hints)
+            TranscriptAgentKind.CODEX -> locateCodex(sftp, home, normCwd, hints)
+            TranscriptAgentKind.CLAUDE -> locateClaude(sftp, home, pid, cwd, normCwd, hints)
         }
+    }
+
+    private fun normalizeMatchText(raw: String): String {
+        if (raw.isEmpty()) return ""
+        return raw
+            .replace("\\r\\n", " ")
+            .replace("\\n", " ")
+            .replace("\\r", " ")
+            .replace("\\t", " ")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .replace(locateTagStripRegex, " ")
+            .replace("**", "")
+            .replace("`", "")
+            .replace(locateWhitespaceRegex, " ")
+            .trim()
+            .lowercase()
+    }
+
+    private fun probeAgyPresenceLocked(
+        sftp: SshSftpChannel,
+        agyRoot: String,
+        uuid: String,
+        hasPresenceDir: Boolean
+    ): Boolean? {
+        if (!hasPresenceDir) return null
+        val lockStat = sftp.statOrNull(joinRemote(agyRoot, "presence", "$uuid.lock"))
+            ?: return if (platform == HostPlatform.WINDOWS) false else null
+        return try {
+            sftp.openRead(lockStat.path).use { rf ->
+                val b = ByteArray(1)
+                rf.readAt(0L, b, 0, 1)
+            }
+            if (platform == HostPlatform.WINDOWS) false else null
+        } catch (_: IOException) {
+            true
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun scoreCandidateFromTail(
+        sftp: SshSftpChannel,
+        path: String,
+        hints: TranscriptLocateHints,
+        matchedPromptIndices: MutableSet<Int>,
+        fallbackFullPath: String? = null
+    ): Int {
+        if (!hints.hasContentAnchors) return 0
+
+        fun readNormalizedTail(targetPath: String): String {
+            return try {
+                sftp.openRead(targetPath).use { rf ->
+                    val len = rf.length()
+                    if (len <= 0L) return@use ""
+                    val win = minOf(len, 131_072L).toInt()
+                    normalizeMatchText(String(readBytesAt(rf, len - win, win), StandardCharsets.UTF_8))
+                }
+            } catch (_: Exception) {
+                ""
+            }
+        }
+
+        var score = 0
+        var assistBonus = 0
+        val normTail = readNormalizedTail(path)
+        if (normTail.isNotEmpty()) {
+            hints.userPrompts.forEachIndexed { pIdx, rawPrompt ->
+                if (pIdx !in matchedPromptIndices) {
+                    val normP = normalizeMatchText(rawPrompt)
+                    if (normP.length >= 6 && normTail.contains(normP)) {
+                        score += if (pIdx == 0) 480 else 240
+                        matchedPromptIndices.add(pIdx)
+                    }
+                }
+            }
+            hints.assistantAnchors.forEachIndexed { aIdx, rawAnchor ->
+                val normA = normalizeMatchText(rawAnchor)
+                if (normA.length >= 8 && normTail.contains(normA)) {
+                    assistBonus += if (aIdx == 0) 350 else 180
+                }
+            }
+        }
+
+        if (assistBonus == 0 && fallbackFullPath != null && normTail.contains("truncated_fields")) {
+            val fullStat = sftp.statOrNull(fallbackFullPath)
+            if (fullStat != null && fullStat.isRegularFile && fullStat.size > 0L) {
+                val normFullTail = readNormalizedTail(fullStat.path)
+                if (normFullTail.isNotEmpty()) {
+                    hints.userPrompts.forEachIndexed { pIdx, rawPrompt ->
+                        if (pIdx !in matchedPromptIndices) {
+                            val normP = normalizeMatchText(rawPrompt)
+                            if (normP.length >= 6 && normFullTail.contains(normP)) {
+                                score += if (pIdx == 0) 480 else 240
+                                matchedPromptIndices.add(pIdx)
+                            }
+                        }
+                    }
+                    hints.assistantAnchors.forEachIndexed { aIdx, rawAnchor ->
+                        val normA = normalizeMatchText(rawAnchor)
+                        if (normA.length >= 8 && normFullTail.contains(normA)) {
+                            assistBonus += if (aIdx == 0) 350 else 180
+                        }
+                    }
+                }
+            }
+        }
+
+        return score + minOf(assistBonus, 800)
     }
 
     private fun locateAgy(
         sftp: SshSftpChannel,
         home: String,
         rawCwd: String,
-        normCwd: String
+        normCwd: String,
+        hints: TranscriptLocateHints
     ): TranscriptLocation? {
         val agyRoot = joinRemote(home, ".gemini", "antigravity-cli")
 
@@ -217,11 +334,13 @@ class RemoteTranscriptSidecar(
             return null
         }
 
-        // Tier 1: Fast `history.jsonl` lookup (tail 256 KB, scan newest to oldest)
-        var historyClosedCandidate: TranscriptLocation? = null
+        val orderedCandidates = LinkedHashMap<String, SftpEntryInfo>()
+        val historyPromptsByCid = HashMap<String, MutableList<String>>()
+
+        // Tier 1: Fast `history.jsonl` lookup (tail 512 KB, collect ALL matching sessions for `normCwd`)
         val historyStat = sftp.statOrNull(joinRemote(agyRoot, "history.jsonl"))
         if (historyStat != null && historyStat.isRegularFile && historyStat.size > 0L) {
-            val readLen = minOf(historyStat.size, HISTORY_TAIL_BYTES).toInt()
+            val readLen = minOf(historyStat.size, 524_288L).toInt()
             val startOff = historyStat.size - readLen
             val buf = sftp.openRead(historyStat.path).use { rf -> readBytesAt(rf, startOff, readLen) }
             val lines = decodeUtf8Lines(buf, skipFirstPartial = startOff > 0L)
@@ -236,42 +355,120 @@ class RemoteTranscriptSidecar(
                 val ws = normalizeComparePath(obj.str("workspace"))
                 val cid = obj.str("conversationId")
                 if (ws != normCwd || !isUuid36(cid)) continue
-                val logStat = resolveAgyLog(sftp, agyRoot, cid) ?: continue
-                if (cid in activeWalSet) {
-                    return TranscriptLocation(TranscriptAgentKind.ANTIGRAVITY, cid, logStat.path, logStat.size)
+                val displayText = obj.str("display").trim()
+                if (displayText.isNotEmpty()) {
+                    val promptList = historyPromptsByCid.getOrPut(cid) { ArrayList(6) }
+                    if (promptList.size < 6) promptList.add(displayText)
                 }
-                if (historyClosedCandidate == null) {
-                    historyClosedCandidate = TranscriptLocation(
-                        TranscriptAgentKind.ANTIGRAVITY,
-                        cid,
-                        logStat.path,
-                        logStat.size
-                    )
+                if (cid !in orderedCandidates && orderedCandidates.size < 16) {
+                    val logStat = resolveAgyLog(sftp, agyRoot, cid) ?: continue
+                    if (logStat.size > 0L || cid in activeWalSet) {
+                        orderedCandidates[cid] = logStat
+                    }
                 }
             }
         }
 
-        // Tier 2: Active WAL sessions whose first prompt hasn't landed in `history.jsonl` yet
-        if (activeWalUuids.isNotEmpty()) {
-            matchAgyUuidByCwd(sftp, agyRoot, activeWalUuids, rawCwd, normCwd)?.let { return it }
+        // Tier 2: Active WAL sessions whose prompts haven't landed in `history.jsonl` yet
+        val extraWalUuids = activeWalUuids.filter { it !in orderedCandidates }
+        if (extraWalUuids.isNotEmpty()) {
+            for ((cid, logStat) in filterAgyUuidsByCwd(sftp, agyRoot, extraWalUuids, rawCwd, normCwd)) {
+                orderedCandidates.putIfAbsent(cid, logStat)
+            }
         }
 
-        // Return newest matching closed session from `history.jsonl` if present
-        if (historyClosedCandidate != null) return historyClosedCandidate
+        // Tier 3: Fallback scan over `conversations/*.db`, then `brain/<uuid>` when still empty
+        if (orderedCandidates.isEmpty()) {
+            val remainingDbUuids = recentDbUuids.filter { it !in activeWalSet }
+            if (remainingDbUuids.isNotEmpty()) {
+                for ((cid, logStat) in filterAgyUuidsByCwd(sftp, agyRoot, remainingDbUuids, rawCwd, normCwd)) {
+                    orderedCandidates.putIfAbsent(cid, logStat)
+                }
+            }
+        }
+        if (orderedCandidates.isEmpty()) {
+            val brainDirEntries = sftp.listDir(joinRemote(agyRoot, "brain"))
+            val brainUuids = brainDirEntries
+                .filter { it.isDirectory && isUuid36(it.name) && it.name !in activeWalSet && it.name !in dbMtimeByUuid }
+                .map { it.name }
+            if (brainUuids.isNotEmpty()) {
+                for ((cid, logStat) in filterAgyUuidsByCwd(sftp, agyRoot, brainUuids, rawCwd, normCwd)) {
+                    orderedCandidates.putIfAbsent(cid, logStat)
+                }
+            }
+        }
 
-        // Tier 3: Fallback scan over recent `conversations/*.db` UUIDs, then `brain/<uuid>`
-        val remainingDbUuids = recentDbUuids.filter { it !in activeWalSet }
-        if (remainingDbUuids.isNotEmpty()) {
-            matchAgyUuidByCwd(sftp, agyRoot, remainingDbUuids, rawCwd, normCwd)?.let { return it }
+        if (orderedCandidates.isEmpty()) return null
+        if (orderedCandidates.size == 1) {
+            val only = orderedCandidates.entries.first()
+            return TranscriptLocation(TranscriptAgentKind.ANTIGRAVITY, only.key, only.value.path, only.value.size)
         }
-        val brainDirEntries = sftp.listDir(joinRemote(agyRoot, "brain"))
-        val brainUuids = brainDirEntries
-            .filter { it.isDirectory && isUuid36(it.name) && it.name !in activeWalSet && it.name !in dbMtimeByUuid }
-            .map { it.name }
-        if (brainUuids.isNotEmpty()) {
-            matchAgyUuidByCwd(sftp, agyRoot, brainUuids, rawCwd, normCwd)?.let { return it }
+
+        // Multi-candidate disambiguation: liveness lock + sibling claims + screen prompt/assistant match
+        val hasPresenceDir = sftp.statOrNull(joinRemote(agyRoot, "presence"))?.isDirectory == true
+        val topCandidates = orderedCandidates.entries.sortedByDescending { it.value.mtimeSeconds }.take(10)
+
+        var bestEntry = topCandidates.first()
+        var bestScore = Int.MIN_VALUE
+
+        topCandidates.forEachIndexed { rankIdx, entry ->
+            val cid = entry.key
+            val logStat = entry.value
+            var score = maxOf(0, 30 - rankIdx * 3)
+
+            val locked = probeAgyPresenceLocked(sftp, agyRoot, cid, hasPresenceDir)
+            when (locked) {
+                true -> score += 300
+                false -> score -= 220
+                null -> if (cid in activeWalSet) score += 150
+            }
+
+            if (logStat.path in hints.claimedPaths) {
+                score -= 180
+            }
+
+            val matchedPrompts = HashSet<Int>()
+            val histPrompts = historyPromptsByCid[cid].orEmpty().map(::normalizeMatchText)
+            if (histPrompts.isNotEmpty() && hints.userPrompts.isNotEmpty()) {
+                hints.userPrompts.forEachIndexed { pIdx, rawPrompt ->
+                    val normP = normalizeMatchText(rawPrompt)
+                    if (normP.length >= 6) {
+                        if (histPrompts.any { it.contains(normP) || (it.length >= 6 && normP.contains(it)) }) {
+                            score += if (pIdx == 0) 520 else 260
+                            matchedPrompts.add(pIdx)
+                        }
+                    } else if (normP.length in 2..5) {
+                        if (histPrompts.firstOrNull() == normP) {
+                            score += if (pIdx == 0) 90 else 30
+                            matchedPrompts.add(pIdx)
+                        }
+                    }
+                }
+            }
+
+            if (hints.hasContentAnchors) {
+                val logsDir = parentRemotePath(logStat.path)
+                val fullFallback = if (logsDir != null && fileNameOf(logStat.path).equals("transcript.jsonl", ignoreCase = true)) {
+                    joinRemote(logsDir, "transcript_full.jsonl")
+                } else {
+                    null
+                }
+                score += scoreCandidateFromTail(
+                    sftp = sftp,
+                    path = logStat.path,
+                    hints = hints,
+                    matchedPromptIndices = matchedPrompts,
+                    fallbackFullPath = fullFallback
+                )
+            }
+
+            if (score > bestScore || (score == bestScore && logStat.mtimeSeconds > bestEntry.value.mtimeSeconds)) {
+                bestScore = score
+                bestEntry = entry
+            }
         }
-        return null
+
+        return TranscriptLocation(TranscriptAgentKind.ANTIGRAVITY, bestEntry.key, bestEntry.value.path, bestEntry.value.size)
     }
 
     private fun resolveAgyLog(sftp: SshSftpChannel, agyRoot: String, uuid: String): SftpEntryInfo? {
@@ -284,13 +481,14 @@ class RemoteTranscriptSidecar(
         return null
     }
 
-    private fun matchAgyUuidByCwd(
+    private fun filterAgyUuidsByCwd(
         sftp: SshSftpChannel,
         agyRoot: String,
         uuids: List<String>,
         rawCwd: String,
-        normCwd: String
-    ): TranscriptLocation? {
+        normCwd: String,
+        maxMatches: Int = 8
+    ): List<Pair<String, SftpEntryInfo>> {
         val candidates = ArrayList<Pair<String, SftpEntryInfo>>(uuids.size)
         for (uuid in uuids) {
             val logStat = resolveAgyLog(sftp, agyRoot, uuid) ?: continue
@@ -300,9 +498,11 @@ class RemoteTranscriptSidecar(
         candidates.sortByDescending { it.second.mtimeSeconds }
 
         val variants = buildCwdBoundaryVariants(rawCwd, normCwd)
+        val out = ArrayList<Pair<String, SftpEntryInfo>>()
         val limit = minOf(candidates.size, 24)
         for (i in 0 until limit) {
-            val (uuid, logStat) = candidates[i]
+            val pair = candidates[i]
+            val logStat = pair.second
             val matched = try {
                 sftp.openRead(logStat.path).use { rf ->
                     val len = rf.length()
@@ -322,88 +522,237 @@ class RemoteTranscriptSidecar(
                 false
             }
             if (matched) {
-                return TranscriptLocation(TranscriptAgentKind.ANTIGRAVITY, uuid, logStat.path, logStat.size)
+                out.add(pair)
+                if (out.size >= maxMatches) break
             }
         }
+        return out
+    }
+
+    private fun resolveCodexRolloutByIdAndDate(
+        sftp: SshSftpChannel,
+        sessionsDir: String,
+        id: String,
+        updatedAtIso: String
+    ): SftpEntryInfo? {
+        val datePrefix = if (updatedAtIso.length >= 10) updatedAtIso.substring(0, 10) else ""
+        val date = runCatching { LocalDate.parse(datePrefix) }.getOrNull() ?: return null
+        val targetSuffix = "-$id.jsonl"
+        val exactName = "$id.jsonl"
+        // Account for UTC vs local timezone folder boundary shifts (e.g. UTC 16:26 -> local +1 day)
+        for (d in listOf(date.plusDays(1), date, date.minusDays(1))) {
+            val dayDir = joinRemote(
+                sessionsDir,
+                d.year.toString().padStart(4, '0'),
+                d.monthValue.toString().padStart(2, '0'),
+                d.dayOfMonth.toString().padStart(2, '0')
+            )
+            val hit = sftp.listDir(dayDir).firstOrNull {
+                it.isRegularFile && (it.name.endsWith(targetSuffix) || it.name == exactName)
+            }
+            if (hit != null) return hit
+        }
         return null
+    }
+
+    private val codexSessionMetaTypeRegex = Regex("\"type\"\\s*:\\s*\"session_meta\"")
+    private val codexSessionMetaCwdRegex = Regex("\"cwd\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+    private val codexSessionMetaIdRegex = Regex("\"(?:id|session_id)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"")
+
+    private fun unescapeJsonStringLiteral(escapedBody: String): String =
+        runCatching { JSONTokener("\"$escapedBody\"").nextValue() as? String }.getOrNull() ?: escapedBody
+
+    private fun readCodexSessionMeta(rf: SshSftpFile, fallbackFileName: String): Pair<String, String>? {
+        val totalLen = rf.length()
+        if (totalLen <= 0L) return null
+
+        fun parseSessionMetaLine(buf: ByteArray, nlIndex: Int): Pair<String, String>? {
+            val sliceLen = if (nlIndex >= 0) nlIndex else buf.size
+            val line = String(buf, 0, sliceLen, StandardCharsets.UTF_8).trimStart('\uFEFF').trim()
+            if (line.isEmpty()) return null
+            val obj = runCatching { JSONObject(line) }.getOrNull() ?: return null
+            if (obj.str("type") != "session_meta") return null
+            val payload = obj.dict("payload") ?: return null
+            val cwd = payload.str("cwd")
+            if (cwd.isBlank()) return null
+            val sid = payload.str("id")
+                .ifBlank { payload.str("session_id") }
+                .ifBlank { fileNameWithoutExtension(fallbackFileName) }
+            return sid to cwd
+        }
+
+        val fastLen = minOf(totalLen, 4_096L).toInt()
+        val fastBuf = readBytesAt(rf, 0L, fastLen)
+        val fastNl = fastBuf.indexOfFirst { it == 10.toByte() }
+        if (fastNl >= 0 || totalLen <= 4_096L) {
+            return parseSessionMetaLine(fastBuf, fastNl)
+        }
+
+        // Real Codex 0.164+ embeds a 22+ KB `base_instructions` block inside line 1 after `id` and `cwd`.
+        // Parse from the initial 4 KB prefix so SFTP discovery avoids transferring the rest of line 1.
+        val prefix = String(fastBuf, 0, fastBuf.size, StandardCharsets.UTF_8).trimStart('\uFEFF')
+        if (codexSessionMetaTypeRegex.containsMatchIn(prefix.take(512))) {
+            val cwdMatch = codexSessionMetaCwdRegex.find(prefix)
+            if (cwdMatch != null) {
+                val cwd = unescapeJsonStringLiteral(cwdMatch.groupValues[1])
+                if (cwd.isNotBlank()) {
+                    val sid = codexSessionMetaIdRegex.find(prefix)
+                        ?.let { unescapeJsonStringLiteral(it.groupValues[1]) }
+                        ?.ifBlank { fileNameWithoutExtension(fallbackFileName) }
+                        ?: fileNameWithoutExtension(fallbackFileName)
+                    return sid to cwd
+                }
+            }
+        }
+
+        // Full-line fallback (up to 256 KB) if `base_instructions` appears before `cwd`.
+        val fullLen = minOf(totalLen, 262_144L).toInt()
+        val fullBuf = ByteArray(fullLen)
+        fastBuf.copyInto(fullBuf, destinationOffset = 0, startIndex = 0, endIndex = fastLen)
+        if (fullLen > fastLen) {
+            val rem = readBytesAt(rf, fastLen.toLong(), fullLen - fastLen)
+            rem.copyInto(fullBuf, destinationOffset = fastLen, startIndex = 0, endIndex = minOf(rem.size, fullLen - fastLen))
+        }
+        val fullNl = fullBuf.indexOfFirst { it == 10.toByte() }
+        return parseSessionMetaLine(fullBuf, fullNl)
     }
 
     private fun locateCodex(
         sftp: SshSftpChannel,
         home: String,
-        normCwd: String
+        normCwd: String,
+        hints: TranscriptLocateHints
     ): TranscriptLocation? {
         if (normCwd.isEmpty()) return null
-        val sessionsDir = joinRemote(home, ".codex", "sessions")
-        val recentFiles = collectRecentCodexRollouts(sftp, sessionsDir, maxFiles = 32)
-        if (recentFiles.isEmpty()) return null
+        val codexDir = joinRemote(home, ".codex")
+        val sessionsDir = joinRemote(codexDir, "sessions")
 
-        val sorted = recentFiles.sortedByDescending { it.mtimeSeconds }
-        val limit = minOf(sorted.size, 24)
-        for (i in 0 until limit) {
-            val fileEntry = sorted[i]
-            val firstLine = try {
-                sftp.openRead(fileEntry.path).use { rf ->
-                    val readLen = minOf(rf.length(), 16_384L).toInt()
-                    if (readLen <= 0) return@use null
-                    val buf = readBytesAt(rf, 0L, readLen)
-                    val nl = buf.indexOfFirst { it == 10.toByte() }
-                    val sliceLen = if (nl >= 0) nl else buf.size
-                    String(buf, 0, sliceLen, StandardCharsets.UTF_8).trimStart('\uFEFF').trim()
+        val normTitleHint = normalizeMatchText(hints.terminalTitle?.substringBeforeLast(" | ").orEmpty())
+        val threadNameById = HashMap<String, String>()
+        val titleMatchedIndex = ArrayList<Pair<String, String>>(8)
+        val seenMatchedIds = HashSet<String>()
+
+        val indexStat = sftp.statOrNull(joinRemote(codexDir, "session_index.jsonl"))
+        if (indexStat != null && indexStat.isRegularFile && indexStat.size > 0L) {
+            val readLen = minOf(indexStat.size, 262_144L).toInt()
+            val startOff = indexStat.size - readLen
+            val buf = sftp.openRead(indexStat.path).use { rf -> readBytesAt(rf, startOff, readLen) }
+            val lines = decodeUtf8Lines(buf, skipFirstPartial = startOff > 0L)
+            for (i in lines.lastIndex downTo 0) {
+                val ln = lines[i].trim()
+                if (ln.isEmpty()) continue
+                val obj = try {
+                    JSONObject(ln)
+                } catch (_: Exception) {
+                    continue
                 }
+                val id = obj.str("id").trim()
+                if (id.isEmpty()) continue
+                val threadName = obj.str("thread_name").trim()
+                if (threadName.isNotEmpty()) {
+                    threadNameById.putIfAbsent(id, threadName)
+                    if (normTitleHint.length >= 2 && titleMatchedIndex.size < 8) {
+                        val normThread = normalizeMatchText(threadName)
+                        val titleMatch = normThread.isNotEmpty() && (
+                            normThread == normTitleHint ||
+                                (normTitleHint.length >= 6 && (normThread.contains(normTitleHint) || normTitleHint.contains(normThread)))
+                            )
+                        if (titleMatch && seenMatchedIds.add(id)) {
+                            titleMatchedIndex.add(id to obj.str("updated_at").trim())
+                        }
+                    }
+                }
+            }
+        }
+
+        val candidatesByPath = LinkedHashMap<String, SftpEntryInfo>()
+        for ((id, updatedAt) in titleMatchedIndex) {
+            resolveCodexRolloutByIdAndDate(sftp, sessionsDir, id, updatedAt)?.let { entry ->
+                candidatesByPath.putIfAbsent(entry.path, entry)
+            }
+        }
+        for (entry in collectRecentCodexRollouts(sftp, sessionsDir, maxFiles = 40)) {
+            candidatesByPath.putIfAbsent(entry.path, entry)
+        }
+        if (candidatesByPath.isEmpty()) return null
+
+        val candidateFiles = candidatesByPath.values.take(32)
+        val matches = ArrayList<Pair<String, SftpEntryInfo>>()
+        for (fileEntry in candidateFiles) {
+            val (sid, mcwd) = try {
+                sftp.openRead(fileEntry.path).use { rf -> readCodexSessionMeta(rf, fileEntry.name) }
             } catch (_: Exception) {
                 null
             } ?: continue
-            if (firstLine.isEmpty()) continue
-            val obj = try {
-                JSONObject(firstLine)
-            } catch (_: Exception) {
-                continue
-            }
-            if (obj.str("type") != "session_meta") continue
-            val payload = obj.dict("payload") ?: continue
-            val mcwd = normalizeComparePath(payload.str("cwd"))
-            if (mcwd == normCwd) {
-                val sid = payload.str("id").ifBlank { fileNameWithoutExtension(fileEntry.name) }
-                return TranscriptLocation(TranscriptAgentKind.CODEX, sid, fileEntry.path, fileEntry.size)
+            if (normalizeComparePath(mcwd) == normCwd) {
+                matches.add(sid to fileEntry)
             }
         }
-        return null
+        if (matches.isEmpty()) return null
+        if (matches.size == 1) {
+            val only = matches.first()
+            return TranscriptLocation(TranscriptAgentKind.CODEX, only.first, only.second.path, only.second.size)
+        }
+
+        val topMatches = matches.take(12)
+        var best = topMatches.first()
+        var bestScore = Int.MIN_VALUE
+        topMatches.forEachIndexed { idx, cand ->
+            var score = maxOf(0, 30 - idx * 3)
+            if (cand.second.path in hints.claimedPaths) score -= 180
+            val normThread = normalizeMatchText(threadNameById[cand.first].orEmpty())
+            if (normTitleHint.length >= 2 && normThread.isNotEmpty()) {
+                when {
+                    normThread == normTitleHint -> score += 650
+                    normTitleHint.length >= 6 && (normThread.contains(normTitleHint) || normTitleHint.contains(normThread)) -> score += 380
+                }
+            }
+            if (hints.hasContentAnchors) {
+                score += scoreCandidateFromTail(sftp, cand.second.path, hints, HashSet())
+            }
+            if (score > bestScore || (score == bestScore && cand.second.mtimeSeconds > best.second.mtimeSeconds)) {
+                bestScore = score
+                best = cand
+            }
+        }
+        return TranscriptLocation(TranscriptAgentKind.CODEX, best.first, best.second.path, best.second.size)
     }
 
     private fun collectRecentCodexRollouts(
         sftp: SshSftpChannel,
         sessionsDir: String,
-        maxFiles: Int
+        maxFiles: Int = 40,
+        maxScanFiles: Int = 240
     ): List<SftpEntryInfo> {
-        val out = ArrayList<SftpEntryInfo>(maxFiles)
+        val collected = ArrayList<SftpEntryInfo>(maxScanFiles)
         val topEntries = sftp.listDir(sessionsDir)
-        if (topEntries.isEmpty()) return out
+        if (topEntries.isEmpty()) return emptyList()
 
         for (entry in topEntries.sortedByDescending { it.mtimeSeconds }) {
             if (entry.isRegularFile && entry.name.endsWith(".jsonl")) {
-                out.add(entry)
-                if (out.size >= maxFiles) return out
+                collected.add(entry)
+                if (collected.size >= maxScanFiles) break
             }
         }
 
-        val years = topEntries.filter { it.isDirectory }.sortedByDescending { it.name }
-        for (year in years) {
-            val months = sftp.listDir(year.path).filter { it.isDirectory }.sortedByDescending { it.name }
-            for (month in months) {
-                val days = sftp.listDir(month.path).filter { it.isDirectory }.sortedByDescending { it.name }
-                for (day in days) {
-                    val files = sftp.listDir(day.path)
-                        .filter { it.isRegularFile && it.name.startsWith("rollout-") && it.name.endsWith(".jsonl") }
-                        .sortedByDescending { it.mtimeSeconds }
-                    for (f in files) {
-                        out.add(f)
-                        if (out.size >= maxFiles) return out
+        if (collected.size < maxScanFiles) {
+            val years = topEntries.filter { it.isDirectory }.sortedByDescending { it.name }
+            outer@ for (year in years) {
+                val months = sftp.listDir(year.path).filter { it.isDirectory }.sortedByDescending { it.name }
+                for (month in months) {
+                    val days = sftp.listDir(month.path).filter { it.isDirectory }.sortedByDescending { it.name }
+                    for (day in days) {
+                        val files = sftp.listDir(day.path)
+                            .filter { it.isRegularFile && it.name.startsWith("rollout-") && it.name.endsWith(".jsonl") }
+                        for (f in files) {
+                            collected.add(f)
+                            if (collected.size >= maxScanFiles) break@outer
+                        }
                     }
                 }
             }
         }
-        return out
+        return collected.sortedByDescending { it.mtimeSeconds }.take(maxFiles)
     }
 
     private fun locateClaude(
@@ -411,7 +760,8 @@ class RemoteTranscriptSidecar(
         home: String,
         pid: Long?,
         rawCwd: String,
-        normCwd: String
+        normCwd: String,
+        hints: TranscriptLocateHints
     ): TranscriptLocation? {
         val claudeRoot = joinRemote(home, ".claude")
         val projectsDir = joinRemote(claudeRoot, "projects")
@@ -451,7 +801,10 @@ class RemoteTranscriptSidecar(
             bySessionId[fileNameWithoutExtension(f.name)] = f
         }
 
-        // Check `history.jsonl` tail for the newest explicit session in this project cwd
+        val orderedCandidates = LinkedHashMap<String, SftpEntryInfo>()
+        val historyPromptsBySid = HashMap<String, MutableList<String>>()
+
+        // Collect matching explicit sessions from `history.jsonl` tail (newest to oldest)
         val historyStat = sftp.statOrNull(joinRemote(claudeRoot, "history.jsonl"))
         if (historyStat != null && historyStat.isRegularFile && historyStat.size > 0L) {
             val readLen = minOf(historyStat.size, 131_072L).toInt()
@@ -469,21 +822,59 @@ class RemoteTranscriptSidecar(
                 val proj = normalizeComparePath(obj.str("project"))
                 val sid = obj.str("sessionId")
                 if (proj == normCwd && sid.isNotEmpty()) {
-                    val matched = bySessionId[sid]
-                    if (matched != null) {
-                        return TranscriptLocation(TranscriptAgentKind.CLAUDE, sid, matched.path, matched.size)
+                    val matched = bySessionId[sid] ?: continue
+                    val displayText = obj.str("display").trim()
+                    if (displayText.isNotEmpty()) {
+                        val promptList = historyPromptsBySid.getOrPut(sid) { ArrayList(6) }
+                        if (promptList.size < 6) promptList.add(displayText)
+                    }
+                    if (sid !in orderedCandidates && orderedCandidates.size < 10) {
+                        orderedCandidates[sid] = matched
                     }
                 }
             }
         }
 
-        val newest = jsonls.first()
-        return TranscriptLocation(
-            TranscriptAgentKind.CLAUDE,
-            fileNameWithoutExtension(newest.name),
-            newest.path,
-            newest.size
-        )
+        for (f in jsonls) {
+            val sid = fileNameWithoutExtension(f.name)
+            if (sid !in orderedCandidates && orderedCandidates.size < 10) {
+                orderedCandidates[sid] = f
+            }
+        }
+
+        if (orderedCandidates.size == 1 || (!hints.hasContentAnchors && hints.claimedPaths.isEmpty())) {
+            val first = orderedCandidates.entries.first()
+            return TranscriptLocation(TranscriptAgentKind.CLAUDE, first.key, first.value.path, first.value.size)
+        }
+
+        val topCandidates = orderedCandidates.entries.sortedByDescending { it.value.mtimeSeconds }.take(10)
+        var best = topCandidates.first()
+        var bestScore = Int.MIN_VALUE
+        topCandidates.forEachIndexed { idx, entry ->
+            val sid = entry.key
+            val fileEntry = entry.value
+            var score = maxOf(0, 30 - idx * 3)
+            if (fileEntry.path in hints.claimedPaths) score -= 180
+            val matchedPrompts = HashSet<Int>()
+            val histPrompts = historyPromptsBySid[sid].orEmpty().map(::normalizeMatchText)
+            if (histPrompts.isNotEmpty() && hints.userPrompts.isNotEmpty()) {
+                hints.userPrompts.forEachIndexed { pIdx, rawPrompt ->
+                    val normP = normalizeMatchText(rawPrompt)
+                    if (normP.length >= 6 && histPrompts.any { it.contains(normP) || (it.length >= 6 && normP.contains(it)) }) {
+                        score += if (pIdx == 0) 520 else 260
+                        matchedPrompts.add(pIdx)
+                    }
+                }
+            }
+            if (hints.hasContentAnchors) {
+                score += scoreCandidateFromTail(sftp, fileEntry.path, hints, matchedPrompts)
+            }
+            if (score > bestScore || (score == bestScore && fileEntry.mtimeSeconds > best.value.mtimeSeconds)) {
+                bestScore = score
+                best = entry
+            }
+        }
+        return TranscriptLocation(TranscriptAgentKind.CLAUDE, best.key, best.value.path, best.value.size)
     }
 
     // -------------------------------------------------------------------------

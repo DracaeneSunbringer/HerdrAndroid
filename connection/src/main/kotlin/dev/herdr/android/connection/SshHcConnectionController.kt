@@ -9,6 +9,7 @@ import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.protocol.TranscriptAgentKind
 import dev.herdr.android.protocol.TranscriptChunkResult
+import dev.herdr.android.protocol.TranscriptLocateHints
 import dev.herdr.android.protocol.TranscriptLocation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -296,12 +297,13 @@ class SshHcConnectionController(
     override suspend fun locateTranscript(
         agentKind: TranscriptAgentKind,
         pid: Long?,
-        cwd: String
+        cwd: String,
+        hints: TranscriptLocateHints
     ): Result<TranscriptLocation?> {
         if (demo != null) return Result.success(null)
         return capture {
             val sidecar = requireSidecar()
-            sidecar.locate(agentKind, pid, cwd)
+            sidecar.locate(agentKind, pid, cwd, hints)
         }
     }
 

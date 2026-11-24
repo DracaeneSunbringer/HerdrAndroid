@@ -22,6 +22,7 @@ data class TerminalTranscriptUiState(
     val stepOutputs: Map<Int, String> = emptyMap(),
     val loadingSteps: Set<Int> = emptySet(),
     val activeModel: String? = null,
+    val locatedWithScreenHints: Boolean = false,
     val lastError: String? = null
 )
 

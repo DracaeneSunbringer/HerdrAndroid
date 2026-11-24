@@ -30,6 +30,7 @@ import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.protocol.TranscriptAgentKind
+import dev.herdr.android.protocol.TranscriptLocateHints
 import dev.herdr.android.protocol.TranscriptRawEvent
 import dev.herdr.android.service.HerdrKeepAliveCoordinator
 import dev.herdr.android.ui.terminal.QuickReplyAction
@@ -1288,6 +1289,8 @@ class HerdrMainViewModel(
         if (_activeSession.value?.address != summary.address) {
             sequenceCoordinator.cancel()
         }
+        val staleBackfills = transcriptBackfillJobs.keys.filter { it != summary.address }
+        staleBackfills.forEach { addr -> transcriptBackfillJobs.remove(addr)?.cancel() }
         sessionJob?.cancel()
         lastDesiredAttachMode = initialMode
         sessionJob = HerdrKeepAliveCoordinator.processScope.launch {
@@ -2055,19 +2058,52 @@ class HerdrMainViewModel(
         }
 
         val nowMs = System.currentTimeMillis()
-        val needsLocate = forceRelocate || curState == null || curState.path.isBlank()
+        val detailForCheck = _activeTerminalSummary.value?.takeIf { it.address == address }
+            ?: controller.terminals.value.firstOrNull { it.address == address }
+        val normCwdForCheck = detailForCheck?.cwd?.trim()?.replace('\\', '/')?.trimEnd('/')?.lowercase().orEmpty()
+        val hasSameCwdSiblings = normCwdForCheck.isNotEmpty() && controller.terminals.value.count {
+            it.state == "live" && it.cwd.trim().replace('\\', '/').trimEnd('/').lowercase() == normCwdForCheck
+        } > 1
+        val needsUpgradeLocate = curState != null &&
+            curState.path.isNotBlank() &&
+            !curState.locatedWithScreenHints &&
+            hasSameCwdSiblings
+        val needsLocate = forceRelocate || curState == null || curState.path.isBlank() || needsUpgradeLocate
+        var switchedSession = false
         if (needsLocate) {
             val lastMissMs = transcriptLocateRetryAtMs[address] ?: 0L
-            if (!forceRelocate && curState?.locateAttempted == true && nowMs - lastMissMs < 1_500L) {
+            if (!forceRelocate && !needsUpgradeLocate && curState?.locateAttempted == true && nowMs - lastMissMs < 1_500L) {
                 return
             }
             val detail = controller.getTerminalDetail(address).getOrNull()
                 ?: controller.terminals.value.firstOrNull { it.address == address }
                 ?: _activeTerminalSummary.value?.takeIf { it.address == address }
                 ?: return
+            val detailNormCwd = detail.cwd.trim().replace('\\', '/').trimEnd('/').lowercase()
+            val siblingsCount = if (detailNormCwd.isEmpty()) 1 else controller.terminals.value.count {
+                it.state == "live" && it.cwd.trim().replace('\\', '/').trimEnd('/').lowercase() == detailNormCwd
+            }
+            val claimedPaths = _transcriptStatesByAddress.value.values
+                .filter { it.address != address && it.path.isNotBlank() }
+                .map { it.path }
+                .toSet()
+            val liveScreen = _activeSession.value
+                ?.takeIf { it.address == address }
+                ?.screenSnapshot
+                ?.value
+                ?.takeIf { it.isNotBlank() }
+                ?: controller.readTerminalPreview(address).getOrNull()
+            val hints = StructuredTerminalReader.extractLocateHints(
+                rawScreen = liveScreen,
+                summary = detail,
+                claimedPaths = claimedPaths
+            )
             val probePid = detail.rootPid ?: detail.foregroundPid
-            Log.i("HerdrTranscript", "locating($address, agent=$agentKind, pid=$probePid, cwd=${detail.cwd})")
-            val locResult = controller.locateTranscript(agentKind, probePid, detail.cwd)
+            Log.i(
+                "HerdrTranscript",
+                "locating($address, agent=$agentKind, pid=$probePid, cwd=${detail.cwd}, hints=${hints.userPrompts.size}u/${hints.assistantAnchors.size}a, siblings=$siblingsCount)"
+            )
+            val locResult = controller.locateTranscript(agentKind, probePid, detail.cwd, hints)
             if (locResult.isFailure) {
                 val err = locResult.exceptionOrNull()
                 Log.w("HerdrTranscript", "locate($address, pid=$probePid) failed: ${err?.message}", err)
@@ -2099,11 +2135,20 @@ class HerdrMainViewModel(
             }
             transcriptLocateRetryAtMs.remove(address)
             val sameSession = curState != null && curState.path == loc.path && curState.sessionId == loc.sessionId
-            if (!sameSession) {
-                Log.i("HerdrTranscript", "located($address) -> ${loc.sessionId} (${loc.fileSize} bytes)")
+            switchedSession = !sameSession
+            if (!sameSession || needsUpgradeLocate) {
+                Log.i(
+                    "HerdrTranscript",
+                    "located($address) -> ${loc.sessionId} (${loc.fileSize} bytes, same=$sameSession, withHints=${hints.hasContentAnchors})"
+                )
             }
             curState = if (sameSession && !forceRelocate) {
-                curState!!.copy(locateAttempted = true, fileSize = loc.fileSize, lastError = null)
+                curState!!.copy(
+                    locateAttempted = true,
+                    fileSize = loc.fileSize,
+                    locatedWithScreenHints = curState.locatedWithScreenHints || hints.hasContentAnchors,
+                    lastError = null
+                )
             } else {
                 TerminalTranscriptUiState(
                     address = address,
@@ -2112,6 +2157,7 @@ class HerdrMainViewModel(
                     path = loc.path,
                     fileSize = loc.fileSize,
                     locateAttempted = true,
+                    locatedWithScreenHints = hints.hasContentAnchors,
                     lastError = null
                 )
             }
@@ -2120,7 +2166,7 @@ class HerdrMainViewModel(
 
         val activeState = curState ?: return
         if (activeState.path.isBlank()) return
-        if (forceRelocate) {
+        if (forceRelocate || switchedSession) {
             transcriptBackfillJobs.remove(address)?.cancel()
         }
 

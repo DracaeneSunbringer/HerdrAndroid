@@ -279,18 +279,18 @@ data class HerdrColorPalette(
 fun HerdrThemePreset.basePalette(): HerdrColorPalette = when (this) {
     HerdrThemePreset.LINEAR_OBSIDIAN -> HerdrColorPalette(
         preset = this,
-        canvas = Color(0xFF0C0C0E),
-        chrome = Color(0xFF0C0C0E),
-        surface = Color(0xFF151518),
-        raised = Color(0xFF1D1D21),
-        hover = Color(0xFF26262B),
-        border = Color(0xFF212125),
-        inputBorder = Color(0xFF2E2E34),
-        foreground = Color(0xFFECECEE),
-        muted = Color(0xFFA1A1AA),
-        dim = Color(0xFF75757E),
-        accent = Color(0xFFE4E4E7),
-        accentSubtle = Color(0xFF27272B),
+        canvas = Color(0xFF0B0C0E),
+        chrome = Color(0xFF0F1013),
+        surface = Color(0xFF141519),
+        raised = Color(0xFF1C1E24),
+        hover = Color(0xFF252830),
+        border = Color(0xFF262830),
+        inputBorder = Color(0xFF343742),
+        foreground = Color(0xFFEEEFF2),
+        muted = Color(0xFFA0A4B0),
+        dim = Color(0xFF717582),
+        accent = Color(0xFFEDEDEF),
+        accentSubtle = Color(0xFF23252E),
         onAccent = Color(0xFF09090B),
         working = Color(0xFFE5B266),
         workingSubtle = Color(0xFF2A2316),
@@ -375,50 +375,50 @@ fun HerdrThemePreset.basePalette(): HerdrColorPalette = when (this) {
 
     HerdrThemePreset.ALABASTER_LIGHT -> HerdrColorPalette(
         preset = this,
-        canvas = Color(0xFFF5F5F7),
-        chrome = Color(0xFFF5F5F7),
+        canvas = Color(0xFFF8F9FB),
+        chrome = Color(0xFFFDFDFE),
         surface = Color(0xFFFFFFFF),
-        raised = Color(0xFFEFEFF2),
-        hover = Color(0xFFE7E7EB),
-        border = Color(0xFFE5E5EA),
-        inputBorder = Color(0xFFD9D9DF),
-        foreground = Color(0xFF18181B),
-        muted = Color(0xFF52525B),
-        dim = Color(0xFF6E6E78),
-        accent = Color(0xFF18181B),
-        accentSubtle = Color(0xFFE4E4E7),
+        raised = Color(0xFFF1F3F7),
+        hover = Color(0xFFE7ECF3),
+        border = Color(0xFFE2E6EE),
+        inputBorder = Color(0xFFD0D7E2),
+        foreground = Color(0xFF111827),
+        muted = Color(0xFF4B5563),
+        dim = Color(0xFF6B7280),
+        accent = Color(0xFF2563EB),
+        accentSubtle = Color(0xFFEFF4FF),
         onAccent = Color(0xFFFFFFFF),
-        working = Color(0xFFAD5A07),
-        workingSubtle = Color(0xFFFBF1E3),
-        blocked = Color(0xFFD1344A),
-        blockedSubtle = Color(0xFFFCEBED),
-        done = Color(0xFF1C7C43),
-        doneSubtle = Color(0xFFE6F4EB),
-        idle = Color(0xFF8A8A94)
+        working = Color(0xFFB45309),
+        workingSubtle = Color(0xFFFFFBEB),
+        blocked = Color(0xFFDC2626),
+        blockedSubtle = Color(0xFFFEF2F2),
+        done = Color(0xFF059669),
+        doneSubtle = Color(0xFFECFDF5),
+        idle = Color(0xFF9CA3AF)
     )
 
     HerdrThemePreset.SOLARIZED_WARM -> HerdrColorPalette(
         preset = this,
-        canvas = Color(0xFFF5F0E6),
-        chrome = Color(0xFFF5F0E6),
-        surface = Color(0xFFFFFCF6),
-        raised = Color(0xFFEEE7D9),
-        hover = Color(0xFFE6DDCB),
-        border = Color(0xFFE6DDCC),
-        inputBorder = Color(0xFFD7CCB6),
-        foreground = Color(0xFF2A2924),
-        muted = Color(0xFF5D594F),
-        dim = Color(0xFF6E695D),
-        accent = Color(0xFF117A70),
-        accentSubtle = Color(0xFFDDEFEA),
+        canvas = Color(0xFFFAF8F4),
+        chrome = Color(0xFFFCFBF8),
+        surface = Color(0xFFFFFFFF),
+        raised = Color(0xFFF2EFE8),
+        hover = Color(0xFFE8E3D8),
+        border = Color(0xFFE5DFD3),
+        inputBorder = Color(0xFFD5CEC0),
+        foreground = Color(0xFF1F1E1B),
+        muted = Color(0xFF57534A),
+        dim = Color(0xFF7D776B),
+        accent = Color(0xFF0F766E),
+        accentSubtle = Color(0xFFE6F4F1),
         onAccent = Color(0xFFFFFFFF),
-        working = Color(0xFF975008),
-        workingSubtle = Color(0xFFF7EBD7),
-        blocked = Color(0xFFBE3A33),
-        blockedSubtle = Color(0xFFF7E2DE),
-        done = Color(0xFF2F7A34),
-        doneSubtle = Color(0xFFE2EFDC),
-        idle = Color(0xFF8C8676)
+        working = Color(0xFFB45309),
+        workingSubtle = Color(0xFFFEF6E6),
+        blocked = Color(0xFFC83333),
+        blockedSubtle = Color(0xFFFCECEC),
+        done = Color(0xFF15803D),
+        doneSubtle = Color(0xFFE9F7EE),
+        idle = Color(0xFF968F82)
     )
 }
 
@@ -611,13 +611,13 @@ object HerdrColors {
  */
 object HerdrType {
     /** Screen title (inbox "牧群", workbench agent name). */
-    val Title = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.4).sp, lineHeight = 28.sp)
+    val Title = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.3).sp, lineHeight = 26.sp)
 
     /** Card title / section emphasis. */
-    val Heading = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.2).sp, lineHeight = 22.sp)
+    val Heading = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-0.2).sp, lineHeight = 23.sp)
 
     /** Reading body (agent prose, headlines). */
-    val Body = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Normal, lineHeight = 23.sp)
+    val Body = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Normal, letterSpacing = 0.05.sp, lineHeight = 24.sp)
 
     /** Secondary text, buttons. */
     val Label = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium, lineHeight = 18.sp)
@@ -626,7 +626,7 @@ object HerdrType {
     val Caption = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Normal, lineHeight = 16.sp)
 
     /** Monospace for ids, paths, code. */
-    val Mono = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.5.sp, lineHeight = 18.sp)
+    val Mono = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp)
 }
 
 private val HerdrTypography = Typography(

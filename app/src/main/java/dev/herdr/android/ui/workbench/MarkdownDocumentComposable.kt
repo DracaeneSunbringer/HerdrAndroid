@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.herdr.android.ui.components.HerdrDivider
+import dev.herdr.android.ui.components.HerdrIcons
 import dev.herdr.android.ui.components.HerdrShapes
 import dev.herdr.android.ui.terminal.MarkdownBlockNode
 import dev.herdr.android.ui.theme.HerdrColors
@@ -354,13 +356,14 @@ private val fileLineFragmentRegex = Regex("""^([^#]+)#L(\d+(?:-L?\d+)?)""", Rege
 @Composable
 internal fun formatRichMarkdownInline(text: String): AnnotatedString {
     val codeBg = HerdrColors.Raised
+    val codeFg = if (HerdrColors.IsLight) Color(0xFF0F172A) else Color(0xFFE2E8F0)
     val accent = HerdrColors.Accent
     val muted = HerdrColors.Muted
-    return remember(text, codeBg, accent, muted) {
+    return remember(text, codeBg, codeFg, accent, muted) {
         buildRichMarkdownAnnotatedString(
             text = text,
             codeBg = codeBg,
-            codeFg = accent,
+            codeFg = codeFg,
             linkFg = accent,
             strikeFg = muted
         )
@@ -455,7 +458,7 @@ private fun appendInlineMarkdown(
                     }
                     builder.pushStringAnnotation(tag = HERDR_LINK_TAG, annotation = decodedTarget)
                     val spanStart = builder.length
-                    builder.append(" 📄 $display ")
+                    builder.append(" $display ↗ ")
                     builder.addStyle(
                         SpanStyle(
                             fontFamily = FontFamily.Monospace,
@@ -736,7 +739,7 @@ internal fun MarkdownDocumentRenderer(
     val palette = rememberCodeHighlightPalette()
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         nodes.forEachIndexed { idx, node ->
             when (node) {
@@ -750,8 +753,8 @@ internal fun MarkdownDocumentRenderer(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 4.dp)
-                        .height(1.dp)
-                        .background(HerdrColors.Border.copy(alpha = 0.75f))
+                        .height(0.6.dp)
+                        .background(HerdrColors.Border.copy(alpha = 0.85f))
                 )
                 is MarkdownBlockNode.QuoteBlock -> QuoteNodeView(
                     node = node,
@@ -775,7 +778,7 @@ internal fun MarkdownDocumentRenderer(
                 )
                 is MarkdownBlockNode.Paragraph -> RichInlineText(
                     text = node.text,
-                    style = HerdrType.Body.copy(lineHeight = 22.sp),
+                    style = HerdrType.Body.copy(lineHeight = 24.sp),
                     color = HerdrColors.Foreground,
                     copyFallback = node.text,
                     onCopy = onCopy,
@@ -795,9 +798,9 @@ private fun rememberCodeHighlightPalette(): CodeHighlightPalette {
     val type = if (HerdrColors.IsLight) Color(0xFF0B5CAD) else Color(0xFF7DCFFF)
     val annotation = HerdrColors.Working
     val diffAddFg = HerdrColors.Done
-    val diffAddBg = HerdrColors.DoneSubtle.copy(alpha = 0.65f)
+    val diffAddBg = if (HerdrColors.IsLight) Color(0xFFE6F7ED) else HerdrColors.DoneSubtle.copy(alpha = 0.78f)
     val diffDelFg = HerdrColors.Blocked
-    val diffDelBg = HerdrColors.BlockedSubtle.copy(alpha = 0.65f)
+    val diffDelBg = if (HerdrColors.IsLight) Color(0xFFFEECEC) else HerdrColors.BlockedSubtle.copy(alpha = 0.78f)
     val diffHunkFg = HerdrColors.Accent
     val diffMetaFg = HerdrColors.Muted
     return remember(
@@ -835,7 +838,7 @@ private fun HeadingNodeView(
         ) {
             RichInlineText(
                 text = text,
-                style = HerdrType.Title.copy(fontSize = 19.sp, lineHeight = 25.sp, fontWeight = FontWeight.Bold),
+                style = HerdrType.Title.copy(fontSize = 18.5.sp, lineHeight = 25.sp, fontWeight = FontWeight.Bold),
                 color = HerdrColors.Foreground,
                 copyFallback = rawMarkdown,
                 onCopy = onCopy,
@@ -844,29 +847,18 @@ private fun HeadingNodeView(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(1.dp)
-                    .background(HerdrColors.Accent.copy(alpha = 0.35f))
+                    .height(0.6.dp)
+                    .background(HerdrColors.Border)
             )
         }
-        2 -> Column(
-            modifier = Modifier.fillMaxWidth().padding(top = 5.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            RichInlineText(
-                text = text,
-                style = HerdrType.Heading.copy(fontSize = 17.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold),
-                color = HerdrColors.Foreground,
-                copyFallback = rawMarkdown,
-                onCopy = onCopy,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(1.dp)
-                    .background(HerdrColors.Border.copy(alpha = 0.65f))
-            )
-        }
+        2 -> RichInlineText(
+            text = text,
+            style = HerdrType.Heading.copy(fontSize = 16.5.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold),
+            color = HerdrColors.Foreground,
+            copyFallback = rawMarkdown,
+            onCopy = onCopy,
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+        )
         3 -> {
             val railColor = HerdrColors.Accent
             Box(
@@ -874,7 +866,7 @@ private fun HeadingNodeView(
                     .fillMaxWidth()
                     .padding(top = 4.dp)
                     .drawBehind {
-                        drawRect(color = railColor, size = Size(3.dp.toPx(), size.height))
+                        drawRect(color = railColor, size = Size(2.5.dp.toPx(), size.height))
                     }
                     .padding(start = 10.dp)
             ) {
@@ -891,7 +883,7 @@ private fun HeadingNodeView(
         else -> RichInlineText(
             text = text,
             style = HerdrType.Label.copy(fontSize = 14.5.sp, lineHeight = 20.sp, fontWeight = FontWeight.SemiBold),
-            color = HerdrColors.Accent,
+            color = HerdrColors.Foreground,
             copyFallback = rawMarkdown,
             onCopy = onCopy,
             modifier = Modifier.fillMaxWidth().padding(top = 3.dp)
@@ -911,12 +903,12 @@ private fun QuoteNodeView(
         "TIP" -> HerdrColors.Done
         else -> HerdrColors.Accent
     }
-    val alertBadge = when (node.alertType) {
-        "CAUTION" -> "🚨 注意"
-        "WARNING" -> "⚠️ 警告"
-        "TIP" -> "💡 提示"
-        "IMPORTANT" -> "📌 重要"
-        "NOTE" -> "ℹ️ 说明"
+    val alertMeta = when (node.alertType) {
+        "CAUTION" -> HerdrIcons.AlertTriangle to "注意"
+        "WARNING" -> HerdrIcons.AlertTriangle to "警告"
+        "TIP" -> HerdrIcons.Sparkle to "提示"
+        "IMPORTANT" -> HerdrIcons.InfoCircle to "重要"
+        "NOTE" -> HerdrIcons.InfoCircle to "说明"
         else -> null
     }
     val body = node.lines.joinToString("\n")
@@ -925,24 +917,36 @@ private fun QuoteNodeView(
             .fillMaxWidth()
             .clip(HerdrShapes.Small)
             .background(HerdrColors.Surface)
+            .border(0.6.dp, HerdrColors.Border, HerdrShapes.Small)
             .drawBehind {
-                drawRect(color = barColor, size = Size(3.dp.toPx(), size.height))
+                drawRect(color = barColor, size = Size(2.5.dp.toPx(), size.height))
             }
             .padding(start = 13.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        if (alertBadge != null) {
-            Text(
-                text = alertBadge,
-                style = HerdrType.Caption,
-                color = barColor,
-                fontWeight = FontWeight.SemiBold
-            )
+        if (alertMeta != null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Icon(
+                    imageVector = alertMeta.first,
+                    contentDescription = null,
+                    tint = barColor,
+                    modifier = Modifier.size(13.dp)
+                )
+                Text(
+                    text = alertMeta.second,
+                    style = HerdrType.Caption,
+                    color = barColor,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
         if (body.isNotBlank()) {
             RichInlineText(
                 text = body,
-                style = HerdrType.Body.copy(lineHeight = 21.sp),
+                style = HerdrType.Body.copy(lineHeight = 22.sp),
                 color = HerdrColors.Foreground,
                 copyFallback = body.ifBlank { rawMarkdown },
                 onCopy = onCopy,
@@ -960,7 +964,7 @@ private fun ListNodeView(
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(5.dp)
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         node.items.forEach { item ->
             Row(
@@ -998,8 +1002,8 @@ private fun ListNodeView(
                     item.ordered -> {
                         Text(
                             text = "${item.ordinal ?: 1}.",
-                            style = HerdrType.Body.copy(fontWeight = FontWeight.Medium),
-                            color = HerdrColors.Accent,
+                            style = HerdrType.Body.copy(fontWeight = FontWeight.Medium, lineHeight = 23.sp),
+                            color = HerdrColors.Muted,
                             modifier = Modifier.widthIn(min = 20.dp)
                         )
                     }
@@ -1011,15 +1015,15 @@ private fun ListNodeView(
                         }
                         Text(
                             text = marker,
-                            style = HerdrType.Body,
-                            color = HerdrColors.Accent,
+                            style = HerdrType.Body.copy(lineHeight = 23.sp),
+                            color = HerdrColors.Muted,
                             modifier = Modifier.widthIn(min = 12.dp)
                         )
                     }
                 }
                 RichInlineText(
                     text = item.text,
-                    style = HerdrType.Body.copy(lineHeight = 21.sp),
+                    style = HerdrType.Body.copy(lineHeight = 23.sp),
                     color = if (item.checked == true) HerdrColors.Muted else HerdrColors.Foreground,
                     copyFallback = rawMarkdown,
                     onCopy = onCopy,
@@ -1059,46 +1063,39 @@ internal fun SyntaxHighlightedCodeCard(
             else -> 22.dp
         }
     }
-    val displayLang = language.trim().ifBlank { "CODE" }.uppercase(Locale.ROOT)
-    val gutterBorderColor = HerdrColors.Border.copy(alpha = 0.45f)
+    val displayLang = language.trim().ifBlank { "text" }.lowercase(Locale.ROOT)
+    val gutterBorderColor = HerdrColors.Border.copy(alpha = 0.55f)
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(HerdrShapes.Block)
             .background(HerdrColors.Surface)
-            .border(1.dp, HerdrColors.Border.copy(alpha = 0.55f), HerdrShapes.Block)
+            .border(0.75.dp, HerdrColors.Border, HerdrShapes.Block)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(HerdrColors.Raised.copy(alpha = 0.72f))
-                .padding(start = 10.dp, end = 6.dp, top = 5.dp, bottom = 5.dp),
+                .background(HerdrColors.Raised.copy(alpha = 0.65f))
+                .padding(start = 12.dp, end = 6.dp, top = 5.dp, bottom = 5.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .clip(HerdrShapes.Small)
-                    .background(HerdrColors.AccentSubtle)
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = displayLang,
-                    style = HerdrType.Caption.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
-                    color = HerdrColors.Accent,
-                    maxLines = 1
-                )
-            }
             Text(
-                text = "${lines.size} 行",
-                style = HerdrType.Caption,
+                text = displayLang,
+                style = HerdrType.Mono.copy(fontSize = 11.sp, fontWeight = FontWeight.Medium),
                 color = HerdrColors.Muted,
+                maxLines = 1
+            )
+            Text(
+                text = "· ${lines.size} 行",
+                style = HerdrType.Caption.copy(fontSize = 11.sp),
+                color = HerdrColors.Dim,
                 modifier = Modifier.weight(1f),
                 maxLines = 1
             )
             Text(
-                text = if (copied) "✓ 已复制" else "复制代码",
+                text = if (copied) "✓ 已复制" else "复制",
                 style = HerdrType.Caption,
                 color = if (copied) HerdrColors.Done else HerdrColors.Accent,
                 fontWeight = FontWeight.Medium,
@@ -1108,7 +1105,7 @@ internal fun SyntaxHighlightedCodeCard(
                         onCopy(code)
                         copied = true
                     }
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
             )
         }
         HerdrDivider()
@@ -1394,16 +1391,22 @@ internal fun InlineUnifiedDiffCard(
             .fillMaxWidth()
             .clip(HerdrShapes.Small)
             .background(HerdrColors.Canvas)
-            .border(1.dp, HerdrColors.Border.copy(alpha = 0.65f), HerdrShapes.Small)
+            .border(0.75.dp, HerdrColors.Border, HerdrShapes.Small)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(HerdrColors.Surface)
-                .padding(horizontal = 8.dp, vertical = 4.dp),
+                .padding(horizontal = 8.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
+            Icon(
+                imageVector = HerdrIcons.FileCode,
+                contentDescription = null,
+                tint = HerdrColors.Muted,
+                modifier = Modifier.size(12.dp)
+            )
             Text(
                 text = fileLabel?.takeIf { it.isNotBlank() } ?: "变更 Diff",
                 style = HerdrType.Caption.copy(fontFamily = FontFamily.Monospace, fontSize = 11.sp),

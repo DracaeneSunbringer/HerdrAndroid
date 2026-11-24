@@ -10,6 +10,7 @@ import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
 import dev.herdr.android.protocol.TranscriptAgentKind
 import dev.herdr.android.protocol.TranscriptChunkResult
+import dev.herdr.android.protocol.TranscriptLocateHints
 import dev.herdr.android.protocol.TranscriptLocation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -167,7 +168,8 @@ interface HerdrConnectionController {
     suspend fun locateTranscript(
         agentKind: TranscriptAgentKind,
         pid: Long?,
-        cwd: String
+        cwd: String,
+        hints: TranscriptLocateHints = TranscriptLocateHints()
     ): Result<TranscriptLocation?>
 
     suspend fun readTranscriptTail(
@@ -303,7 +305,8 @@ class PreviewDemoConnectionController : HerdrConnectionController {
     override suspend fun locateTranscript(
         agentKind: TranscriptAgentKind,
         pid: Long?,
-        cwd: String
+        cwd: String,
+        hints: TranscriptLocateHints
     ): Result<TranscriptLocation?> = Result.success(null)
 
     override suspend fun readTranscriptTail(

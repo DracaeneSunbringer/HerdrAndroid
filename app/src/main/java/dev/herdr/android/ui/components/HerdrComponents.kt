@@ -47,10 +47,10 @@ import dev.herdr.android.ui.theme.HerdrType
 
 /** Shared corner radii. */
 object HerdrShapes {
-    val Card = RoundedCornerShape(18.dp)
-    val Block = RoundedCornerShape(14.dp)
-    val Control = RoundedCornerShape(12.dp)
-    val Small = RoundedCornerShape(8.dp)
+    val Card = RoundedCornerShape(16.dp)
+    val Block = RoundedCornerShape(12.dp)
+    val Control = RoundedCornerShape(10.dp)
+    val Small = RoundedCornerShape(7.dp)
     val Pill = RoundedCornerShape(999.dp)
 }
 
@@ -189,7 +189,7 @@ fun HerdrIconButton(
     }
 }
 
-/** Elevated container. No border in dark themes; hairline in light themes where white-on-gray needs a hint. */
+/** Elevated container with a hairline border across both light and dark themes. */
 @Composable
 fun HerdrCard(
     modifier: Modifier = Modifier,
@@ -202,7 +202,11 @@ fun HerdrCard(
             .fillMaxWidth()
             .clip(HerdrShapes.Card)
             .background(HerdrColors.Surface)
-            .then(if (HerdrColors.IsLight) Modifier.border(1.dp, HerdrColors.Border, HerdrShapes.Card) else Modifier)
+            .border(
+                width = 0.75.dp,
+                color = HerdrColors.Border.copy(alpha = if (HerdrColors.IsLight) 0.9f else 0.7f),
+                shape = HerdrShapes.Card
+            )
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(contentPadding),
         content = content
@@ -260,25 +264,34 @@ fun HerdrFilterTab(label: String, count: Int?, selected: Boolean, onClick: () ->
 fun HerdrSegmented(options: List<String>, selectedIndex: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
     Row(
         modifier = modifier
-            .clip(HerdrShapes.Control)
+            .clip(HerdrShapes.Small)
             .background(HerdrColors.Raised)
-            .padding(3.dp),
+            .border(0.6.dp, HerdrColors.Border, HerdrShapes.Small)
+            .padding(2.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         options.forEachIndexed { idx, label ->
             val selected = idx == selectedIndex
+            val itemShape = RoundedCornerShape(6.dp)
             Box(
                 modifier = Modifier
-                    .height(30.dp)
-                    .clip(RoundedCornerShape(9.dp))
+                    .height(26.dp)
+                    .clip(itemShape)
                     .background(if (selected) HerdrColors.Surface else Color.Transparent)
+                    .then(
+                        if (selected) {
+                            Modifier.border(0.6.dp, HerdrColors.Border.copy(alpha = 0.7f), itemShape)
+                        } else {
+                            Modifier
+                        }
+                    )
                     .clickable { onSelect(idx) }
-                    .padding(horizontal = 12.dp),
+                    .padding(horizontal = 10.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = label,
-                    style = HerdrType.Caption,
+                    style = HerdrType.Caption.copy(fontSize = 11.5.sp),
                     color = if (selected) HerdrColors.Foreground else HerdrColors.Muted,
                     fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
                     maxLines = 1
@@ -296,7 +309,11 @@ fun HerdrGroupedList(modifier: Modifier = Modifier, content: @Composable ColumnS
             .fillMaxWidth()
             .clip(HerdrShapes.Card)
             .background(HerdrColors.Surface)
-            .then(if (HerdrColors.IsLight) Modifier.border(1.dp, HerdrColors.Border, HerdrShapes.Card) else Modifier),
+            .border(
+                width = 0.75.dp,
+                color = HerdrColors.Border.copy(alpha = if (HerdrColors.IsLight) 0.9f else 0.7f),
+                shape = HerdrShapes.Card
+            ),
         content = content
     )
 }
@@ -307,8 +324,8 @@ fun HerdrDivider(modifier: Modifier = Modifier, startIndent: Dp = 0.dp) {
         modifier = modifier
             .fillMaxWidth()
             .padding(start = startIndent)
-            .height(1.dp)
-            .background(HerdrColors.Border)
+            .height(0.6.dp)
+            .background(HerdrColors.Border.copy(alpha = 0.85f))
     )
 }
 
