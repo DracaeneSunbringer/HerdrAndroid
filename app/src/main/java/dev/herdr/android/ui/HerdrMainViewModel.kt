@@ -27,10 +27,14 @@ import dev.herdr.android.protocol.AttachMode
 import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.protocol.TranscriptAgentKind
+import dev.herdr.android.protocol.TranscriptRawEvent
 import dev.herdr.android.service.HerdrKeepAliveCoordinator
 import dev.herdr.android.ui.terminal.QuickReplyAction
 import dev.herdr.android.ui.terminal.StructuredTerminalReader
+import dev.herdr.android.ui.terminal.TerminalDialect
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
+import dev.herdr.android.ui.terminal.TerminalTranscriptUiState
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrThemePreset
 import dev.herdr.android.ui.theme.HerdrThemeTriad
@@ -53,6 +57,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -233,10 +239,17 @@ class HerdrMainViewModel(
     private val _queuedPromptsByAddress = MutableStateFlow<Map<String, List<QueuedPromptItem>>>(emptyMap())
     val queuedPromptsByAddress: StateFlow<Map<String, List<QueuedPromptItem>>> = _queuedPromptsByAddress.asStateFlow()
 
+    private val _transcriptStatesByAddress = MutableStateFlow<Map<String, TerminalTranscriptUiState>>(emptyMap())
+    val transcriptStatesByAddress: StateFlow<Map<String, TerminalTranscriptUiState>> = _transcriptStatesByAddress.asStateFlow()
+
     private val sawWorkingByAddress = ConcurrentHashMap<String, Boolean>()
     private val latestStatusByAddress = ConcurrentHashMap<String, AgentStateWord>()
     private val queueDispatchJobs = ConcurrentHashMap<String, Job>()
     private val readerHistoryByAddress = ConcurrentHashMap<String, List<TerminalSemanticBlock>>()
+    private val transcriptSyncMutexes = ConcurrentHashMap<String, Mutex>()
+    private val transcriptPendingResync = ConcurrentHashMap<String, Boolean>()
+    private val transcriptPendingForce = ConcurrentHashMap<String, Boolean>()
+    private val transcriptLocateRetryAtMs = ConcurrentHashMap<String, Long>()
 
     fun getCachedReaderBlocks(address: String): List<TerminalSemanticBlock> =
         readerHistoryByAddress[address].orEmpty()
@@ -323,6 +336,13 @@ class HerdrMainViewModel(
                 sawWorkingByAddress.keys.retainAll(liveAddrs)
                 latestStatusByAddress.keys.retainAll(liveAddrs)
                 readerHistoryByAddress.keys.retainAll(liveAddrs)
+                transcriptSyncMutexes.keys.retainAll(liveAddrs)
+                transcriptPendingResync.keys.retainAll(liveAddrs)
+                transcriptPendingForce.keys.retainAll(liveAddrs)
+                transcriptLocateRetryAtMs.keys.retainAll(liveAddrs)
+                if (_transcriptStatesByAddress.value.keys.any { it !in liveAddrs }) {
+                    _transcriptStatesByAddress.value = _transcriptStatesByAddress.value.filterKeys { it in liveAddrs }
+                }
                 val staleQueueJobs = queueDispatchJobs.keys.filter { it !in liveAddrs }
                 for (deadAddr in staleQueueJobs) {
                     queueDispatchJobs.remove(deadAddr)?.cancel()
@@ -1230,6 +1250,10 @@ class HerdrMainViewModel(
         connectJob?.cancel()
         sessionWatchJob?.cancel()
         sessionJob?.cancel()
+        transcriptPendingResync.clear()
+        transcriptPendingForce.clear()
+        transcriptLocateRetryAtMs.clear()
+        _transcriptStatesByAddress.value = emptyMap()
         syncKeepAliveNotification()
         HerdrKeepAliveCoordinator.processScope.launch {
             runCatching { _activeSession.value?.detach() }
@@ -1948,8 +1972,10 @@ class HerdrMainViewModel(
             return
         }
         val session = _activeSession.value ?: return
-        if (trimmed.equals("/clear", ignoreCase = true)) {
+        if (trimmed.equals("/clear", ignoreCase = true) || trimmed.equals("/new", ignoreCase = true)) {
             readerHistoryByAddress.remove(session.address)
+            transcriptLocateRetryAtMs.remove(session.address)
+            _transcriptStatesByAddress.value = _transcriptStatesByAddress.value - session.address
         }
         lastDesiredAttachMode = AttachMode.TAKEOVER
         sequenceCoordinator.execute(
@@ -1960,6 +1986,244 @@ class HerdrMainViewModel(
                 SequenceOperation.SendSlashCommand(command = trimmed, expectModal = expectModal)
             )
         )
+        if (trimmed.equals("/clear", ignoreCase = true) || trimmed.equals("/new", ignoreCase = true)) {
+            val targetAddr = session.address
+            viewModelScope.launch {
+                delay(1100)
+                syncTerminalTranscript(targetAddr, TerminalDialect.ANTIGRAVITY, forceRelocate = true)
+            }
+        }
+    }
+
+    fun syncTerminalTranscript(
+        address: String,
+        dialectHint: TerminalDialect? = null,
+        forceRelocate: Boolean = false
+    ) {
+        if (_profile.value.host.startsWith("demo://")) return
+        if (controller.connectionState.value !is ConnectionState.Connected) return
+
+        val summary = controller.terminals.value.firstOrNull { it.address == address }
+            ?: _activeTerminalSummary.value?.takeIf { it.address == address }
+        val agentKind = TranscriptAgentKind.fromAgentHint(summary?.agentApp, dialectHint?.name) ?: return
+
+        val mutex = transcriptSyncMutexes[address] ?: transcriptSyncMutexes.computeIfAbsent(address) { Mutex() }
+        if (mutex.isLocked) {
+            transcriptPendingResync[address] = true
+            if (forceRelocate) transcriptPendingForce[address] = true
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            mutex.withLock {
+                var nextForce = forceRelocate
+                while (true) {
+                    runCatching {
+                        syncTerminalTranscriptOnce(address, agentKind, nextForce)
+                    }
+                    val again = transcriptPendingResync.remove(address) == true
+                    if (!again) break
+                    nextForce = transcriptPendingForce.remove(address) == true
+                }
+            }
+        }
+    }
+
+    private suspend fun syncTerminalTranscriptOnce(
+        address: String,
+        agentKind: TranscriptAgentKind,
+        forceRelocate: Boolean
+    ) {
+        if (controller.connectionState.value !is ConnectionState.Connected) return
+
+        var curState = _transcriptStatesByAddress.value[address]
+        if (curState != null && curState.agentKind != agentKind) {
+            curState = null
+        }
+
+        val nowMs = System.currentTimeMillis()
+        val needsLocate = forceRelocate || curState == null || curState.path.isBlank()
+        if (needsLocate) {
+            val lastMissMs = transcriptLocateRetryAtMs[address] ?: 0L
+            if (!forceRelocate && curState?.locateAttempted == true && nowMs - lastMissMs < 1_500L) {
+                return
+            }
+            val detail = controller.getTerminalDetail(address).getOrNull()
+                ?: controller.terminals.value.firstOrNull { it.address == address }
+                ?: _activeTerminalSummary.value?.takeIf { it.address == address }
+                ?: return
+            val probePid = detail.rootPid ?: detail.foregroundPid
+            val locResult = controller.locateTranscript(agentKind, probePid, detail.cwd)
+            if (locResult.isFailure) {
+                transcriptLocateRetryAtMs[address] = nowMs
+                return
+            }
+            val loc = locResult.getOrNull()
+            if (loc == null) {
+                transcriptLocateRetryAtMs[address] = nowMs
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to TerminalTranscriptUiState(
+                        address = address,
+                        agentKind = agentKind,
+                        locateAttempted = true
+                    )
+                    )
+                return
+            }
+            transcriptLocateRetryAtMs.remove(address)
+            val sameSession = curState != null && curState.path == loc.path && curState.sessionId == loc.sessionId
+            curState = if (sameSession && !forceRelocate) {
+                curState!!.copy(locateAttempted = true, fileSize = loc.fileSize)
+            } else {
+                TerminalTranscriptUiState(
+                    address = address,
+                    agentKind = loc.agentKind,
+                    sessionId = loc.sessionId,
+                    path = loc.path,
+                    fileSize = loc.fileSize,
+                    locateAttempted = true
+                )
+            }
+            _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (address to curState)
+        }
+
+        val activeState = curState ?: return
+        if (activeState.path.isBlank()) return
+
+        val chunk = controller.readTranscriptTail(
+            agentKind = activeState.agentKind,
+            path = activeState.path,
+            offset = activeState.tailOffset
+        ).getOrElse { return }
+
+        val prev = _transcriptStatesByAddress.value[address] ?: activeState
+        val isInitialRead = prev.tailOffset == 0L || chunk.resetRequired
+        val mergedEvents = if (isInitialRead) {
+            chunk.events
+        } else if (chunk.events.isEmpty()) {
+            prev.events
+        } else {
+            mergeTranscriptEvents(prev.events, chunk.events)
+        }
+        val nextHead = when {
+            isInitialRead -> chunk.startOffset
+            prev.headOffset == 0L && chunk.startOffset > 0L -> chunk.startOffset
+            else -> prev.headOffset
+        }
+        val nextHasEarlier = when {
+            isInitialRead -> chunk.hasEarlier
+            else -> prev.hasEarlier || nextHead > 0L
+        }
+        val latestModel = findLatestModel(mergedEvents) ?: prev.activeModel
+
+        val updated = prev.copy(
+            headOffset = nextHead,
+            tailOffset = chunk.nextOffset,
+            fileSize = chunk.fileSize,
+            hasEarlier = nextHasEarlier,
+            events = mergedEvents,
+            activeModel = latestModel,
+            stepOutputs = if (chunk.resetRequired) emptyMap() else prev.stepOutputs
+        )
+        _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (address to updated)
+    }
+
+    fun loadEarlierTranscriptTurns(address: String) {
+        val current = _transcriptStatesByAddress.value[address] ?: return
+        if (!current.hasEarlier || current.isLoadingEarlier || current.path.isBlank() || current.headOffset <= 0L) {
+            return
+        }
+        _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+            address to current.copy(isLoadingEarlier = true)
+            )
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = controller.readTranscriptHead(
+                agentKind = current.agentKind,
+                path = current.path,
+                beforeOffset = current.headOffset
+            )
+            val latest = _transcriptStatesByAddress.value[address] ?: return@launch
+            res.onSuccess { chunk ->
+                val merged = mergeTranscriptEvents(chunk.events, latest.events)
+                val nextHead = minOf(latest.headOffset, chunk.startOffset)
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to latest.copy(
+                        headOffset = nextHead,
+                        hasEarlier = chunk.hasEarlier && nextHead > 0L,
+                        isLoadingEarlier = false,
+                        events = merged,
+                        activeModel = latest.activeModel ?: findLatestModel(merged)
+                    )
+                    )
+            }.onFailure { err ->
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to latest.copy(isLoadingEarlier = false)
+                    )
+                _toastBanner.value = "加载更早轮次失败：${err.message}"
+            }
+        }
+    }
+
+    fun loadTranscriptStepOutput(address: String, stepIndex: Int) {
+        if (stepIndex < 0) return
+        val current = _transcriptStatesByAddress.value[address] ?: return
+        if (current.path.isBlank()) return
+        if (stepIndex in current.stepOutputs || stepIndex in current.loadingSteps) return
+
+        _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+            address to current.copy(loadingSteps = current.loadingSteps + stepIndex)
+            )
+        viewModelScope.launch(Dispatchers.IO) {
+            val res = controller.readTranscriptStepOutput(current.agentKind, current.path, stepIndex)
+            val latest = _transcriptStatesByAddress.value[address] ?: return@launch
+            res.onSuccess { text ->
+                val display = text.ifBlank { "(该步骤无文本输出)" }
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to latest.copy(
+                        loadingSteps = latest.loadingSteps - stepIndex,
+                        stepOutputs = latest.stepOutputs + (stepIndex to display)
+                    )
+                    )
+            }.onFailure { err ->
+                _transcriptStatesByAddress.value = _transcriptStatesByAddress.value + (
+                    address to latest.copy(loadingSteps = latest.loadingSteps - stepIndex)
+                    )
+                _toastBanner.value = "读取步骤 #$stepIndex 输出失败：${err.message}"
+            }
+        }
+    }
+
+    private fun mergeTranscriptEvents(
+        base: List<TranscriptRawEvent>,
+        added: List<TranscriptRawEvent>
+    ): List<TranscriptRawEvent> {
+        if (base.isEmpty()) return added
+        if (added.isEmpty()) return base
+        val out = ArrayList<TranscriptRawEvent>(base.size + added.size)
+        val seen = HashSet<String>(base.size + added.size)
+        for (ev in (base + added)) {
+            val extra = when (ev) {
+                is TranscriptRawEvent.ToolStatusUpdate -> "err:${ev.callId}"
+                is TranscriptRawEvent.UserMessage -> "u:${ev.text.hashCode()}"
+                is TranscriptRawEvent.AssistantStep -> "a:${ev.stepIndex ?: ev.markdownContent.hashCode()}"
+                is TranscriptRawEvent.TokenUpdate -> "t:${ev.model.orEmpty()}:${ev.outputTokens}"
+            }
+            val key = "${ev.lineByteOffset}#$extra"
+            if (seen.add(key)) out.add(ev)
+        }
+        return out
+    }
+
+    private fun findLatestModel(events: List<TranscriptRawEvent>): String? {
+        for (idx in events.lastIndex downTo 0) {
+            when (val ev = events[idx]) {
+                is TranscriptRawEvent.AssistantStep -> if (!ev.model.isNullOrBlank()) return ev.model
+                is TranscriptRawEvent.TokenUpdate -> if (!ev.model.isNullOrBlank()) return ev.model
+                is TranscriptRawEvent.UserMessage -> if (!ev.modelChange.isNullOrBlank()) return ev.modelChange
+                is TranscriptRawEvent.ToolStatusUpdate -> Unit
+            }
+        }
+        return null
     }
 
     fun syncLiveBtwCard(address: String, liveCard: AgyBtwCardState?) {

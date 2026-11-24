@@ -71,7 +71,9 @@ data class TerminalSummary(
     val cols: Int = 120,
     val rows: Int = 40,
     val turn: Int = 0,
-    val labels: Map<String, String> = emptyMap()
+    val labels: Map<String, String> = emptyMap(),
+    val rootPid: Long? = null,
+    val foregroundPid: Long? = null
 ) {
     val displayTitle: String
         get() = when {

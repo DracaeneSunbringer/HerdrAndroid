@@ -8,6 +8,9 @@ import dev.herdr.android.protocol.HcServerStatus
 import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.protocol.TranscriptAgentKind
+import dev.herdr.android.protocol.TranscriptChunkResult
+import dev.herdr.android.protocol.TranscriptLocation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -160,6 +163,32 @@ interface HerdrConnectionController {
     ): Result<TerminalSession>
     suspend fun sendMessageToTerminal(address: String, message: String): Result<Unit>
     suspend fun readTerminalPreview(address: String): Result<String> = Result.success("")
+    suspend fun getTerminalDetail(address: String): Result<TerminalSummary>
+    suspend fun locateTranscript(
+        agentKind: TranscriptAgentKind,
+        pid: Long?,
+        cwd: String
+    ): Result<TranscriptLocation?>
+
+    suspend fun readTranscriptTail(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        offset: Long,
+        windowBytes: Long = RemoteTranscriptSidecar.DEFAULT_WINDOW_BYTES
+    ): Result<TranscriptChunkResult>
+
+    suspend fun readTranscriptHead(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        beforeOffset: Long,
+        windowBytes: Long = RemoteTranscriptSidecar.DEFAULT_WINDOW_BYTES
+    ): Result<TranscriptChunkResult>
+
+    suspend fun readTranscriptStepOutput(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        stepIndex: Int
+    ): Result<String>
 }
 
 /**
@@ -265,6 +294,54 @@ class PreviewDemoConnectionController : HerdrConnectionController {
     override suspend fun sendMessageToTerminal(address: String, message: String): Result<Unit> {
         return Result.success(Unit)
     }
+
+    override suspend fun getTerminalDetail(address: String): Result<TerminalSummary> =
+        _terminals.value.firstOrNull { it.address == address }?.let { Result.success(it) }
+            ?: Result.failure(IllegalArgumentException("未找到终端: $address"))
+
+    override suspend fun locateTranscript(
+        agentKind: TranscriptAgentKind,
+        pid: Long?,
+        cwd: String
+    ): Result<TranscriptLocation?> = Result.success(null)
+
+    override suspend fun readTranscriptTail(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        offset: Long,
+        windowBytes: Long
+    ): Result<TranscriptChunkResult> = Result.success(
+        TranscriptChunkResult(
+            path = path,
+            startOffset = offset,
+            nextOffset = offset,
+            fileSize = 0L,
+            hasEarlier = false,
+            events = emptyList()
+        )
+    )
+
+    override suspend fun readTranscriptHead(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        beforeOffset: Long,
+        windowBytes: Long
+    ): Result<TranscriptChunkResult> = Result.success(
+        TranscriptChunkResult(
+            path = path,
+            startOffset = 0L,
+            nextOffset = beforeOffset,
+            fileSize = 0L,
+            hasEarlier = false,
+            events = emptyList()
+        )
+    )
+
+    override suspend fun readTranscriptStepOutput(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        stepIndex: Int
+    ): Result<String> = Result.success("")
 
     companion object {
         fun sampleLiveTopology(): List<TerminalSummary> = listOf(

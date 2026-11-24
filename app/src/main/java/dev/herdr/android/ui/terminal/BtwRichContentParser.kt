@@ -37,6 +37,11 @@ sealed interface BtwContentSegment {
         val items: List<BtwListItem>
     ) : BtwContentSegment
 
+    data class Blockquote(
+        val text: String,
+        val alertType: String? = null
+    ) : BtwContentSegment
+
     data class Paragraph(
         val text: String
     ) : BtwContentSegment
@@ -53,8 +58,10 @@ sealed interface BtwContentSegment {
  */
 object BtwRichContentParser {
 
-    private val fenceRegex = Regex("^```([A-Za-z0-9_+.-]*)\\s*$")
+    private val fenceOpenRegex = Regex("^(`{3,}|~{3,})([A-Za-z0-9_+#.-]*)\\s*$")
     private val headingRegex = Regex("^(#{1,4})\\s+(.+?)\\s*#*$")
+    private val blockquoteLineRegex = Regex("^\\s*>\\s?(.*)$")
+    private val githubAlertHeaderRegex = Regex("^\\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)]\\s*(.*)$", RegexOption.IGNORE_CASE)
     private val bulletRegex = Regex("^(\\s*)(?:([•\\-*])|(\\d+\\.))\\s+(.+)$")
     private val markdownSepRegex = Regex("^\\|?\\s*:?-{2,}:?(?:\\s*\\|\\s*:?-{2,}:?)+\\s*\\|?$")
     private val unescapedPipeRegex = Regex("(?<!\\\\)\\|")
@@ -92,15 +99,16 @@ object BtwRichContentParser {
                 continue
             }
 
-            // 1. Fenced code block (```lang ... ```)
-            val fenceMatch = fenceRegex.matchEntire(trimmed)
+            // 1. Fenced code block (``` or ~~~~, supporting nested fences)
+            val fenceMatch = fenceOpenRegex.matchEntire(trimmed)
             if (fenceMatch != null) {
-                val lang = fenceMatch.groupValues[1].trim().ifEmpty { null }
+                val fenceSeq = fenceMatch.groupValues[1]
+                val lang = fenceMatch.groupValues[2].trim().ifEmpty { null }
                 val baseIndent = line.indexOfFirst { !it.isWhitespace() }.coerceAtLeast(0)
                 i++
                 val codeLines = ArrayList<String>()
                 while (i < lines.size) {
-                    if (lines[i].trim().startsWith("```")) {
+                    if (isFenceClose(lines[i].trim(), fenceSeq)) {
                         i++
                         break
                     }
@@ -147,7 +155,15 @@ object BtwRichContentParser {
                 continue
             }
 
-            // 6. Markdown heading (# .. ####)
+            // 6. Blockquote / GitHub Alert (`> ...`, `> [!IMPORTANT] ...`)
+            if (blockquoteLineRegex.matches(line)) {
+                val (qSeg, nextIdx) = consumeBlockquote(lines, i)
+                if (qSeg != null) segments.add(qSeg)
+                i = nextIdx
+                continue
+            }
+
+            // 7. Markdown heading (# .. ####)
             val hMatch = headingRegex.matchEntire(trimmed)
             if (hMatch != null) {
                 segments.add(
@@ -160,7 +176,7 @@ object BtwRichContentParser {
                 continue
             }
 
-            // 6. Bullet / ordered list block
+            // 8. Bullet / ordered list block
             val bMatch = bulletRegex.matchEntire(line)
             if (bMatch != null) {
                 val (listSeg, nextIdx) = consumeBulletList(lines, i)
@@ -169,14 +185,15 @@ object BtwRichContentParser {
                 continue
             }
 
-            // 7. Paragraph prose block
+            // 9. Paragraph prose block
             val paraLines = ArrayList<String>()
             while (i < lines.size) {
                 val cur = lines[i]
                 val curTrim = cur.trim()
                 if (curTrim.isEmpty() ||
-                    fenceRegex.matches(curTrim) ||
+                    fenceOpenRegex.matches(curTrim) ||
                     headingRegex.matches(curTrim) ||
+                    blockquoteLineRegex.matches(cur) ||
                     bulletRegex.matches(cur) ||
                     isMarkdownTableStart(lines, i) ||
                     isAgyPipeTableStart(lines, i) ||
@@ -213,7 +230,7 @@ object BtwRichContentParser {
         var i = startIdx + 2
         while (i < lines.size) {
             val trimmed = lines[i].trim()
-            if (trimmed.isEmpty() || '|' !in trimmed || fenceRegex.matches(trimmed) || boxHLineOnlyRegex.matches(trimmed)) {
+            if (trimmed.isEmpty() || '|' !in trimmed || fenceOpenRegex.matches(trimmed) || boxHLineOnlyRegex.matches(trimmed)) {
                 break
             }
             if (markdownSepRegex.matches(trimmed)) {
@@ -440,8 +457,9 @@ object BtwRichContentParser {
             val line = lines[i]
             val trimmed = line.trim()
             if (trimmed.isEmpty()) break
-            if (fenceRegex.matches(trimmed) ||
+            if (fenceOpenRegex.matches(trimmed) ||
                 headingRegex.matches(trimmed) ||
+                blockquoteLineRegex.matches(line) ||
                 isMarkdownTableStart(lines, i) ||
                 isAgyPipeTableStart(lines, i) ||
                 isBoxTableStart(lines, i) ||
@@ -468,6 +486,59 @@ object BtwRichContentParser {
         }
         flushItem()
         return BtwContentSegment.BulletList(items) to i
+    }
+
+    private fun isFenceClose(trimmed: String, openFence: String): Boolean {
+        if (openFence.isEmpty()) return false
+        val ch = openFence[0]
+        var count = 0
+        while (count < trimmed.length && trimmed[count] == ch) count++
+        return count >= openFence.length && trimmed.substring(count).isBlank()
+    }
+
+    private fun consumeBlockquote(lines: List<String>, startIdx: Int): Pair<BtwContentSegment.Blockquote?, Int> {
+        val rawQuoteLines = ArrayList<String>()
+        var i = startIdx
+        while (i < lines.size) {
+            val m = blockquoteLineRegex.matchEntire(lines[i]) ?: break
+            rawQuoteLines.add(m.groupValues[1].trimEnd())
+            i++
+        }
+        if (rawQuoteLines.isEmpty()) return null to i
+
+        var alertType: String? = null
+        val firstTrim = rawQuoteLines[0].trim()
+        val alertMatch = githubAlertHeaderRegex.matchEntire(firstTrim)
+        if (alertMatch != null) {
+            alertType = alertMatch.groupValues[1].uppercase()
+            val remainder = alertMatch.groupValues[2].trim()
+            if (remainder.isNotEmpty()) {
+                rawQuoteLines[0] = remainder
+            } else {
+                rawQuoteLines.removeAt(0)
+            }
+        }
+
+        val paras = ArrayList<String>()
+        var cur = ArrayList<String>()
+        for (ln in rawQuoteLines) {
+            val t = ln.trim()
+            if (t.isEmpty()) {
+                if (cur.isNotEmpty()) {
+                    paras.add(joinWrappedLines(cur))
+                    cur = ArrayList()
+                }
+            } else {
+                cur.add(t)
+            }
+        }
+        if (cur.isNotEmpty()) paras.add(joinWrappedLines(cur))
+        val text = paras.joinToString("\n")
+        return if (text.isNotBlank() || alertType != null) {
+            BtwContentSegment.Blockquote(text = text, alertType = alertType) to i
+        } else {
+            null to i
+        }
     }
 
     private fun isBoxRowLike(t: String): Boolean =

@@ -41,6 +41,69 @@ class HcJsonTest {
         assertFalse(summary.labels.containsKey("ignored"))
         assertEquals(132, summary.cols)
         assertEquals(44, summary.rows)
+        assertNull(summary.rootPid)
+        assertNull(summary.foregroundPid)
+    }
+
+    @Test fun terminalGetPidAndForegroundPidAreExtracted() {
+        val summary = HcJson.terminal(JSONObject("""{
+            "address":"t1q","state":"live","pid":13592,
+            "foreground":{"pid":10964,"name":"agy.exe","cwd":"D:\\Code"},
+            "cols":120,"rows":40,"turn":3
+        }"""))
+        assertEquals(13592L, summary.rootPid)
+        assertEquals(10964L, summary.foregroundPid)
+
+        val fallback = HcJson.terminal(JSONObject("""{
+            "address":"t1r","state":"live","pid":24680,
+            "foreground":{"name":"pwsh.exe","cwd":"D:\\Code"}
+        }"""))
+        assertEquals(24680L, fallback.rootPid)
+        assertEquals(24680L, fallback.foregroundPid)
+    }
+
+    @Test fun transcriptWireJsonParsesLocateChunkAndStepResponses() {
+        val loc = TranscriptWireJson.parseLocateResponse(
+            """{"ok":true,"id":1,"found":true,"agent":"agy","sessionId":"uuid-1","path":"C:\\logs\\transcript_full.jsonl","fileSize":4096}""",
+            TranscriptAgentKind.ANTIGRAVITY
+        )
+        assertNotNull(loc)
+        assertEquals(TranscriptAgentKind.ANTIGRAVITY, loc!!.agentKind)
+        assertEquals("uuid-1", loc.sessionId)
+        assertEquals(4096L, loc.fileSize)
+
+        val notFound = TranscriptWireJson.parseLocateResponse(
+            """{"ok":true,"id":2,"found":false}""",
+            TranscriptAgentKind.CODEX
+        )
+        assertNull(notFound)
+
+        val chunk = TranscriptWireJson.parseChunkResponse(
+            """{"ok":true,"id":3,"path":"p","startOffset":100,"nextOffset":512,"fileSize":512,"hasEarlier":true,"reset":false,"events":[
+                {"k":"user","o":100,"s":0,"ts":"2026-11-23T01:00:00Z","text":"hello","mc":"gpt-5"},
+                {"k":"assistant","o":200,"s":1,"ts":"2026-11-23T01:00:05Z","st":"DONE","m":"gemini-2.5-pro","th":"plan","md":"# Title\n\nBody","in":100,"cin":50,"out":25,"tc":[{"id":"step_2","n":"edit_file","t":"A.kt","d":"+2 -1","f":"A.kt","rs":2,"err":false}]},
+                {"k":"tokens","o":350,"m":"gpt-5","ef":"high","in":400,"cin":200,"out":90},
+                {"k":"tool_err","o":420,"id":"step_2","err":true}
+            ]}""",
+            "fallback"
+        )
+        assertEquals("p", chunk.path)
+        assertEquals(100L, chunk.startOffset)
+        assertEquals(512L, chunk.nextOffset)
+        assertTrue(chunk.hasEarlier)
+        assertEquals(4, chunk.events.size)
+        val asst = chunk.events[1] as TranscriptRawEvent.AssistantStep
+        assertEquals("gemini-2.5-pro", asst.model)
+        assertEquals(1, asst.toolCalls.size)
+        assertEquals(2, asst.toolCalls[0].resultStepIndex)
+        val err = chunk.events[3] as TranscriptRawEvent.ToolStatusUpdate
+        assertEquals("step_2", err.callId)
+        assertTrue(err.hasError)
+
+        assertEquals(
+            "step output text",
+            TranscriptWireJson.parseStepResponse("""{"ok":true,"id":4,"output":"step output text"}""")
+        )
     }
 
     @Test fun malformedInventoryDoesNotBecomeAValidEmptyConnection() {

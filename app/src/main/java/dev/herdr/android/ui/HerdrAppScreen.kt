@@ -154,6 +154,7 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
     val queuedPromptsByAddress by viewModel.queuedPromptsByAddress.collectAsState()
     val btwHistoryByAddress by viewModel.btwHistoryByAddress.collectAsState()
     val viewingBtwHistoryAddress by viewModel.viewingBtwHistoryAddress.collectAsState()
+    val transcriptStatesByAddress by viewModel.transcriptStatesByAddress.collectAsState()
     val requestInputFocusSignal by viewModel.requestInputFocusSignal.collectAsState()
     val sequenceStatus by viewModel.sequenceStatus.collectAsState()
     val liveTerminals = remember(allTerminals) { allTerminals.filter { it.state == "live" } }
@@ -331,6 +332,18 @@ fun HerdrAppScreen(viewModel: HerdrMainViewModel) {
                         cachedReaderBlocks = activeSession?.address?.let(viewModel::getCachedReaderBlocks).orEmpty(),
                         onUpdateCachedReaderBlocks = { blocks ->
                             activeSession?.address?.let { addr -> viewModel.updateCachedReaderBlocks(addr, blocks) }
+                        },
+                        transcriptState = activeSession?.address?.let { transcriptStatesByAddress[it] },
+                        onRequestTranscriptSync = { dialect, forceRelocate ->
+                            activeSession?.address?.let { addr ->
+                                viewModel.syncTerminalTranscript(addr, dialect, forceRelocate)
+                            }
+                        },
+                        onLoadEarlierTranscript = {
+                            activeSession?.address?.let { addr -> viewModel.loadEarlierTranscriptTurns(addr) }
+                        },
+                        onLoadTranscriptStepOutput = { stepIndex ->
+                            activeSession?.address?.let { addr -> viewModel.loadTranscriptStepOutput(addr, stepIndex) }
                         },
                         onPickTerminal = { viewModel.selectTab(WorkspaceTab.AGENTS) }
                     )

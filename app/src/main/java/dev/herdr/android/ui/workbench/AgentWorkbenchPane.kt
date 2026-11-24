@@ -89,6 +89,7 @@ import androidx.compose.ui.unit.sp
 import dev.herdr.android.protocol.AgentStateWord
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.protocol.TranscriptAgentKind
 import dev.herdr.android.ui.DispatchedReceipt
 import dev.herdr.android.ui.HerdrAppSettings
 import dev.herdr.android.ui.QueuedDispatchMode
@@ -118,7 +119,9 @@ import dev.herdr.android.ui.terminal.AgySlashModalKind
 import dev.herdr.android.ui.terminal.AskNavDirection
 import dev.herdr.android.ui.terminal.TerminalDialect
 import dev.herdr.android.ui.terminal.TerminalSemanticBlock
+import dev.herdr.android.ui.terminal.TerminalTranscriptUiState
 import dev.herdr.android.ui.terminal.ToolActionCategory
+import dev.herdr.android.ui.terminal.TranscriptSessionAssembler
 import dev.herdr.android.ui.terminal.WorkbenchSnapshot
 import dev.herdr.android.ui.theme.HerdrColors
 import dev.herdr.android.ui.theme.HerdrType
@@ -131,6 +134,7 @@ private val hcWrapperRegex = Regex("^<hc\\b[^>]*?(?:from=\"([^\"]*)\")?[^>]*>([\
 private val whitespaceRegex = Regex("\\s+")
 private val orderedBulletPrefixRegex = Regex("^(\\d{1,2}[.)、]|[（(]\\d{1,2}[)）])\\s*")
 private val attachmentTagRegex = Regex("\\[📎[^\\]]*]")
+private val blockquoteAlertTagRegex = Regex("^\\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)]\\s*([\\s\\S]*)$", RegexOption.IGNORE_CASE)
 
 private val PhotoAttachIcon: ImageVector by lazy {
     ImageVector.Builder(
@@ -247,6 +251,10 @@ fun AgentWorkbenchPane(
     onOpenBtwHistory: () -> Unit = {},
     cachedReaderBlocks: List<TerminalSemanticBlock> = emptyList(),
     onUpdateCachedReaderBlocks: (List<TerminalSemanticBlock>) -> Unit = {},
+    transcriptState: TerminalTranscriptUiState? = null,
+    onRequestTranscriptSync: (TerminalDialect, Boolean) -> Unit = { _, _ -> },
+    onLoadEarlierTranscript: () -> Unit = {},
+    onLoadTranscriptStepOutput: (Int) -> Unit = {},
     onPickTerminal: () -> Unit
 ) {
     if (session == null || summary == null) {
@@ -266,6 +274,7 @@ fun AgentWorkbenchPane(
 
     val clipboard = LocalClipboardManager.current
     val rawScreen by session.screenSnapshot.collectAsState()
+    val outputEpoch = session.outputEpochCount
     val dims by session.dimensions.collectAsState()
 
     var readerMode by remember { mutableStateOf(true) }
@@ -293,7 +302,7 @@ fun AgentWorkbenchPane(
     var localHistoryBlocks by remember(session.address) {
         mutableStateOf(cachedReaderBlocks)
     }
-    var snapshot by remember(session.address) {
+    var liveSnapshot by remember(session.address) {
         mutableStateOf(
             WorkbenchSnapshot(
                 blocks = emptyList(),
@@ -303,7 +312,15 @@ fun AgentWorkbenchPane(
             )
         )
     }
+    var snapshot by remember(session.address) {
+        mutableStateOf(liveSnapshot)
+    }
     var hasInitialSnapshot by remember(session.address) { mutableStateOf(false) }
+
+    val latestTranscriptState by rememberUpdatedState(transcriptState)
+    val currentSummary by rememberUpdatedState(summary)
+    val latestOnRequestTranscriptSync by rememberUpdatedState(onRequestTranscriptSync)
+
     LaunchedEffect(session.address, rawScreen, summary) {
         val computed = withContext(Dispatchers.Default) {
             StructuredTerminalReader.analyzeWorkbench(rawScreen, summary, localHistoryBlocks)
@@ -318,8 +335,44 @@ fun AgentWorkbenchPane(
         }
         localHistoryBlocks = nextCache
         onUpdateCachedReaderBlocks(computed.blocks)
-        snapshot = computed
+        val fused = withContext(Dispatchers.Default) {
+            TranscriptSessionAssembler.fuseWithLiveWorkbench(latestTranscriptState, computed, summary)
+        }
+        liveSnapshot = computed
+        snapshot = fused
         hasInitialSnapshot = true
+    }
+
+    LaunchedEffect(session.address, transcriptState) {
+        if (hasInitialSnapshot) {
+            snapshot = withContext(Dispatchers.Default) {
+                TranscriptSessionAssembler.fuseWithLiveWorkbench(transcriptState, liveSnapshot, currentSummary)
+            }
+        }
+    }
+
+    val syncAgentKind = remember(summary.agentApp, liveSnapshot.dialect) {
+        TranscriptAgentKind.fromAgentHint(summary.agentApp, liveSnapshot.dialect.name)
+    }
+    LaunchedEffect(
+        session.address,
+        syncAgentKind,
+        outputEpoch,
+        summary.turn,
+        liveSnapshot.liveStatus
+    ) {
+        if (syncAgentKind == null) return@LaunchedEffect
+        val cur = latestTranscriptState
+        val shouldForceRelocate = liveSnapshot.blocks.any { it is TerminalSemanticBlock.SessionHeaderBlock } &&
+            cur?.events?.isNotEmpty() == true
+        val isFirstSync = cur == null || (!cur.locateAttempted && cur.path.isBlank())
+        val debounceMs = when {
+            shouldForceRelocate || isFirstSync -> 50L
+            liveSnapshot.liveStatus == AgentStateWord.WORKING -> 350L
+            else -> 80L
+        }
+        delay(debounceMs)
+        latestOnRequestTranscriptSync(liveSnapshot.dialect, shouldForceRelocate)
     }
 
     val isAgyStreamingCard = snapshot.agyState?.activeBtwCard?.isRunning == true ||
@@ -448,6 +501,7 @@ fun AgentWorkbenchPane(
         as? TerminalSemanticBlock.SessionHeaderBlock
     val turns = snapshot.turns
     val hasCwdHeader = summary.cwd.isNotBlank()
+    val hasLoadEarlierBanner = transcriptState?.hasEarlier == true
     val hasPendingReceiptItem = shouldShowPendingReceipt && dispatchedReceipt != null
     val liveWorkingActivity = if (effectiveStatus == AgentStateWord.WORKING) {
         snapshot.liveWorkingActivity
@@ -457,6 +511,7 @@ fun AgentWorkbenchPane(
 
     val (turnStartItemIndices, readerAnchorIndex) = remember(
         hasCwdHeader,
+        hasLoadEarlierBanner,
         sessionHeader,
         turns,
         blocks.size,
@@ -468,6 +523,7 @@ fun AgentWorkbenchPane(
         val startMap = LinkedHashMap<Int, Int>(turns.size)
         var count = 0
         if (hasCwdHeader) count++
+        if (hasLoadEarlierBanner) count++
         if (sessionHeader != null) count++
         if (turns.isEmpty()) {
             count++ // empty hint
@@ -611,6 +667,7 @@ fun AgentWorkbenchPane(
                             summary.name?.takeIf { it.isNotBlank() && it != workbenchTitleOf(summary) }?.let { add(it) }
                             add(agentAppLabel(summary.agentApp))
                             if (summary.turn > 0) add("${summary.turn} 轮")
+                            if (snapshot.isRawMarkdownActive) add("MD 原生")
                         }.joinToString(" · ")
                         OneLine(meta, HerdrType.Caption, HerdrColors.Muted)
                     }
@@ -703,6 +760,7 @@ fun AgentWorkbenchPane(
                         TurnQuickJumpBar(
                             turns = turns,
                             collapsedTurnIndices = collapsedTurnIndices,
+                            isRawMarkdownActive = snapshot.isRawMarkdownActive,
                             onJumpToTurn = { turnIdx ->
                                 collapsedTurnIndices = collapsedTurnIndices - turnIdx
                                 val targetItem = turnStartItemIndices[turnIdx] ?: 0
@@ -739,6 +797,14 @@ fun AgentWorkbenchPane(
                         if (hasCwdHeader) {
                             item(key = "cwd", contentType = "cwd") {
                                 OneLine(summary.cwd, HerdrType.Caption.copy(fontFamily = FontFamily.Monospace), HerdrColors.Dim)
+                            }
+                        }
+                        if (hasLoadEarlierBanner) {
+                            item(key = "load_earlier", contentType = "load_earlier") {
+                                LoadEarlierTranscriptBanner(
+                                    isLoading = transcriptState?.isLoadingEarlier == true,
+                                    onClick = onLoadEarlierTranscript
+                                )
                             }
                         }
                         if (sessionHeader != null) {
@@ -831,6 +897,9 @@ fun AgentWorkbenchPane(
                                                 block = block,
                                                 stateKey = "${session.address}#t${turn.turnIndex}#$bIdx",
                                                 isSequenceBusy = isSequenceBusy,
+                                                stepOutputs = transcriptState?.stepOutputs.orEmpty(),
+                                                loadingSteps = transcriptState?.loadingSteps.orEmpty(),
+                                                onLoadStepOutput = onLoadTranscriptStepOutput,
                                                 onSubmitAgyAskAnswer = onSubmitAgyAskAnswer,
                                                 onNavigateAgyAsk = onNavigateAgyAsk,
                                                 onCopy = { clipboard.setText(AnnotatedString(it)) }
@@ -1761,6 +1830,9 @@ private fun ReaderBlock(
     block: TerminalSemanticBlock,
     stateKey: String,
     isSequenceBusy: Boolean,
+    stepOutputs: Map<Int, String> = emptyMap(),
+    loadingSteps: Set<Int> = emptySet(),
+    onLoadStepOutput: (Int) -> Unit = {},
     onSubmitAgyAskAnswer: (questionIndex: Int, selectedNumbers: Set<Int>, writeInText: String?) -> Unit,
     onNavigateAgyAsk: (AskNavDirection, Int) -> Unit,
     onCopy: (String) -> Unit
@@ -1897,9 +1969,25 @@ private fun ReaderBlock(
             )
             when {
                 block.text.startsWith("▎ ") -> {
-                    val quoteBody = block.text.removePrefix("▎ ")
-                    val barColor = HerdrColors.Accent
-                    Box(
+                    val rawQuote = block.text.removePrefix("▎ ")
+                    val alertMatch = blockquoteAlertTagRegex.matchEntire(rawQuote)
+                    val alertKind = alertMatch?.groupValues?.get(1)?.uppercase()
+                    val quoteBody = alertMatch?.groupValues?.get(2)?.trim()?.ifEmpty { rawQuote } ?: rawQuote
+                    val barColor = when (alertKind) {
+                        "CAUTION" -> HerdrColors.Blocked
+                        "WARNING" -> HerdrColors.Working
+                        "TIP" -> HerdrColors.Done
+                        else -> HerdrColors.Accent
+                    }
+                    val alertBadge = when (alertKind) {
+                        "CAUTION" -> "🚨 注意"
+                        "WARNING" -> "⚠️ 警告"
+                        "TIP" -> "💡 提示"
+                        "IMPORTANT" -> "📌 重要"
+                        "NOTE" -> "ℹ️ 说明"
+                        else -> null
+                    }
+                    Column(
                         modifier = copyMod
                             .fillMaxWidth()
                             .clip(HerdrShapes.Small)
@@ -1907,8 +1995,17 @@ private fun ReaderBlock(
                             .drawBehind {
                                 drawRect(color = barColor, size = Size(3.dp.toPx(), size.height))
                             }
-                            .padding(start = 13.dp, end = 12.dp, top = 8.dp, bottom = 8.dp)
+                            .padding(start = 13.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
+                        if (alertBadge != null) {
+                            Text(
+                                text = alertBadge,
+                                style = HerdrType.Caption,
+                                color = barColor,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                         Text(formatBtwInline(quoteBody), style = HerdrType.Body, color = HerdrColors.Foreground)
                     }
                 }
@@ -1940,7 +2037,14 @@ private fun ReaderBlock(
             if (block.isPureThought) {
                 ThoughtPillCard(block = block, stateKey = stateKey, onCopy = onCopy)
             } else {
-                ToolGroupCard(block = block, stateKey = stateKey, onCopy = onCopy)
+                ToolGroupCard(
+                    block = block,
+                    stateKey = stateKey,
+                    stepOutputs = stepOutputs,
+                    loadingSteps = loadingSteps,
+                    onLoadStepOutput = onLoadStepOutput,
+                    onCopy = onCopy
+                )
             }
         }
 
@@ -2162,9 +2266,13 @@ private fun ThoughtPillCard(
 private fun ToolGroupCard(
     block: TerminalSemanticBlock.ToolGroupBlock,
     stateKey: String,
+    stepOutputs: Map<Int, String> = emptyMap(),
+    loadingSteps: Set<Int> = emptySet(),
+    onLoadStepOutput: (Int) -> Unit = {},
     onCopy: (String) -> Unit
 ) {
     var expanded by remember(stateKey, block.defaultExpanded) { mutableStateOf(block.defaultExpanded) }
+    var expandedStepIndices by remember(stateKey) { mutableStateOf(emptySet<Int>()) }
     val primaryLabel = block.actionBreakdownLabel ?: block.summaryLabel
     val pillBg = when {
         block.hasError -> HerdrColors.BlockedSubtle
@@ -2304,6 +2412,34 @@ private fun ToolGroupCard(
                                     color = if (entry.hasError) HerdrColors.Blocked else HerdrColors.Foreground,
                                     modifier = Modifier.weight(1f)
                                 )
+                                val rStep = entry.resultStepIndex
+                                if (rStep != null) {
+                                    val isStepOpen = rStep in expandedStepIndices
+                                    val isLoading = rStep in loadingSteps
+                                    Text(
+                                        text = when {
+                                            isLoading -> "加载中…"
+                                            isStepOpen -> "收起输出 ▴"
+                                            else -> "查看输出 ▾"
+                                        },
+                                        style = HerdrType.Caption.copy(fontSize = 10.5.sp),
+                                        color = HerdrColors.Accent,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier
+                                            .clip(HerdrShapes.Small)
+                                            .clickable {
+                                                if (isStepOpen) {
+                                                    expandedStepIndices = expandedStepIndices - rStep
+                                                } else {
+                                                    expandedStepIndices = expandedStepIndices + rStep
+                                                    if (rStep !in stepOutputs && rStep !in loadingSteps) {
+                                                        onLoadStepOutput(rStep)
+                                                    }
+                                                }
+                                            }
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
                             }
                             if (entry.detailLines.isNotEmpty()) {
                                 Box(
@@ -2316,6 +2452,35 @@ private fun ToolGroupCard(
                                         entry.detailLines.joinToString("\n"),
                                         style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
                                         color = HerdrColors.Dim,
+                                        softWrap = false
+                                    )
+                                }
+                            }
+                            val rStep = entry.resultStepIndex
+                            if (rStep != null && rStep in expandedStepIndices) {
+                                val stepText = stepOutputs[rStep]
+                                val isLoading = rStep in loadingSteps
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(HerdrShapes.Small)
+                                        .background(HerdrColors.Canvas)
+                                        .border(1.dp, HerdrColors.Border.copy(alpha = 0.5f), HerdrShapes.Small)
+                                        .combinedClickable(
+                                            onClick = {},
+                                            onLongClick = { if (!stepText.isNullOrBlank()) onCopy(stepText) }
+                                        )
+                                        .horizontalScroll(rememberScrollState())
+                                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        text = when {
+                                            isLoading && stepText == null -> "正在按需拉取第 #$rStep 步输出…"
+                                            stepText != null -> stepText
+                                            else -> "(暂无输出)"
+                                        },
+                                        style = HerdrType.Mono.copy(fontSize = 11.sp, lineHeight = 16.sp),
+                                        color = HerdrColors.Muted,
                                         softWrap = false
                                     )
                                 }
@@ -2335,9 +2500,35 @@ private fun ToolGroupCard(
 }
 
 @Composable
+private fun LoadEarlierTranscriptBanner(
+    isLoading: Boolean,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(HerdrShapes.Pill)
+            .background(HerdrColors.Surface)
+            .border(1.dp, HerdrColors.Border.copy(alpha = 0.7f), HerdrShapes.Pill)
+            .clickable(enabled = !isLoading, onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = if (isLoading) "正在加载更早历史轮次…" else "↑ 加载更早历史轮次 (2MB 分页)",
+            style = HerdrType.Caption,
+            color = if (isLoading) HerdrColors.Muted else HerdrColors.Accent,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+@Composable
 private fun TurnQuickJumpBar(
     turns: List<ConversationTurn>,
     collapsedTurnIndices: Set<Int>,
+    isRawMarkdownActive: Boolean = false,
     onJumpToTurn: (Int) -> Unit,
     onToggleCollapseOlder: () -> Unit
 ) {
@@ -2363,6 +2554,21 @@ private fun TurnQuickJumpBar(
             fontWeight = FontWeight.SemiBold,
             maxLines = 1
         )
+        if (isRawMarkdownActive) {
+            Box(
+                modifier = Modifier
+                    .clip(HerdrShapes.Pill)
+                    .background(HerdrColors.DoneSubtle)
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    "MD",
+                    style = HerdrType.Caption.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                    color = HerdrColors.Done,
+                    maxLines = 1
+                )
+            }
+        }
         Row(
             modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -2448,6 +2654,8 @@ private fun TurnDividerHeader(
             if (turn.toolOperationCount > 0) add("${turn.toolOperationCount} 步操作")
             if (turn.changedFiles.isNotEmpty()) add("改 ${turn.changedFiles.size} 文件")
             turn.durationLabel?.let { add(it) }
+            turn.modelLabel?.let { add(it) }
+            turn.tokenSummaryLabel?.let { add(it) }
         }.joinToString(" · ")
         if (meta.isNotEmpty()) {
             OneLine(meta, HerdrType.Caption, HerdrColors.Dim, modifier = Modifier.weight(1f))
@@ -2505,6 +2713,8 @@ private fun TurnSummaryCard(
                 if (turn.toolOperationCount > 0) add("${turn.toolOperationCount} 工具")
                 if (turn.changedFiles.isNotEmpty()) add("${turn.changedFiles.size} 改动")
                 turn.durationLabel?.let { add(it) }
+                turn.modelLabel?.let { add(it) }
+                turn.tokenSummaryLabel?.let { add(it) }
             }.joinToString(" · ")
             if (meta.isNotEmpty()) {
                 OneLine(meta, HerdrType.Caption, HerdrColors.Dim, modifier = Modifier.weight(1f))

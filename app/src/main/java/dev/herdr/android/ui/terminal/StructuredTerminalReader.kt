@@ -31,7 +31,8 @@ data class ToolStepEntry(
     val durationText: String? = null,
     val changedFiles: List<String> = emptyList(),
     val isRunning: Boolean = false,
-    val hasError: Boolean = false
+    val hasError: Boolean = false,
+    val resultStepIndex: Int? = null
 )
 
 data class LiveWorkingActivity(
@@ -54,7 +55,10 @@ data class ConversationTurn(
     val answerPreview: String = "",
     val hasError: Boolean = false,
     val isRunning: Boolean = false,
-    val hasInteractiveCard: Boolean = false
+    val hasInteractiveCard: Boolean = false,
+    val modelLabel: String? = null,
+    val tokenSummaryLabel: String? = null,
+    val isRawMarkdownSource: Boolean = false
 )
 
 sealed interface TerminalSemanticBlock {
@@ -151,7 +155,8 @@ data class WorkbenchSnapshot(
     val dialect: TerminalDialect = TerminalDialect.GENERIC,
     val agyState: AgyTerminalState? = null,
     val turns: List<ConversationTurn> = emptyList(),
-    val liveWorkingActivity: LiveWorkingActivity? = null
+    val liveWorkingActivity: LiveWorkingActivity? = null,
+    val isRawMarkdownActive: Boolean = false
 )
 
 object StructuredTerminalReader {

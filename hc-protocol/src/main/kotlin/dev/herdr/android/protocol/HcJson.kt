@@ -62,6 +62,8 @@ object HcJson {
         }
         val status = item.optJSONObject("status")
         val foreground = item.optJSONObject("foreground")
+        val rootPid = item.optLong("pid", -1L).takeIf { it > 0L }
+        val foregroundPid = foreground?.optLong("pid", -1L)?.takeIf { it > 0L } ?: rootPid
         return TerminalSummary(
             address = address,
             name = item.nullableString("name"), parent = item.nullableString("parent"),
@@ -71,7 +73,8 @@ object HcJson {
             cwd = foreground?.nullableString("cwd") ?: item.optString("cwd"),
             whereLabel = labels["where"], spaceId = labels["herdr.space"], tabId = labels["herdr.tab"],
             title = item.optString("title"), cols = item.optInt("cols", 120).coerceIn(1, 65535),
-            rows = item.optInt("rows", 40).coerceIn(1, 65535), turn = item.optInt("turn"), labels = labels
+            rows = item.optInt("rows", 40).coerceIn(1, 65535), turn = item.optInt("turn"), labels = labels,
+            rootPid = rootPid, foregroundPid = foregroundPid
         )
     }
 

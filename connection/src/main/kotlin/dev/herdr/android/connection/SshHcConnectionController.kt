@@ -7,6 +7,9 @@ import dev.herdr.android.protocol.HcRpcException
 import dev.herdr.android.protocol.MachineSummary
 import dev.herdr.android.protocol.TerminalSession
 import dev.herdr.android.protocol.TerminalSummary
+import dev.herdr.android.protocol.TranscriptAgentKind
+import dev.herdr.android.protocol.TranscriptChunkResult
+import dev.herdr.android.protocol.TranscriptLocation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -48,6 +51,8 @@ class SshHcConnectionController(
     @Volatile private var exec: SshHcExecChannel? = null
     @Volatile private var client: HcFramedClient? = null
     @Volatile private var demo: PreviewDemoConnectionController? = null
+    @Volatile private var activePlatform: HostPlatform = HostPlatform.WINDOWS
+    @Volatile private var transcriptSidecar: RemoteTranscriptSidecar? = null
     private var pollJob: Job? = null
     private var monitorJob: Job? = null
     private var stderrJob: Job? = null
@@ -84,6 +89,7 @@ class SshHcConnectionController(
 
                 val commands = RemoteHcCommandBuilder.candidates(profile)
                 var selectedClient: HcFramedClient? = null
+                var selectedPlatform: HostPlatform = profile.platform
                 var lastError: Exception? = null
                 for ((index, command) in commands.withIndex()) {
                     checkEpoch(epoch)
@@ -101,6 +107,7 @@ class SshHcConnectionController(
                     try {
                         candidate.start()
                         selectedClient = candidate
+                        selectedPlatform = command.first
                         break
                     } catch (error: CancellationException) {
                         throw error
@@ -120,6 +127,8 @@ class SshHcConnectionController(
                     }
                 }
                 val connected = selectedClient ?: throw (lastError ?: IllegalStateException("No HC command was available"))
+                activePlatform = selectedPlatform
+                transcriptSidecar = ssh?.let { RemoteTranscriptSidecar(it, activePlatform, scope) }
                 val hello = connected.helloInfo ?: throw HcProtocolException("HC hello was not completed")
                 val status = connected.serverStatus()
                 val inventory = connected.listTerminals()
@@ -239,6 +248,7 @@ class SshHcConnectionController(
         monitorJob?.cancel(); monitorJob = null
         stderrJob?.cancel(); stderrJob = null
         demoJobs.forEach { it.cancel() }; demoJobs = emptyList()
+        runCatching { transcriptSidecar?.close() }; transcriptSidecar = null
         runCatching { client?.close() }; client = null
         runCatching { exec?.close() }; exec = null
         runCatching { ssh?.close() }; ssh = null
@@ -267,6 +277,65 @@ class SshHcConnectionController(
         demo?.let { return it.readTerminalPreview(address) }
         return capture { requireClient().readTerminal(address, lines = 0) }
     }
+
+    override suspend fun getTerminalDetail(address: String): Result<TerminalSummary> {
+        demo?.let { return it.getTerminalDetail(address) }
+        return capture {
+            val detail = requireClient().getTerminal(address)
+            val current = _terminals.value
+            val idx = current.indexOfFirst { it.address == address }
+            if (idx >= 0) {
+                val updated = current.toMutableList()
+                updated[idx] = detail
+                _terminals.value = updated
+            }
+            detail
+        }
+    }
+
+    override suspend fun locateTranscript(
+        agentKind: TranscriptAgentKind,
+        pid: Long?,
+        cwd: String
+    ): Result<TranscriptLocation?> {
+        if (demo != null) return Result.success(null)
+        return capture {
+            val sidecar = requireSidecar()
+            sidecar.locate(agentKind, pid, cwd)
+        }
+    }
+
+    override suspend fun readTranscriptTail(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        offset: Long,
+        windowBytes: Long
+    ): Result<TranscriptChunkResult> {
+        demo?.let { return it.readTranscriptTail(agentKind, path, offset, windowBytes) }
+        return capture { requireSidecar().readTail(agentKind, path, offset, windowBytes) }
+    }
+
+    override suspend fun readTranscriptHead(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        beforeOffset: Long,
+        windowBytes: Long
+    ): Result<TranscriptChunkResult> {
+        demo?.let { return it.readTranscriptHead(agentKind, path, beforeOffset, windowBytes) }
+        return capture { requireSidecar().readHead(agentKind, path, beforeOffset, windowBytes) }
+    }
+
+    override suspend fun readTranscriptStepOutput(
+        agentKind: TranscriptAgentKind,
+        path: String,
+        stepIndex: Int
+    ): Result<String> {
+        demo?.let { return it.readTranscriptStepOutput(agentKind, path, stepIndex) }
+        return capture { requireSidecar().readStepOutput(agentKind, path, stepIndex) }
+    }
+
+    private fun requireSidecar(): RemoteTranscriptSidecar =
+        transcriptSidecar ?: throw IllegalStateException("尚未初始化旁路读取通道")
 
     private fun requireClient(): HcFramedClient = client?.takeIf { it.isConnected.value }
         ?: throw IllegalStateException("尚未连接 HC")

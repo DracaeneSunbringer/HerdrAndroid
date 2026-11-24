@@ -947,6 +947,39 @@ private fun BtwRichAnswerBody(
                                 }
                             }
                         }
+                        is BtwContentSegment.Blockquote -> {
+                            val barColor = when (seg.alertType) {
+                                "CAUTION" -> HerdrColors.Blocked
+                                "WARNING" -> HerdrColors.Working
+                                "TIP" -> HerdrColors.Done
+                                else -> HerdrColors.Accent
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(HerdrShapes.Small)
+                                    .background(HerdrColors.Surface)
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(3.dp)
+                                        .height(18.dp)
+                                        .clip(HerdrShapes.Pill)
+                                        .background(barColor)
+                                )
+                                Text(
+                                    text = formatBtwInline(
+                                        if (seg.alertType != null) "**[${seg.alertType}]** ${seg.text}".trim() else seg.text
+                                    ),
+                                    style = HerdrType.Body,
+                                    color = HerdrColors.Foreground,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
                         is BtwContentSegment.Paragraph -> Text(
                             text = formatBtwInline(seg.text),
                             style = HerdrType.Body,
@@ -1199,7 +1232,7 @@ private fun BtwCodeSegmentBlock(
     }
 }
 
-private val btwInlineTokenRegex = Regex("`([^`]+)`|\\*\\*([^*]+)\\*\\*")
+private val btwInlineTokenRegex = Regex("\\[([^\\]]+)]\\(([^)\\s]+)\\)|`([^`]+)`|\\*\\*([^*]+)\\*\\*")
 
 @Composable
 internal fun formatBtwInline(text: String): AnnotatedString {
@@ -1212,10 +1245,26 @@ internal fun formatBtwInline(text: String): AnnotatedString {
                 if (m.range.first > pos) {
                     append(text.substring(pos, m.range.first))
                 }
-                val codeContent = m.groups[1]?.value
-                val boldContent = m.groups[2]?.value
+                val linkLabelRaw = m.groups[1]?.value
+                val codeContent = m.groups[3]?.value
+                val boldContent = m.groups[4]?.value
                 val start = length
                 when {
+                    linkLabelRaw != null -> {
+                        val isCodeLabel = linkLabelRaw.length >= 2 && linkLabelRaw.startsWith("`") && linkLabelRaw.endsWith("`")
+                        val cleanLabel = if (isCodeLabel) linkLabelRaw.substring(1, linkLabelRaw.length - 1) else linkLabelRaw
+                        append(cleanLabel)
+                        addStyle(
+                            SpanStyle(
+                                fontFamily = if (isCodeLabel) FontFamily.Monospace else null,
+                                fontWeight = FontWeight.Medium,
+                                textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
+                                color = codeFg
+                            ),
+                            start,
+                            length
+                        )
+                    }
                     codeContent != null -> {
                         append(codeContent)
                         addStyle(
